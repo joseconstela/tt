@@ -5,6 +5,7 @@
 //!   block <tab> done|failed <tab> exit code <tab> duration ms <tab> flags <tab> command
 //!   note  <tab> text          a note shown instead of output
 //!   out   <tab> line          one logical line of output, styles as SGR
+//!   explain <tab> done|failed <tab> text   what the explain agent said of a failure
 //!
 //! The flags are letters: `f` ran full-screen, `a` used the alternate
 //! screen, `x` shown expanded, `g` an agent's reply (the output is what the
@@ -57,6 +58,7 @@ pub fn write(session: *const Session, out: *std.ArrayList(u8), gpa: std.mem.Allo
 fn estimate(b: *const Block) usize {
     var n: usize = b.command.len + 64;
     if (b.note) |note| n += note.len + 8;
+    n += b.explanation.items.len + 16;
     const count = b.buf.lineCount();
     for (b.buf.lines.items[count -| max_lines..count]) |line| n += line.cells.items.len + 8;
     return n;
@@ -76,6 +78,12 @@ fn writeBlock(b: *const Block, out: *std.ArrayList(u8), raw: *std.ArrayList(u8),
     if (b.note) |note| {
         try out.appendSlice(gpa, "note\t");
         try records.escape(out, gpa, note);
+        try out.append(gpa, '\n');
+    }
+    // An explanation still coming in is not written: the next save has it.
+    if (b.explain_state == .done or b.explain_state == .failed) {
+        try out.print(gpa, "explain\t{s}\t", .{if (b.explain_state == .failed) "failed" else "done"});
+        try records.escape(out, gpa, b.explanation.items);
         try out.append(gpa, '\n');
     }
     const count = b.buf.lineCount();
@@ -139,6 +147,13 @@ pub fn read(session: *Session, data: []const u8) void {
             if (b.note_owned) if (b.note) |old| gpa.free(old);
             b.note = gpa.dupe(u8, text) catch continue;
             b.note_owned = true;
+        } else if (std.mem.eql(u8, tag, "explain")) {
+            const b = current orelse continue;
+            const state = f.next() orelse continue;
+            const text = records.unescape(&field, gpa, f.rest()) catch continue;
+            b.explanation.clearRetainingCapacity();
+            b.explanation.appendSlice(gpa, text) catch continue;
+            b.explain_state = if (std.mem.eql(u8, state, "failed")) .failed else .done;
         } else if (std.mem.eql(u8, tag, "out")) {
             const b = current orelse continue;
             const bytes = records.unescape(&field, gpa, f.rest()) catch continue;
@@ -176,6 +191,8 @@ test "block codec: blocks round-trip with their output, styles, notes, state and
     b.exit_code = 2;
     b.fullscreen = true;
     b.used_alt_screen = true;
+    b.explanation.appendSlice(gpa, "vim quit with an error.\n→ vim -u NONE") catch unreachable;
+    b.explain_state = .done;
     s.addNote("# hello", "a note");
     const asked = s.restoreBlock("how big is this folder").?;
     asked.agent = true;
@@ -183,6 +200,9 @@ test "block codec: blocks round-trip with their output, styles, notes, state and
     fill(asked, "du -sh .\r\n");
     const running = s.restoreBlock("sleep 9").?;
     running.state = .running;
+    // An explanation still being written is not saved.
+    asked.explanation.appendSlice(gpa, "half") catch unreachable;
+    asked.explain_state = .running;
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -192,6 +212,7 @@ test "block codec: blocks round-trip with their output, styles, notes, state and
             "out\tplain \\e[0;1;31mred\\e[m\n" ++
             "out\tnext\\\\line\\e[0;38;2;1;2;3m \\e[m\n" ++
             "block\tfailed\t2\t0\tfa\tvim\n" ++
+            "explain\tdone\tvim quit with an error.\\n→ vim -u NONE\n" ++
             "block\tdone\t0\t0\t-\t# hello\n" ++
             "note\ta note\n" ++
             "block\tdone\t0\t0\tg\thow big is this folder\n" ++
@@ -223,11 +244,16 @@ test "block codec: blocks round-trip with their output, styles, notes, state and
     try std.testing.expectEqual(@as(i32, 2), b2.exit_code);
     try std.testing.expect(b2.fullscreen and b2.used_alt_screen and !b2.expanded);
     try std.testing.expectEqual(@as(usize, 0), b2.buf.lineCount());
+    try std.testing.expectEqual(session_mod.ExplainState.done, b2.explain_state);
+    try std.testing.expectEqualStrings("vim quit with an error.\n→ vim -u NONE", b2.explanation.items);
+    try std.testing.expectEqual(session_mod.ExplainState.none, t.blocks.items[0].explain_state);
     const c2 = t.blocks.items[2];
     try std.testing.expectEqualStrings("a note", c2.note.?);
     try std.testing.expect(c2.note_owned);
     const d2 = t.blocks.items[3];
     try std.testing.expect(d2.agent and !d2.expanded);
+    try std.testing.expectEqual(session_mod.ExplainState.none, d2.explain_state);
+    try std.testing.expectEqual(@as(usize, 0), d2.explanation.items.len);
     try std.testing.expectEqual(session_mod.BlockState.done, d2.state);
     try std.testing.expectEqual(@as(u32, 5), t.next_block_id);
 }

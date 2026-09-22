@@ -1,4 +1,4 @@
-//! Settings › AI › Agents: the models conch can talk to. One card per
+//! Settings › AI › APIs: the models conch can talk to. One card per
 //! agent — name, provider, model, key, endpoint — and a card to add one at
 //! any of the main providers or Ollama. Everything edits the config in
 //! place (see `config.zig`); text fields share one keyboard focus.
@@ -30,7 +30,7 @@ const FieldRef = struct {
     kind: FieldKind,
 
     fn id(self: FieldRef) u64 {
-        return Ui.id("agents.field", @as(usize, self.uid) * 8 + @intFromEnum(self.kind));
+        return Ui.id("apis.field", @as(usize, self.uid) * 8 + @intFromEnum(self.kind));
     }
 
     fn slot(self: FieldRef, cfg: *config.Config) ?*[]u8 {
@@ -209,7 +209,7 @@ pub const Page = struct {
             const rr: Rect = .{ .x = right - rw, .y = hcy - 13, .w = rw, .h = 26 };
             if (ui.pressed and ui.mouseIn(rr)) press_outside.* = false;
             if (self.confirm_remove == uid) dl.rrect(rr, 6, theme.red.alpha(0.14));
-            if (field.textButton(ui, Ui.id("agents.remove", uid), rr, remove_label, theme.red)) {
+            if (field.textButton(ui, Ui.id("apis.remove", uid), rr, remove_label, theme.red)) {
                 if (self.confirm_remove == uid) {
                     if (self.focus.active() and self.focus_ref.uid == uid) self.focus.drop();
                     if (self.revealed == uid) self.revealed = null;
@@ -233,7 +233,7 @@ pub const Page = struct {
             const label = "Make default";
             const bw = ui.text.measure(theme.font_hint, label) + 20;
             const br: Rect = .{ .x = right - bw, .y = hcy - 13, .w = bw, .h = 26 };
-            if (field.textButton(ui, Ui.id("agents.default", uid), br, label, theme.text_2)) {
+            if (field.textButton(ui, Ui.id("apis.default", uid), br, label, theme.text_2)) {
                 cfg.setDefaultAgent(uid);
                 cfg.save();
             }
@@ -271,7 +271,7 @@ pub const Page = struct {
             self.textRow(ui, .{ .uid = uid, .kind = .api_key }, card.x + card_pad, fields_x, y, fields_w - toggle_w - 8, "API key", .{ .masked = true, .revealed = revealed, .placeholder = if (a.provider == .custom) "Optional" else "Paste the key" }, now, press_outside);
             const tr: Rect = .{ .x = fields_x + fields_w - toggle_w, .y = y + 3, .w = toggle_w, .h = field.height - 6 };
             if (ui.pressed and ui.mouseIn(tr)) press_outside.* = false;
-            if (field.textButton(ui, Ui.id("agents.reveal", uid), tr, if (revealed) "Hide" else "Show", theme.text_2)) {
+            if (field.textButton(ui, Ui.id("apis.reveal", uid), tr, if (revealed) "Hide" else "Show", theme.text_2)) {
                 self.revealed = if (revealed) null else uid;
             }
         } else {
@@ -329,7 +329,7 @@ pub const Page = struct {
                 cx = x;
                 cy += chip_h + 8;
             }
-            if (field.chip(ui, Ui.id("agents.provider", @as(usize, uid) * 8 + i), .{ .x = cx, .y = cy, .w = cw, .h = chip_h }, p.label(), p == selected)) picked = p;
+            if (field.chip(ui, Ui.id("apis.provider", @as(usize, uid) * 8 + i), .{ .x = cx, .y = cy, .w = cw, .h = chip_h }, p.label(), p == selected)) picked = p;
             cx += cw + 8;
         }
         return picked;
@@ -357,7 +357,7 @@ pub const Page = struct {
                 cx = card.x + card_pad;
                 cy += chip_h + 8;
             }
-            if (field.chip(ui, Ui.id("agents.add", i), .{ .x = cx, .y = cy, .w = cw, .h = chip_h }, p.label(), false)) {
+            if (field.chip(ui, Ui.id("apis.add", i), .{ .x = cx, .y = cy, .w = cw, .h = chip_h }, p.label(), false)) {
                 if (cfg.addAgent(p)) |a| {
                     cfg.save();
                     self.takeFocus(.{ .uid = a.uid, .kind = .name }, now);

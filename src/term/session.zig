@@ -12,6 +12,10 @@ const sys = @import("../sys.zig");
 
 pub const BlockState = enum { pending, running, done, failed };
 
+/// How a failed block's "Explain" went: not asked, the agent is answering,
+/// answered, or it could not answer (`explanation` then says why).
+pub const ExplainState = enum { none, running, done, failed };
+
 pub const Block = struct {
     id: u32,
     command: []u8,
@@ -35,6 +39,10 @@ pub const Block = struct {
     /// The line went to an agent (see the terminal tab): the output is the
     /// agent's reply, the state how the reply went.
     agent: bool = false,
+    /// What the explain agent said about this failure ("Explain" on a
+    /// failed block), shown under the output and kept across relaunches.
+    explanation: std.ArrayList(u8) = .empty,
+    explain_state: ExplainState = .none,
 
     // View state owned by the terminal tab.
     expanded: bool = false,
@@ -194,6 +202,7 @@ pub const Session = struct {
     fn freeBlock(self: *Session, b: *Block) void {
         b.buf.deinit();
         b.row_starts.deinit(self.gpa);
+        b.explanation.deinit(self.gpa);
         if (b.note_owned) if (b.note) |n| self.gpa.free(n);
         self.gpa.free(b.command);
         self.gpa.destroy(b);

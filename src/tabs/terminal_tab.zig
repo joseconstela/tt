@@ -19,6 +19,7 @@ const sys = @import("../sys.zig");
 const block_codec = @import("../term/block_codec.zig");
 const agent = @import("../agent.zig");
 const config = @import("../config.zig");
+const coding_agents = @import("../coding_agents.zig");
 const settings_features = @import("settings_features.zig");
 
 const Ui = ui_mod.Ui;
@@ -37,6 +38,16 @@ const hint_h: f32 = 19;
 const note_no_agent = "No agent takes plain-English lines yet: pick one under Settings › AI › Features.";
 const note_empty_question = "Put the question after the #.";
 const note_no_answer = "The agent sent no answer.";
+const note_no_explain_agent = "No agent explains failures yet: pick one under Settings › AI › Features › Explain.";
+const note_no_explanation = "The agent sent no explanation.";
+const note_fix_off = "Fix with agent is off (Settings › AI › Features).";
+const note_fix_none = "No coding agent found on this Mac: Settings › AI › Agents says how to install one.";
+const note_fix_unknown = "The coding agent chosen under Settings › AI › Features is not one conch knows.";
+/// Line height of the explanation under a failed command.
+const explain_line_h: f32 = 21;
+/// Gap above the explanation's label, and the label row itself.
+const explain_gap: f32 = 12;
+const explain_label_h: f32 = 22;
 /// What a question carries along: the tab's earlier turns — commands with
 /// their output and exit codes, questions with their answers — the newest
 /// within these budgets, so a small local model's context is not overrun.
@@ -46,8 +57,11 @@ const max_transcript_bytes: usize = 16 * 1024;
 const max_output_lines: usize = 60;
 const max_output_bytes: usize = 4 * 1024;
 
-/// An agent's reply on its way into a block.
-const Pending = struct { block_id: u32, req: *agent.Request };
+/// An agent's reply on its way into a block: the answer to the line the
+/// shell did not know (into the block's output) or the explanation of a
+/// failure (into `Block.explanation`).
+const PendingKind = enum { answer, explain };
+const Pending = struct { block_id: u32, req: *agent.Request, kind: PendingKind = .answer };
 const note_fullscreen = "Ran full-screen; it left nothing on the screen when it ended.";
 
 pub const TerminalTab = struct {
@@ -77,6 +91,13 @@ pub const TerminalTab = struct {
     unseen_failure: bool = false,
     last_block_checked: u32 = 0,
     rerun: ?[]u8 = null,
+    /// A line to run in the shell after this frame, without adding it to
+    /// the history (the coding agent "Fix with agent" starts).
+    launch: ?[]u8 = null,
+    /// Why "Fix with agent" did nothing, shown beside the buttons of that
+    /// block (a string from the binary; 0 = none).
+    fix_note_block: u32 = 0,
+    fix_note: []const u8 = "",
     closing: bool = false,
     /// Action button clicked during the current block's draw.
     clicked_id: u64 = 0,
@@ -141,6 +162,7 @@ pub const TerminalTab = struct {
         self.suggestion.deinit(self.gpa);
         self.hist_prefix.deinit(self.gpa);
         if (self.rerun) |r| self.gpa.free(r);
+        if (self.launch) |l| self.gpa.free(l);
         self.gpa.destroy(self);
     }
 
@@ -206,7 +228,7 @@ pub const TerminalTab = struct {
     /// Why closing needs a confirmation: a command still running (or queued),
     /// or typed input that was never run.
     pub fn closeWarning(self: *TerminalTab, _: []u8) ?[]const u8 {
-        if (self.session.working() or self.rerun != null) return "A command is still running; closing the tab will stop it.";
+        if (self.session.working() or self.rerun != null or self.launch != null) return "A command is still running; closing the tab will stop it.";
         if (!self.editor.isEmpty()) return "The command input has text you haven't run; it will be lost.";
         return null;
     }
@@ -225,7 +247,10 @@ pub const TerminalTab = struct {
             h.update(std.mem.asBytes(&b.id));
             h.update(std.mem.asBytes(&b.buf.version));
             h.update(std.mem.asBytes(&b.exit_code));
-            h.update(&[_]u8{ @intFromEnum(b.state), @intFromBool(b.expanded) });
+            h.update(&[_]u8{ @intFromEnum(b.state), @intFromBool(b.expanded), @intFromEnum(b.explain_state) });
+            // An explanation counts once it is settled (the codec skips one
+            // still coming in), so streaming does not rewrite the file.
+            if (b.explain_state == .done or b.explain_state == .failed) h.update(b.explanation.items);
         }
         return h.final();
     }
@@ -534,13 +559,7 @@ pub const TerminalTab = struct {
         };
         var prepared = agent.prepare(self.gpa, a, system, messages.items, .{ .tools = true }) catch |err| {
             var buf: [256]u8 = undefined;
-            const why: []const u8 = switch (err) {
-                error.NoModel => std.fmt.bufPrint(&buf, "The agent “{s}” has no model set (Settings › AI › Agents).", .{a.name}) catch "The agent has no model set.",
-                error.NoApiKey => std.fmt.bufPrint(&buf, "The agent “{s}” needs an API key (Settings › AI › Agents).", .{a.name}) catch "The agent needs an API key.",
-                error.NoBaseUrl => std.fmt.bufPrint(&buf, "The agent “{s}” has no base URL (Settings › AI › Agents).", .{a.name}) catch "The agent has no base URL.",
-                error.OutOfMemory => "Out of memory.",
-            };
-            self.failAgent(b, why);
+            self.failAgent(b, prepareFailure(err, a, &buf));
             return;
         };
         defer prepared.deinit(self.gpa);
@@ -577,6 +596,39 @@ pub const TerminalTab = struct {
             var err: std.ArrayList(u8) = .empty;
             defer err.deinit(self.gpa);
             const outcome = p.req.take(&text, &proposals, &err, self.gpa);
+            if (p.kind == .explain) {
+                if (text.items.len > 0) {
+                    appendExplanation(b, text.items, self.gpa);
+                    changed = true;
+                }
+                for (proposals.items) |cmd| {
+                    // The fix the agent suggests: a line of the explanation,
+                    // and in the input box for the user to check and run.
+                    if (b.explanation.items.len > 0 and b.explanation.items[b.explanation.items.len - 1] != '\n') b.explanation.append(self.gpa, '\n') catch {};
+                    b.explanation.appendSlice(self.gpa, "→ ") catch {};
+                    b.explanation.appendSlice(self.gpa, cmd) catch {};
+                    b.explanation.append(self.gpa, '\n') catch {};
+                    self.offer(cmd);
+                    changed = true;
+                }
+                switch (outcome) {
+                    .running => i += 1,
+                    .done => {
+                        b.explain_state = .done;
+                        if (b.explanation.items.len == 0) self.explainFailed(b, note_no_explanation);
+                        p.req.release();
+                        _ = self.pending.swapRemove(i);
+                        changed = true;
+                    },
+                    .failed => {
+                        self.explainFailed(b, err.items);
+                        p.req.release();
+                        _ = self.pending.swapRemove(i);
+                        changed = true;
+                    },
+                }
+                continue;
+            }
             if (text.items.len > 0) {
                 appendReply(b, text.items);
                 changed = true;
@@ -607,6 +659,171 @@ pub const TerminalTab = struct {
         return changed;
     }
 
+    // ── explain a failure ───────────────────────────────────────────────
+    // "Explain" on a failed block asks the agent chosen under Settings › AI ›
+    // Features › Explain why the command failed. The answer streams into
+    // `Block.explanation`, shown under the error and saved with the block,
+    // so it is still there after a relaunch.
+
+    /// Asks (or asks again) about `b`; an earlier explanation is replaced.
+    fn explain(self: *TerminalTab, b: *Block) void {
+        if (b.explain_state == .running) return;
+        b.explanation.clearRetainingCapacity();
+        b.explain_state = .running;
+        const cfg = config.get();
+        const name = cfg.features.explain_agent orelse {
+            self.explainFailed(b, note_no_explain_agent);
+            return;
+        };
+        const a = cfg.findAgentByName(name) orelse {
+            self.explainFailed(b, "The agent chosen for Explain under Settings › AI › Features is no longer set up.");
+            return;
+        };
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const system = self.explainSystemPrompt(arena) catch "";
+        const report = self.failureReport(arena, b) catch {
+            self.explainFailed(b, "Out of memory.");
+            return;
+        };
+        const messages = [_]agent.Message{.{ .role = .user, .text = report }};
+        var prepared = agent.prepare(self.gpa, a, system, &messages, .{ .tools = true }) catch |err| {
+            var buf: [256]u8 = undefined;
+            self.explainFailed(b, prepareFailure(err, a, &buf));
+            return;
+        };
+        defer prepared.deinit(self.gpa);
+        const req = agent.Request.start(&prepared) catch {
+            self.explainFailed(b, "Out of memory.");
+            return;
+        };
+        self.pending.append(self.gpa, .{ .block_id = b.id, .req = req, .kind = .explain }) catch {
+            req.release();
+            self.explainFailed(b, "Out of memory.");
+        };
+    }
+
+    /// The explanation ends here without an answer, or short of one.
+    fn explainFailed(self: *TerminalTab, b: *Block, why: []const u8) void {
+        b.explain_state = .failed;
+        // Whatever arrived stays; the reason shows when nothing did.
+        if (b.explanation.items.len == 0) b.explanation.appendSlice(self.gpa, why) catch {};
+    }
+
+    /// What the explain agent is told first: the prompt from Settings › AI ›
+    /// Features › Explain (or its default), then where the user is and how
+    /// to answer.
+    fn explainSystemPrompt(self: *TerminalTab, arena: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(arena, settings_features.promptFor(.explain));
+        try out.print(arena, "\n\nContext: the user is in a terminal on macOS running zsh, in the directory {s}", .{self.session.cwd.items});
+        if (self.session.branch.items.len > 0) try out.print(arena, " (git branch {s})", .{self.session.branch.items});
+        try out.appendSlice(arena, ". The message carries the command that failed, what it printed (stdout and stderr together, as the terminal showed them) and its exit code; the commands run before it may be there too. When a corrected command would fix it, call propose_command with it: it lands in the user's input box for them to check and run, so never assume it ran. Answer in plain text for a monospaced terminal: no Markdown headings or tables, a few short lines.");
+        return out.toOwnedSlice(arena);
+    }
+
+    /// The failed block as the agents read it: the shell blocks just
+    /// before it (for context: a cd, an export …), then the failure itself.
+    fn failureReport(self: *TerminalTab, arena: std.mem.Allocator, b: *Block) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        // Up to three earlier shell blocks, within the transcript budget.
+        var earlier: std.ArrayList([]const u8) = .empty;
+        var budget: usize = max_transcript_bytes / 2;
+        var i = self.session.blocks.items.len;
+        var seen_self = false;
+        while (i > 0 and earlier.items.len < 3) {
+            i -= 1;
+            const other = self.session.blocks.items[i];
+            if (other == b) {
+                seen_self = true;
+                continue;
+            }
+            if (!seen_self or other.agent or !other.finished()) continue;
+            const t = try blockTranscript(arena, other);
+            if (t.len > budget) break;
+            budget -= t.len;
+            try earlier.append(arena, t);
+        }
+        if (earlier.items.len > 0) {
+            try out.appendSlice(arena, "Commands run just before, oldest first:\n");
+            var k = earlier.items.len;
+            while (k > 0) {
+                k -= 1;
+                try out.appendSlice(arena, earlier.items[k]);
+            }
+            try out.append(arena, '\n');
+        }
+        try out.appendSlice(arena, "This command failed:\n");
+        try out.appendSlice(arena, try blockTranscript(arena, b));
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Why a request could not even be built, for the block.
+    fn prepareFailure(err: agent.PrepareError, a: *const config.Agent, buf: []u8) []const u8 {
+        return switch (err) {
+            error.NoModel => std.fmt.bufPrint(buf, "The agent “{s}” has no model set (Settings › AI › APIs).", .{a.name}) catch "The agent has no model set.",
+            error.NoApiKey => std.fmt.bufPrint(buf, "The agent “{s}” needs an API key (Settings › AI › APIs).", .{a.name}) catch "The agent needs an API key.",
+            error.NoBaseUrl => std.fmt.bufPrint(buf, "The agent “{s}” has no base URL (Settings › AI › APIs).", .{a.name}) catch "The agent has no base URL.",
+            error.OutOfMemory => "Out of memory.",
+        };
+    }
+
+    /// Adds explanation text to a block: line breaks kept, CRs and other
+    /// control bytes dropped, tabs as spaces.
+    fn appendExplanation(b: *Block, text: []const u8, gpa: std.mem.Allocator) void {
+        for (text) |c| switch (c) {
+            '\r' => {},
+            '\t' => b.explanation.appendSlice(gpa, "    ") catch return,
+            else => if (c >= 0x20 or c == '\n') b.explanation.append(gpa, c) catch return,
+        };
+    }
+
+    // ── fix with a coding agent ─────────────────────────────────────────
+    // "Fix with agent" on a failed block starts the coding agent chosen
+    // under Settings › AI › Features (Claude Code, Codex … from AI › Agents)
+    // in this tab's shell, with the failure as its task. It runs like any
+    // command typed here — full screen when it takes over the terminal.
+
+    fn fixWithAgent(self: *TerminalTab, b: *Block) void {
+        if (self.session.busy() or self.launch != null) return;
+        const cfg = config.get();
+        const f = &cfg.features;
+        if (f.fixOff()) return self.noteFix(b, note_fix_off);
+        const scan = coding_agents.get();
+        const k: *const coding_agents.Known = blk: {
+            if (f.fixAuto()) {
+                // Whatever is installed now, not at the last scan.
+                scan.rescan();
+                const found = scan.first() orelse return self.noteFix(b, note_fix_none);
+                break :blk found.known;
+            }
+            // A chosen agent runs even when the scan did not see it: the
+            // shell's PATH may know more than ours.
+            break :blk coding_agents.byId(f.fix_agent) orelse return self.noteFix(b, note_fix_unknown);
+        };
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var task: std.ArrayList(u8) = .empty;
+        task.appendSlice(arena, settings_features.promptFor(.fix)) catch return;
+        task.print(arena, "\n\nIn the directory {s}", .{self.session.cwd.items}) catch return;
+        if (self.session.branch.items.len > 0) task.print(arena, " (git branch {s})", .{self.session.branch.items}) catch return;
+        task.appendSlice(arena, ", this is what happened in the terminal (stdout and stderr together):\n\n") catch return;
+        task.appendSlice(arena, self.failureReport(arena, b) catch return) catch return;
+        self.launch = coding_agents.launchCommand(self.gpa, k, task.items) catch return;
+        self.fix_note_block = 0;
+        self.scroll = 0;
+    }
+
+    /// Why nothing was launched, shown beside the block's buttons.
+    fn noteFix(self: *TerminalTab, b: *Block, why: []const u8) void {
+        self.fix_note_block = b.id;
+        self.fix_note = why;
+    }
+
     /// ⌃C while a reply is coming in stops it; the block keeps what arrived.
     fn stopAgents(self: *TerminalTab) void {
         for (self.pending.items) |p| p.req.cancel();
@@ -627,6 +844,12 @@ pub const TerminalTab = struct {
         b.buf.resetPen();
         b.buf.carriageReturn();
         b.buf.lineFeed();
+        self.offer(cmd);
+    }
+
+    /// Puts a proposed command in the input box, unless the user is typing
+    /// something else there (a newer proposal replaces an earlier one).
+    fn offer(self: *TerminalTab, cmd: []const u8) void {
         const box = self.editor.bytes();
         const ours = if (self.last_proposal) |p| std.mem.eql(u8, box, p) else false;
         if (box.len == 0 or ours) {
@@ -672,10 +895,8 @@ pub const TerminalTab = struct {
     /// What the agent is told before the conversation: the prompt from
     /// Settings › AI › Features (or the default), then where the user is.
     fn systemPrompt(self: *TerminalTab, arena: std.mem.Allocator) ![]u8 {
-        const own = config.get().features.command_fallback_prompt;
-        const prompt = if (std.mem.trim(u8, own, " \t\r\n").len == 0) settings_features.default_prompt else own;
         var out: std.ArrayList(u8) = .empty;
-        try out.appendSlice(arena, prompt);
+        try out.appendSlice(arena, settings_features.promptFor(.fallback));
         try out.print(arena, "\n\nContext: the user is in a terminal on macOS running zsh, in the directory {s}", .{self.session.cwd.items});
         if (self.session.branch.items.len > 0) try out.print(arena, " (git branch {s})", .{self.session.branch.items});
         try out.appendSlice(arena, ". The messages carry a transcript of that terminal: the commands run so far, what they printed (stdout and stderr together, as the terminal showed them) and how they ended; read it before answering. When a command would do what the user wants, call propose_command with it: it lands in the user's input box for them to check and run, so never assume it ran and never make up its output; say in a line what it does. Answer in plain text for a monospaced terminal: no Markdown headings or tables, short lines.");
@@ -919,6 +1140,13 @@ pub const TerminalTab = struct {
             defer self.gpa.free(cmd);
             self.run(cmd);
         }
+        if (self.launch) |cmd| {
+            self.launch = null;
+            defer self.gpa.free(cmd);
+            self.hist_index = null;
+            self.scroll = 0;
+            self.session.submit(cmd);
+        }
     }
 
     const BlockLayout = struct {
@@ -931,6 +1159,8 @@ pub const TerminalTab = struct {
         failed: bool,
         note: ?[]const u8,
         note_lines: u32 = 0,
+        /// Lines of the explanation under a failed command (0 = none).
+        explain_lines: u32 = 0,
     };
 
     fn ensureRows(self: *TerminalTab, b: *Block, cols: u32) void {
@@ -982,6 +1212,10 @@ pub const TerminalTab = struct {
             l.h = l.header_h;
             if (l.note != null) l.h += @as(f32, @floatFromInt(l.note_lines)) * 21;
             if (l.rows > 0) l.h += 10 + out_h + 10;
+            if (b.explain_state != .none) {
+                l.explain_lines = if (b.explanation.items.len == 0) 1 else wrapParagraphCount(ui, theme.font_ui, b.explanation.items, col_w - 2 * theme.block_pad_x);
+                l.h += explain_gap + explain_label_h + @as(f32, @floatFromInt(l.explain_lines)) * explain_line_h;
+            }
             l.h += 14 + 34 + 16;
         } else {
             l.header_h = 14 + 21 + (if (has_body) @as(f32, 10) else 14);
@@ -1091,15 +1325,33 @@ pub const TerminalTab = struct {
         }
 
         if (l.failed) {
+            if (l.explain_lines > 0) y = self.drawExplanation(ui, b, px, y, inner_w);
+
             // Action row (design: Fix with agent · Explain · Run again ··· Show full output).
             const by = y + 14;
             var bx = px;
-            bx = self.actionButton(ui, Ui.id("block.fix", b.id), bx, by, "Fix with agent", .primary) + 10;
-            bx = self.actionButton(ui, Ui.id("block.explain", b.id), bx, by, "Explain", .outline) + 10;
+            const fix_id = Ui.id("block.fix", b.id);
+            bx = self.actionButton(ui, fix_id, bx, by, "Fix with agent", .primary) + 10;
+            if (self.clicked_id == fix_id) self.fixWithAgent(b);
+            const explain_id = Ui.id("block.explain", b.id);
+            const explain_label: []const u8 = switch (b.explain_state) {
+                .none => "Explain",
+                .running => "Explaining…",
+                .done, .failed => "Explain again",
+            };
+            bx = self.actionButton(ui, explain_id, bx, by, explain_label, .outline) + 10;
+            if (self.clicked_id == explain_id) self.explain(b);
             const run_again_id = Ui.id("block.rerun", b.id);
-            _ = self.actionButton(ui, run_again_id, bx, by, "Run again", .outline);
+            bx = self.actionButton(ui, run_again_id, bx, by, "Run again", .outline) + 14;
             if (self.clicked_id == run_again_id) self.queueRerun(b.command);
-            if (l.collapsible) self.expandToggle(ui, b, r.right() - theme.block_pad_x, by + 17);
+            var right = r.right() - theme.block_pad_x;
+            if (l.collapsible) {
+                self.expandToggle(ui, b, right, by + 17);
+                right -= ui.text.measure(ui_mod.Font.sans(13.5), "Show full output · 00000 lines") + 24;
+            }
+            if (self.fix_note_block == b.id and right - bx > 60) {
+                _ = dl.textEllipsis(theme.font_hint, bx, by + 17, self.fix_note, right - bx, theme.text_3);
+            }
         } else if (l.rows > 0 and l.collapsible) {
             self.expandToggle(ui, b, r.right() - theme.block_pad_x, y + 4 + 14);
         }
@@ -1141,6 +1393,34 @@ pub const TerminalTab = struct {
         ui.feedback(r, 6, st);
         _ = ui.dl.textCentered(font, r.x + 8, cy, label, if (st.hover) theme.text else theme.text_2);
         if (st.clicked) b.expanded = !b.expanded;
+    }
+
+    /// The explanation under a failed command: a label saying how it is
+    /// going, then the agent's text, wrapped. Returns the y below it.
+    fn drawExplanation(self: *TerminalTab, ui: *Ui, b: *Block, x: f32, y0: f32, w: f32) f32 {
+        _ = self;
+        const dl = ui.dl;
+        var y = y0 + explain_gap;
+        const label: []const u8 = switch (b.explain_state) {
+            .none => "",
+            .running => "Explaining…",
+            .done => "Explanation",
+            .failed => if (b.explanation.items.len > 0 and !std.mem.startsWith(u8, b.explanation.items, "No agent") and !std.mem.startsWith(u8, b.explanation.items, "The agent")) "Explanation · stopped" else "Could not explain",
+        };
+        const color = switch (b.explain_state) {
+            .running => theme.teal,
+            .failed => theme.red,
+            else => theme.text_3,
+        };
+        const cy = y + explain_label_h / 2;
+        dl.icon(.sparkle, x, cy - 7, 14, if (b.explain_state == .failed) theme.red else theme.accent);
+        _ = dl.textCentered(theme.font_hint, x + 20, cy, label, color);
+        y += explain_label_h;
+        if (b.explanation.items.len == 0) {
+            _ = dl.textCentered(theme.font_ui, x, y + explain_line_h / 2, if (b.explain_state == .running) "Thinking…" else "", theme.text_3);
+            return y + explain_line_h;
+        }
+        return drawWrappedParagraphs(ui, theme.font_ui, b.explanation.items, x, y, w, explain_line_h, if (b.explain_state == .failed and b.explanation.items.len < 200) theme.text_3 else theme.text_2);
     }
 
     fn queueRerun(self: *TerminalTab, cmd: []const u8) void {
@@ -1834,6 +2114,46 @@ fn wrapLines(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32, ctx: anyty
         start = end;
     }
     return @max(lines, 1);
+}
+
+/// Word wrap that keeps the text's own line breaks: every line of `str`
+/// wraps on its own, an empty one stays an empty line. Returns the count.
+fn wrapParagraphs(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32, ctx: anytype) u32 {
+    const trimmed = std.mem.trim(u8, str, "\n");
+    var lines: u32 = 0;
+    var it = std.mem.splitScalar(u8, trimmed, '\n');
+    while (it.next()) |para| {
+        if (para.len == 0) {
+            ctx.line("");
+            lines += 1;
+        } else lines += wrapLines(ui, font, para, max_w, ctx);
+    }
+    return @max(lines, 1);
+}
+
+fn wrapParagraphCount(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32) u32 {
+    const Counter = struct {
+        fn line(_: @This(), _: []const u8) void {}
+    };
+    return wrapParagraphs(ui, font, str, max_w, Counter{});
+}
+
+fn drawWrappedParagraphs(ui: *Ui, font: ui_mod.Font, str: []const u8, x: f32, y: f32, max_w: f32, lh: f32, color: Color) f32 {
+    const Painter = struct {
+        ui: *Ui,
+        font: ui_mod.Font,
+        x: f32,
+        y: *f32,
+        lh: f32,
+        color: Color,
+        fn line(p: @This(), s: []const u8) void {
+            if (s.len > 0) _ = p.ui.dl.textCentered(p.font, p.x, p.y.* + p.lh / 2, s, p.color);
+            p.y.* += p.lh;
+        }
+    };
+    var cy = y;
+    _ = wrapParagraphs(ui, font, str, max_w, Painter{ .ui = ui, .font = font, .x = x, .y = &cy, .lh = lh, .color = color });
+    return cy;
 }
 
 fn wrapCount(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32) u32 {

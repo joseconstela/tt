@@ -222,3 +222,134 @@ pub fn writeFileAtomic(gpa: std.mem.Allocator, path: []const u8, data: []const u
     if (c.rename(tmpl.ptr, path_z.ptr) != 0) return error.RenameFailed;
     ok = true;
 }
+
+// ── child processes ─────────────────────────────────────────────────────
+extern "c" fn __error() *c_int;
+const EINTR: c_int = 4;
+
+/// What a finished command left behind. Free with `deinit`.
+pub const RunResult = struct {
+    gpa: std.mem.Allocator,
+    stdout: []u8,
+    stderr: []u8,
+    /// The exit status, or -1 when the command was killed by a signal.
+    status: i32,
+
+    pub fn ok(self: *const RunResult) bool {
+        return self.status == 0;
+    }
+
+    /// The first line of stderr (what a failed git command has to say).
+    pub fn firstErrorLine(self: *const RunResult) []const u8 {
+        const s = std.mem.trim(u8, self.stderr, " \r\n\t");
+        const end = std.mem.indexOfScalar(u8, s, '\n') orelse s.len;
+        return s[0..end];
+    }
+
+    pub fn deinit(self: *RunResult) void {
+        self.gpa.free(self.stdout);
+        self.gpa.free(self.stderr);
+    }
+};
+
+/// Runs `argv` in `cwd` with stdin from /dev/null and collects what it
+/// writes until it exits. `extra_env` (NAME=value) is added to our own
+/// environment. Blocks until the command is done: call it for quick
+/// commands, or from a thread of its own.
+pub fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, extra_env: []const []const u8) !RunResult {
+    if (argv.len == 0) return error.NoCommand;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const argv_z = try arena.alloc(?[*:0]const u8, argv.len + 1);
+    for (argv, 0..) |a, i| argv_z[i] = (try arena.dupeZ(u8, a)).ptr;
+    argv_z[argv.len] = null;
+
+    const environ = _NSGetEnviron().*;
+    var env_count: usize = 0;
+    while (environ[env_count] != null) env_count += 1;
+    const envp = try arena.alloc(?[*:0]const u8, env_count + extra_env.len + 1);
+    for (0..env_count) |i| envp[i] = environ[i];
+    for (extra_env, 0..) |e, i| envp[env_count + i] = (try arena.dupeZ(u8, e)).ptr;
+    envp[env_count + extra_env.len] = null;
+    const cwd_z = try arena.dupeZ(u8, if (cwd.len == 0) "." else cwd);
+
+    var out_pipe: [2]c.fd_t = undefined;
+    var err_pipe: [2]c.fd_t = undefined;
+    if (c.pipe(&out_pipe) != 0) return error.PipeFailed;
+    if (c.pipe(&err_pipe) != 0) {
+        _ = c.close(out_pipe[0]);
+        _ = c.close(out_pipe[1]);
+        return error.PipeFailed;
+    }
+
+    var actions: c.posix_spawn_file_actions_t = undefined;
+    _ = c.posix_spawn_file_actions_init(&actions);
+    defer _ = c.posix_spawn_file_actions_destroy(&actions);
+    _ = c.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", 0, 0);
+    _ = c.posix_spawn_file_actions_adddup2(&actions, out_pipe[1], 1);
+    _ = c.posix_spawn_file_actions_adddup2(&actions, err_pipe[1], 2);
+    _ = c.posix_spawn_file_actions_addchdir_np(&actions, cwd_z.ptr);
+    var attr: c.posix_spawnattr_t = undefined;
+    _ = c.posix_spawnattr_init(&attr);
+    defer _ = c.posix_spawnattr_destroy(&attr);
+    // Only the three standard descriptors reach the child: no pty or pipe
+    // of ours leaks into it.
+    _ = c.posix_spawnattr_setflags(&attr, .{ .CLOEXEC_DEFAULT = true, .SETSIGDEF = true });
+
+    var pid: c.pid_t = 0;
+    const rc = c.posix_spawnp(&pid, argv_z[0].?, &actions, &attr, @ptrCast(argv_z.ptr), @ptrCast(envp.ptr));
+    _ = c.close(out_pipe[1]);
+    _ = c.close(err_pipe[1]);
+    if (rc != 0) {
+        _ = c.close(out_pipe[0]);
+        _ = c.close(err_pipe[0]);
+        return error.SpawnFailed;
+    }
+
+    var bufs: [2]std.ArrayList(u8) = .{ .empty, .empty };
+    errdefer for (&bufs) |*b| b.deinit(gpa);
+    var fds = [2]c.pollfd{
+        .{ .fd = out_pipe[0], .events = c.POLL.IN, .revents = 0 },
+        .{ .fd = err_pipe[0], .events = c.POLL.IN, .revents = 0 },
+    };
+    var open_count: usize = 2;
+    while (open_count > 0) {
+        const n = c.poll(&fds, 2, -1);
+        if (n < 0) {
+            if (__error().* == EINTR) continue;
+            break;
+        }
+        for (&fds, 0..) |*p, i| {
+            if (p.fd < 0 or p.revents == 0) continue;
+            var chunk: [8192]u8 = undefined;
+            const got = c.read(p.fd, &chunk, chunk.len);
+            if (got > 0) {
+                try bufs[i].appendSlice(gpa, chunk[0..@intCast(got)]);
+            } else if (got < 0 and __error().* == EINTR) {
+                continue;
+            } else {
+                _ = c.close(p.fd);
+                p.fd = -1;
+                open_count -= 1;
+            }
+        }
+    }
+    for (&fds) |*p| if (p.fd >= 0) {
+        _ = c.close(p.fd);
+    };
+
+    var status: c_int = 0;
+    while (c.waitpid(pid, &status, 0) < 0) {
+        if (__error().* != EINTR) break;
+    }
+    const st: u32 = @bitCast(status);
+    const code: i32 = if (c.W.IFEXITED(st)) c.W.EXITSTATUS(st) else -1;
+    return .{
+        .gpa = gpa,
+        .stdout = try bufs[0].toOwnedSlice(gpa),
+        .stderr = try bufs[1].toOwnedSlice(gpa),
+        .status = code,
+    };
+}

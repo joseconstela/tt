@@ -10,7 +10,8 @@ const field = @import("../ui/field.zig");
 const icons = @import("../gfx/icons.zig");
 const config = @import("../config.zig");
 const appearance = @import("../appearance.zig");
-const agents_mod = @import("settings_agents.zig");
+const apis_mod = @import("settings_apis.zig");
+const coding_mod = @import("settings_coding_agents.zig");
 const features_mod = @import("settings_features.zig");
 const EditCommand = @import("../events.zig").EditCommand;
 
@@ -22,6 +23,9 @@ const Font = ui_mod.Font;
 pub const Page = enum {
     mode,
     theme,
+    /// The model APIs (a model at a provider, with its key).
+    apis,
+    /// The coding agents installed on this Mac.
     agents,
     mcps,
     features,
@@ -30,6 +34,7 @@ pub const Page = enum {
         return switch (self) {
             .mode => "Mode",
             .theme => "Theme",
+            .apis => "APIs",
             .agents => "Agents",
             .mcps => "MCPs",
             .features => "Features",
@@ -40,6 +45,7 @@ pub const Page = enum {
         return switch (self) {
             .mode => .sun,
             .theme => .drop,
+            .apis => .cloud,
             .agents => .agent,
             .mcps => .plug,
             .features => .sparkle,
@@ -51,16 +57,17 @@ pub const Page = enum {
         return switch (self) {
             .mode => "Light, dark, e-ink, or follow the system.",
             .theme => "Colours for the workspace.",
-            .agents => "The models conch can talk to: hosted providers, or Ollama on this Mac.",
+            .apis => "The models conch can talk to: hosted providers, or Ollama on this Mac.",
+            .agents => "The coding agents installed on this Mac, for fixing what fails.",
             .mcps => "Model Context Protocol servers your agents can use.",
-            .features => "What your agents are used for.",
+            .features => "What your APIs and agents are used for.",
         };
     }
 
     /// False while the page only says "coming up soon".
     pub fn ready(self: Page) bool {
         return switch (self) {
-            .mode, .theme, .agents, .features => true,
+            .mode, .theme, .apis, .agents, .features => true,
             .mcps => false,
         };
     }
@@ -83,7 +90,7 @@ pub const Section = struct {
 
 pub const sections = [_]Section{
     .{ .title = "UI", .pages = &.{ .mode, .theme } },
-    .{ .title = "AI", .pages = &.{ .agents, .mcps, .features } },
+    .{ .title = "AI", .pages = &.{ .apis, .agents, .mcps, .features } },
 };
 
 pub const SettingsTab = struct {
@@ -94,7 +101,8 @@ pub const SettingsTab = struct {
 
     gpa: std.mem.Allocator,
     page: Page = .mode,
-    agents: agents_mod.Page,
+    apis: apis_mod.Page,
+    agents: coding_mod.Page,
     features: features_mod.Page,
     /// The page drawn last frame: a switch resets the scroll and the focus.
     shown: Page = .mode,
@@ -105,11 +113,12 @@ pub const SettingsTab = struct {
 
     pub fn create(env: *tab_mod.Env, _: tab_mod.OpenArgs) anyerror!tab_mod.Tab {
         const self = try env.gpa.create(SettingsTab);
-        self.* = .{ .gpa = env.gpa, .agents = agents_mod.Page.init(env.gpa), .features = features_mod.Page.init(env.gpa) };
+        self.* = .{ .gpa = env.gpa, .apis = apis_mod.Page.init(env.gpa), .agents = coding_mod.Page.init(env.gpa), .features = features_mod.Page.init(env.gpa) };
         return tab_mod.Tab.from(SettingsTab, self);
     }
 
     pub fn deinit(self: *SettingsTab) void {
+        self.apis.deinit();
         self.agents.deinit();
         self.features.deinit();
         self.gpa.destroy(self);
@@ -128,7 +137,7 @@ pub const SettingsTab = struct {
 
     pub fn tick(self: *SettingsTab, now: f64, active: bool) bool {
         return switch (self.page) {
-            .agents => self.agents.tick(now),
+            .apis => self.apis.tick(now),
             .features => self.features.tick(now, active),
             else => false,
         };
@@ -137,7 +146,7 @@ pub const SettingsTab = struct {
     // ── keyboard: to the page with a focused field, else page scrolling ──
     pub fn onText(self: *SettingsTab, utf8: []const u8) void {
         switch (self.page) {
-            .agents => self.agents.onText(utf8),
+            .apis => self.apis.onText(utf8),
             .features => self.features.onText(utf8),
             else => {},
         }
@@ -145,7 +154,7 @@ pub const SettingsTab = struct {
 
     pub fn onMarkedText(self: *SettingsTab, utf8: []const u8) void {
         switch (self.page) {
-            .agents => self.agents.onMarkedText(utf8),
+            .apis => self.apis.onMarkedText(utf8),
             .features => self.features.onMarkedText(utf8),
             else => {},
         }
@@ -153,7 +162,7 @@ pub const SettingsTab = struct {
 
     pub fn onEdit(self: *SettingsTab, cmd: EditCommand) void {
         const used = switch (self.page) {
-            .agents => self.agents.onEdit(cmd),
+            .apis => self.apis.onEdit(cmd),
             .features => self.features.onEdit(cmd),
             else => false,
         };
@@ -172,14 +181,14 @@ pub const SettingsTab = struct {
 
     pub fn onCtrl(self: *SettingsTab, key: u8) void {
         switch (self.page) {
-            .agents => _ = self.agents.onCtrl(key),
+            .apis => _ = self.apis.onCtrl(key),
             else => {},
         }
     }
 
     pub fn paste(self: *SettingsTab, utf8: []const u8) void {
         switch (self.page) {
-            .agents => self.agents.paste(utf8),
+            .apis => self.apis.paste(utf8),
             .features => self.features.paste(utf8),
             else => {},
         }
@@ -187,7 +196,7 @@ pub const SettingsTab = struct {
 
     pub fn copy(self: *SettingsTab, out: *std.ArrayList(u8), cut: bool) bool {
         return switch (self.page) {
-            .agents => self.agents.copy(out, cut),
+            .apis => self.apis.copy(out, cut),
             .features => self.features.copy(out, cut),
             else => false,
         };
@@ -195,7 +204,7 @@ pub const SettingsTab = struct {
 
     pub fn hasMarkedText(self: *SettingsTab) bool {
         return switch (self.page) {
-            .agents => self.agents.hasMarkedText(),
+            .apis => self.apis.hasMarkedText(),
             .features => self.features.hasMarkedText(),
             else => false,
         };
@@ -203,7 +212,7 @@ pub const SettingsTab = struct {
 
     pub fn caretRect(self: *SettingsTab) Rect {
         return switch (self.page) {
-            .agents => self.agents.caretRect(),
+            .apis => self.apis.caretRect(),
             .features => self.features.caretRect(),
             else => .{},
         };
@@ -221,7 +230,7 @@ pub const SettingsTab = struct {
     pub fn draw(self: *SettingsTab, ui: *Ui, rect: Rect, focused: bool) void {
         const dl = ui.dl;
         if (self.page != self.shown) {
-            if (self.shown == .agents) self.agents.blur();
+            if (self.shown == .apis) self.apis.blur();
             if (self.shown == .features) self.features.blur();
             self.shown = self.page;
             self.scroll = 0;
@@ -250,7 +259,8 @@ pub const SettingsTab = struct {
         y = switch (page) {
             .mode => drawMode(ui, x, y, col_w),
             .theme => drawTheme(ui, x, y, col_w),
-            .agents => self.agents.draw(ui, x, y, col_w, ui.now),
+            .apis => self.apis.draw(ui, x, y, col_w, ui.now),
+            .agents => self.agents.draw(ui, x, y, col_w),
             .features => self.features.draw(ui, x, y, col_w, focused),
             else => drawSoon(ui, x, y, col_w),
         };

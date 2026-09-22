@@ -21,4 +21,6 @@ test {
     _ = @import("config.zig");
     _ = @import("tabs/web_tab.zig");
     _ = @import("agent.zig");
+    _ = @import("git.zig");
+    _ = @import("coding_agents.zig");
 }

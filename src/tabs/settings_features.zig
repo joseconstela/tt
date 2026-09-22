@@ -1,13 +1,16 @@
-//! Settings › AI › Features: what the configured agents are used for. The
-//! one feature so far hands commands the shell does not know to an agent;
-//! this page picks that agent and edits the prompt it gets. Both live in
-//! the config (`config.features`) and are written as they change.
+//! Settings › AI › Features: what the agents are used for. One card per
+//! feature — Unrecognised commands, Explain, Fix with agent — and each card
+//! holds both halves of its setting: which agent does the job, and, in the
+//! same card, the prompt that agent is told first. Everything lives in
+//! `config.features` and is written as it changes.
 const std = @import("std");
 const ui_mod = @import("../ui/ui.zig");
 const theme = @import("../ui/theme.zig");
 const sidebar = @import("../ui/sidebar.zig");
 const gfx_text = @import("../gfx/text.zig");
 const config = @import("../config.zig");
+const coding_agents = @import("../coding_agents.zig");
+const sys = @import("../sys.zig");
 const tab_mod = @import("tab.zig");
 const Document = @import("../input/document.zig").Document;
 const EditCommand = @import("../events.zig").EditCommand;
@@ -15,27 +18,92 @@ const EditCommand = @import("../events.zig").EditCommand;
 const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
 
-/// What the agent is told when the prompt is left blank.
-pub const default_prompt = "The user typed a line their shell does not recognise. Work out what they meant and propose the command that does it; keep any explanation to a line or two.";
+/// The features, in the order of their cards.
+pub const Feature = enum {
+    /// A line the shell does not know goes to an API agent.
+    fallback,
+    /// "Explain" on a failed block asks an API agent why.
+    explain,
+    /// "Fix with agent" on a failed block launches a coding agent.
+    fix,
+
+    pub fn title(self: Feature) []const u8 {
+        return switch (self) {
+            .fallback => "Unrecognised commands",
+            .explain => "Explain",
+            .fix => "Fix with agent",
+        };
+    }
+
+    pub fn hint(self: Feature) []const u8 {
+        return switch (self) {
+            .fallback => "When the shell does not know a command, the line goes to this agent instead.",
+            .explain => "Explain, on a failed command, asks this agent why it failed. The answer stays under the error.",
+            .fix => "Fix with agent, on a failed command, hands the failure to this coding agent. AI › Agents lists the installed ones.",
+        };
+    }
+
+    pub fn promptHint(self: Feature) []const u8 {
+        return switch (self) {
+            .fallback => "What the agent is told before the line you typed. Blank uses the default.",
+            .explain => "What the agent is told before the failed command and its output. Blank uses the default.",
+            .fix => "What the coding agent is asked, before the failed command and its output. Blank uses the default.",
+        };
+    }
+
+    /// What the agent is told when the prompt is left blank.
+    pub fn defaultPrompt(self: Feature) []const u8 {
+        return switch (self) {
+            .fallback => fallback_default_prompt,
+            .explain => explain_default_prompt,
+            .fix => fix_default_prompt,
+        };
+    }
+
+    /// The config string holding the feature's prompt.
+    pub fn promptSlot(self: Feature, cfg: *config.Config) *[]u8 {
+        return switch (self) {
+            .fallback => &cfg.features.command_fallback_prompt,
+            .explain => &cfg.features.explain_prompt,
+            .fix => &cfg.features.fix_prompt,
+        };
+    }
+};
+
+pub const fallback_default_prompt = "The user typed a line their shell does not recognise. Work out what they meant and propose the command that does it; keep any explanation to a line or two.";
+pub const explain_default_prompt = "A command the user ran in their terminal failed. Explain in a few short lines why it failed and what to do about it. If a corrected command would fix it, propose it.";
+pub const fix_default_prompt = "A command I ran in my terminal failed. Find out why and fix it.";
+
+/// The prompt a feature uses: its own, or the default when blank.
+pub fn promptFor(feature: Feature) []const u8 {
+    const own = feature.promptSlot(config.get()).*;
+    return if (std.mem.trim(u8, own, " \t\r\n").len == 0) feature.defaultPrompt() else own;
+}
 
 const font = theme.font_ui;
 const line_h: f32 = theme.output_line_h;
-/// Rows the prompt box shows before it scrolls.
-const box_rows: f32 = 6;
+/// Rows a prompt box shows before it scrolls.
+const box_rows: f32 = 5;
 const box_pad: f32 = 10;
 const row_h: f32 = 36;
 const card_pad = theme.block_pad_x;
 /// Height of a card's title and hint lines.
 const card_head: f32 = 70;
+/// The "Prompt" label and its hint, between the picker and the box.
+const prompt_head: f32 = 58;
 
-/// One visual row of the prompt after soft wrapping: bytes [start, end)
+/// One visual row of a prompt after soft wrapping: bytes [start, end)
 /// of the text; `last` when it ends its line.
 const Row = struct { start: u32, end: u32, last: bool };
 
-pub const Page = struct {
+/// The editable prompt of one feature: a soft-wrapped, scrolling text box
+/// with caret, selection and IME text. One per card; the one that was
+/// clicked last has the keyboard (`editing`).
+const PromptBox = struct {
     gpa: std.mem.Allocator,
+    feature: Feature,
     prompt: Document,
-    /// The prompt box has the keyboard.
+    /// The box has the keyboard.
     editing: bool = false,
     rows: std.ArrayList(Row) = .empty,
     /// What `rows` reflect: the width they were wrapped for, the document
@@ -58,48 +126,43 @@ pub const Page = struct {
     saved_revision: u64 = 0,
     loaded: bool = false,
 
-    pub fn init(gpa: std.mem.Allocator) Page {
-        return .{ .gpa = gpa, .prompt = Document.init(gpa) };
+    fn init(gpa: std.mem.Allocator, feature: Feature) PromptBox {
+        return .{ .gpa = gpa, .feature = feature, .prompt = Document.init(gpa) };
     }
 
-    pub fn deinit(self: *Page) void {
+    fn deinit(self: *PromptBox) void {
         self.rows.deinit(self.gpa);
         self.prompt.deinit();
     }
 
     /// Takes the prompt from the config, once.
-    fn load(self: *Page) void {
+    fn load(self: *PromptBox) void {
         self.loaded = true;
-        const cfg = config.get();
-        self.prompt.setText(cfg.features.command_fallback_prompt, .plain) catch {};
+        self.prompt.setText(self.feature.promptSlot(config.get()).*, .plain) catch {};
         self.saved_revision = self.prompt.revision;
     }
 
     /// Writes the prompt to the config when it changed.
-    fn flush(self: *Page) void {
+    fn flush(self: *PromptBox) void {
         if (!self.loaded or self.prompt.revision == self.saved_revision) return;
         self.saved_revision = self.prompt.revision;
         const cfg = config.get();
-        cfg.setString(&cfg.features.command_fallback_prompt, self.prompt.bytes());
+        cfg.setString(self.feature.promptSlot(cfg), self.prompt.bytes());
         cfg.touch();
     }
 
-    // ── keyboard (the settings tab routes here while this page is up) ───
-    pub fn onText(self: *Page, utf8: []const u8) void {
-        if (!self.editing) return;
+    // ── keyboard ────────────────────────────────────────────────────────
+    fn onText(self: *PromptBox, utf8: []const u8) void {
         self.prompt.insert(utf8);
         self.follow = true;
     }
 
-    pub fn onMarkedText(self: *Page, utf8: []const u8) void {
-        if (!self.editing) return;
+    fn onMarkedText(self: *PromptBox, utf8: []const u8) void {
         self.prompt.setMarked(utf8);
         self.follow = true;
     }
 
-    /// True when the prompt box had the keyboard and took the key.
-    pub fn onEdit(self: *Page, cmd: EditCommand) bool {
-        if (!self.editing) return false;
+    fn onEdit(self: *PromptBox, cmd: EditCommand) bool {
         const e = &self.prompt.editor;
         switch (cmd) {
             // ⎋ drops the selection, then the focus.
@@ -133,13 +196,7 @@ pub const Page = struct {
         return true;
     }
 
-    /// Gives the keyboard up (the tab switched page).
-    pub fn blur(self: *Page) void {
-        self.editing = false;
-    }
-
-    pub fn copy(self: *Page, out: *std.ArrayList(u8), cut: bool) bool {
-        if (!self.editing) return false;
+    fn copy(self: *PromptBox, out: *std.ArrayList(u8), cut: bool) bool {
         const e = &self.prompt.editor;
         const sel = e.selection() orelse return false;
         out.appendSlice(self.gpa, e.selectedText()) catch return false;
@@ -150,8 +207,7 @@ pub const Page = struct {
         return true;
     }
 
-    pub fn paste(self: *Page, utf8: []const u8) void {
-        if (!self.editing) return;
+    fn paste(self: *PromptBox, utf8: []const u8) void {
         // Clipboard text may use CR line ends; the document keeps LF.
         var clean: std.ArrayList(u8) = .empty;
         defer clean.deinit(self.gpa);
@@ -165,17 +221,7 @@ pub const Page = struct {
         self.follow = true;
     }
 
-    pub fn hasMarkedText(self: *const Page) bool {
-        return self.editing and self.prompt.editor.marked.items.len > 0;
-    }
-
-    pub fn caretRect(self: *const Page) Rect {
-        return if (self.editing) self.caret else .{};
-    }
-
-    /// ⌘Z / ⇧⌘Z while the box has the keyboard.
-    pub fn command(self: *Page, cmd: tab_mod.Command) bool {
-        if (!self.editing) return false;
+    fn command(self: *PromptBox, cmd: tab_mod.Command) bool {
         switch (cmd) {
             .undo => {
                 self.follow = true;
@@ -190,7 +236,7 @@ pub const Page = struct {
     }
 
     /// Caret blink and the write-back; true when a redraw is needed.
-    pub fn tick(self: *Page, now: f64, active: bool) bool {
+    fn tick(self: *PromptBox, now: f64, active: bool) bool {
         self.flush();
         const e = &self.prompt.editor;
         if (e.version != self.seen_version) {
@@ -207,84 +253,16 @@ pub const Page = struct {
     }
 
     // ── drawing ─────────────────────────────────────────────────────────
-    /// The page body under the title: the agent picker, then the prompt.
-    /// `x`/`col_w` is the content column, `y` its top; returns the bottom.
-    pub fn draw(self: *Page, ui: *Ui, x: f32, y: f32, col_w: f32, focused: bool) f32 {
+    /// Soft-wrapped text with caret, selection, IME text and scrolling. A
+    /// press inside takes the keyboard, one anywhere else gives it up.
+    fn draw(self: *PromptBox, ui: *Ui, box: Rect, focused: bool) void {
         if (!self.loaded) self.load();
-        const agents_bottom = drawAgents(ui, x, y, col_w);
-        const bottom = self.drawPrompt(ui, x, agents_bottom + theme.block_gap, col_w, focused);
-        self.flush();
-        return bottom;
-    }
-
-    /// Which agent gets the commands the shell does not know: "Off" first,
-    /// then one row per configured agent. A chosen agent that has since been
-    /// removed is still shown, so the choice can be seen and changed.
-    fn drawAgents(ui: *Ui, x: f32, y: f32, col_w: f32) f32 {
-        const dl = ui.dl;
-        const cfg = config.get();
-        const agents = cfg.agents.items;
-        // `current` points into the config: a click below replaces that
-        // string, so it is re-read after one (and a stale choice is gone).
-        var current: ?[]const u8 = cfg.features.command_fallback_agent;
-        var missing = if (current) |name| findAgent(agents, name) == null else false;
-        const n_rows: f32 = @floatFromInt(1 + agents.len + @intFromBool(missing));
-        const note_h: f32 = if (agents.len == 0) 26 else 0;
-        const card: Rect = .{ .x = x, .y = y, .w = col_w, .h = card_head + n_rows * row_h + note_h + 10 };
-        dl.shape(card, theme.block_radius, theme.bg_block, theme.block_border, theme.line);
-        _ = dl.textCentered(theme.font_ui_medium, card.x + card_pad, card.y + 28, "Unrecognised commands", theme.text);
-        _ = dl.textCentered(theme.font_hint, card.x + card_pad, card.y + 52, "When the shell does not know a command, the line goes to this agent instead.", theme.text_3);
-
-        var ry = card.y + card_head;
-        if (radioRow(ui, Ui.id("settings.features.agent", 0), card, ry, "Off", "Unknown commands stay errors.", current == null, true)) {
-            cfg.setOptString(&cfg.features.command_fallback_agent, null);
-            cfg.touch();
-            current = null;
-            missing = false;
-        }
-        ry += row_h;
-        for (agents, 0..) |a, i| {
-            const selected = if (current) |name| std.mem.eql(u8, name, a.name) else false;
-            var detail_buf: [96]u8 = undefined;
-            const detail = if (a.model.len == 0) a.provider.label() else std.fmt.bufPrint(&detail_buf, "{s} · {s}", .{ a.provider.label(), a.model }) catch a.provider.label();
-            if (radioRow(ui, Ui.id("settings.features.agent", i + 1), card, ry, a.name, detail, selected, true)) {
-                cfg.setOptString(&cfg.features.command_fallback_agent, a.name);
-                cfg.touch();
-                current = cfg.features.command_fallback_agent;
-                missing = false;
-            }
-            ry += row_h;
-        }
-        if (missing) {
-            _ = radioRow(ui, 0, card, ry, current.?, "No longer set up: pick another.", true, false);
-            ry += row_h;
-        }
-        if (agents.len == 0) {
-            _ = dl.textCentered(theme.font_hint, card.x + card_pad + 10, ry + 10, "No agents yet: add one under AI › Agents.", theme.text_3);
-        }
-        return card.bottom();
-    }
-
-    fn drawPrompt(self: *Page, ui: *Ui, x: f32, y: f32, col_w: f32, focused: bool) f32 {
-        const dl = ui.dl;
-        const box_h = box_rows * line_h + 2 * box_pad;
-        const card: Rect = .{ .x = x, .y = y, .w = col_w, .h = card_head + box_h + card_pad };
-        dl.shape(card, theme.block_radius, theme.bg_block, theme.block_border, theme.line);
-        _ = dl.textCentered(theme.font_ui_medium, card.x + card_pad, card.y + 28, "Prompt", theme.text);
-        _ = dl.textCentered(theme.font_hint, card.x + card_pad, card.y + 52, "What the agent is told before the command you typed. Blank uses the default.", theme.text_3);
-        self.drawBox(ui, .{ .x = card.x + card_pad, .y = card.y + card_head, .w = card.w - 2 * card_pad, .h = box_h }, focused);
-        return card.bottom();
-    }
-
-    /// The prompt box: soft-wrapped text with caret, selection, IME text
-    /// and scrolling. A press inside takes the keyboard, one anywhere else
-    /// gives it up.
-    fn drawBox(self: *Page, ui: *Ui, box: Rect, focused: bool) void {
         const dl = ui.dl;
         const text = ui.text;
         const scale = dl.scale;
         const doc = &self.prompt;
         const e = &doc.editor;
+        const n: usize = @intFromEnum(self.feature);
         self.text = text;
         self.box_h = box.h;
 
@@ -293,7 +271,7 @@ pub const Page = struct {
         const inner = box.inset(box_pad, box_pad);
         const wrap_w = @max(20, inner.w - 6);
         const empty = doc.bytes().len == 0;
-        const src: []const u8 = if (empty) default_prompt else doc.bytes();
+        const src: []const u8 = if (empty) self.feature.defaultPrompt() else doc.bytes();
         if (self.wrap_revision != doc.revision or self.wrap_w != wrap_w or self.rows_placeholder != empty) {
             self.wrap(text, src, wrap_w);
             self.wrap_revision = doc.revision;
@@ -305,12 +283,12 @@ pub const Page = struct {
         const max_scroll = @max(0, self.content_h - box.h);
 
         self.scroll -= ui.takeScroll(box);
-        const vbar = Ui.id("settings.features.prompt.vbar", 0);
+        const vbar = Ui.id("settings.features.prompt.vbar", n);
         if (sidebar.scrollbarDrag(ui, vbar, .vertical, box, self.scroll, self.content_h)) |s| self.scroll = s;
 
         // Mouse: caret, word, line, drag selection (a drag past the top or
         // bottom scrolls that way).
-        const d = ui.drag(Ui.id("settings.features.prompt", 0), box);
+        const d = ui.drag(Ui.id("settings.features.prompt", n), box);
         if (d.hover or d.dragging) ui.cursor = .ibeam;
         if ((d.started or d.dragging) and !empty) {
             if (d.dragging and !d.started) {
@@ -402,7 +380,7 @@ pub const Page = struct {
     // ── rows ────────────────────────────────────────────────────────────
     /// Soft-wraps `src` into visual rows `w` points wide, breaking after a
     /// space where it can and inside a word when it must.
-    fn wrap(self: *Page, text: *gfx_text.TextEngine, src: []const u8, w: f32) void {
+    fn wrap(self: *PromptBox, text: *gfx_text.TextEngine, src: []const u8, w: f32) void {
         self.rows.clearRetainingCapacity();
         var ls: usize = 0;
         while (true) {
@@ -412,7 +390,7 @@ pub const Page = struct {
         }
     }
 
-    fn wrapLine(self: *Page, text: *gfx_text.TextEngine, src: []const u8, ls: usize, le: usize, w: f32) void {
+    fn wrapLine(self: *PromptBox, text: *gfx_text.TextEngine, src: []const u8, ls: usize, le: usize, w: f32) void {
         var row_start = ls;
         var x: f32 = 0;
         // Right after the last space of the row so far.
@@ -438,7 +416,7 @@ pub const Page = struct {
 
     /// The visual row byte `c` is on: the caret after a wrap belongs to the
     /// row that starts there, but at the end of a line it stays on that line.
-    fn rowOf(self: *const Page, c: usize) usize {
+    fn rowOf(self: *const PromptBox, c: usize) usize {
         const rows = self.rows.items;
         for (rows, 0..) |row, i| {
             if (c >= row.start and (c < row.end or (c == row.end and row.last))) return i;
@@ -447,7 +425,7 @@ pub const Page = struct {
     }
 
     /// Byte offset closest to the point (mx, my); the text starts at `inner`.
-    fn offsetAt(self: *const Page, text: *gfx_text.TextEngine, src: []const u8, inner: Rect, mx: f32, my: f32) usize {
+    fn offsetAt(self: *const PromptBox, text: *gfx_text.TextEngine, src: []const u8, inner: Rect, mx: f32, my: f32) usize {
         const rows = self.rows.items;
         if (rows.len == 0) return 0;
         const rel_y = @max(0, my - inner.y + self.scroll);
@@ -455,31 +433,10 @@ pub const Page = struct {
         return offsetInRow(text, src, rows[r], mx - inner.x);
     }
 
-    /// Byte offset closest to `x` points from the start of `row`.
-    fn offsetInRow(text: *gfx_text.TextEngine, src: []const u8, row: Row, x: f32) usize {
-        var px: f32 = 0;
-        var it = gfx_text.Utf8Iter{ .bytes = src[row.start..row.end] };
-        while (true) {
-            const at = row.start + it.index;
-            const cp = it.next() orelse return row.end;
-            const adv = advanceOf(text, cp);
-            if (px + adv / 2 > x) return at;
-            px += adv;
-        }
-    }
-
-    /// Points from the start of `row` to byte `c` on it.
-    fn xOf(text: *gfx_text.TextEngine, src: []const u8, row: Row, c: usize) f32 {
-        var px: f32 = 0;
-        var it = gfx_text.Utf8Iter{ .bytes = src[row.start..@min(row.end, c)] };
-        while (it.next()) |cp| px += advanceOf(text, cp);
-        return px;
-    }
-
     /// ↑/↓ between visual rows, keeping the caret's x; the first row goes
     /// to the start of the text and the last to its end. False when the
     /// rows are not current, so the document's own line moves apply.
-    fn moveRow(self: *Page, cmd: EditCommand) bool {
+    fn moveRow(self: *PromptBox, cmd: EditCommand) bool {
         const text = self.text orelse return false;
         const doc = &self.prompt;
         if (self.rows_placeholder or self.wrap_revision != doc.revision or self.rows.items.len == 0) return false;
@@ -504,6 +461,244 @@ pub const Page = struct {
     }
 };
 
+pub const Page = struct {
+    gpa: std.mem.Allocator,
+    boxes: [3]PromptBox,
+
+    pub fn init(gpa: std.mem.Allocator) Page {
+        return .{ .gpa = gpa, .boxes = .{ PromptBox.init(gpa, .fallback), PromptBox.init(gpa, .explain), PromptBox.init(gpa, .fix) } };
+    }
+
+    pub fn deinit(self: *Page) void {
+        for (&self.boxes) |*b| b.deinit();
+    }
+
+    /// The prompt box with the keyboard, if any.
+    fn editing(self: *Page) ?*PromptBox {
+        for (&self.boxes) |*b| {
+            if (b.editing) return b;
+        }
+        return null;
+    }
+
+    fn editingConst(self: *const Page) ?*const PromptBox {
+        for (&self.boxes) |*b| {
+            if (b.editing) return b;
+        }
+        return null;
+    }
+
+    // ── keyboard (the settings tab routes here while this page is up) ───
+    pub fn onText(self: *Page, utf8: []const u8) void {
+        if (self.editing()) |b| b.onText(utf8);
+    }
+
+    pub fn onMarkedText(self: *Page, utf8: []const u8) void {
+        if (self.editing()) |b| b.onMarkedText(utf8);
+    }
+
+    /// True when a prompt box had the keyboard and took the key.
+    pub fn onEdit(self: *Page, cmd: EditCommand) bool {
+        const b = self.editing() orelse return false;
+        return b.onEdit(cmd);
+    }
+
+    /// Gives the keyboard up (the tab switched page).
+    pub fn blur(self: *Page) void {
+        for (&self.boxes) |*b| b.editing = false;
+    }
+
+    pub fn copy(self: *Page, out: *std.ArrayList(u8), cut: bool) bool {
+        const b = self.editing() orelse return false;
+        return b.copy(out, cut);
+    }
+
+    pub fn paste(self: *Page, utf8: []const u8) void {
+        if (self.editing()) |b| b.paste(utf8);
+    }
+
+    pub fn hasMarkedText(self: *const Page) bool {
+        const b = self.editingConst() orelse return false;
+        return b.prompt.editor.marked.items.len > 0;
+    }
+
+    pub fn caretRect(self: *const Page) Rect {
+        const b = self.editingConst() orelse return .{};
+        return b.caret;
+    }
+
+    /// ⌘Z / ⇧⌘Z while a box has the keyboard.
+    pub fn command(self: *Page, cmd: tab_mod.Command) bool {
+        const b = self.editing() orelse return false;
+        return b.command(cmd);
+    }
+
+    /// Caret blink and the write-back; true when a redraw is needed.
+    pub fn tick(self: *Page, now: f64, active: bool) bool {
+        var redraw = false;
+        for (&self.boxes) |*b| {
+            if (b.tick(now, active)) redraw = true;
+        }
+        return redraw;
+    }
+
+    // ── drawing ─────────────────────────────────────────────────────────
+    /// The page body under the title: one card per feature. `x`/`col_w` is
+    /// the content column, `y` its top; returns the bottom.
+    pub fn draw(self: *Page, ui: *Ui, x: f32, y: f32, col_w: f32, focused: bool) f32 {
+        var cy = y;
+        for (&self.boxes, 0..) |*box, i| {
+            if (i > 0) cy += theme.block_gap;
+            cy = self.drawCard(ui, box, x, cy, col_w, focused);
+        }
+        for (&self.boxes) |*b| b.flush();
+        return cy;
+    }
+
+    /// One feature's card: title and hint, the picker rows, then the
+    /// prompt with its own label and box.
+    fn drawCard(self: *Page, ui: *Ui, box: *PromptBox, x: f32, y: f32, col_w: f32, focused: bool) f32 {
+        _ = self;
+        const dl = ui.dl;
+        const feature = box.feature;
+        const rows = pickerRows(feature);
+        const note: ?[]const u8 = pickerNote(feature);
+        const note_h: f32 = if (note != null) 26 else 0;
+        const box_h = box_rows * line_h + 2 * box_pad;
+        const card: Rect = .{ .x = x, .y = y, .w = col_w, .h = card_head + @as(f32, @floatFromInt(rows)) * row_h + note_h + prompt_head + box_h + card_pad };
+        dl.shape(card, theme.block_radius, theme.bg_block, theme.block_border, theme.line);
+        _ = dl.textCentered(theme.font_ui_medium, card.x + card_pad, card.y + 28, feature.title(), theme.text);
+        _ = dl.textEllipsis(theme.font_hint, card.x + card_pad, card.y + 52, feature.hint(), card.w - 2 * card_pad, theme.text_3);
+
+        var ry = card.y + card_head;
+        ry = switch (feature) {
+            .fallback => drawApiPicker(ui, feature, card, ry, &config.get().features.command_fallback_agent),
+            .explain => drawApiPicker(ui, feature, card, ry, &config.get().features.explain_agent),
+            .fix => drawFixPicker(ui, card, ry),
+        };
+        if (note) |n| {
+            _ = dl.textCentered(theme.font_hint, card.x + card_pad + 10, ry + 10, n, theme.text_3);
+            ry += note_h;
+        }
+
+        // The prompt, within the same card.
+        ry += 8;
+        dl.rect(.{ .x = card.x + card_pad, .y = ry, .w = card.w - 2 * card_pad, .h = 1 }, theme.line);
+        _ = dl.textCentered(theme.font_ui_medium, card.x + card_pad, ry + 20, "Prompt", theme.text);
+        _ = dl.textEllipsis(theme.font_hint, card.x + card_pad, ry + 42, feature.promptHint(), card.w - 2 * card_pad, theme.text_3);
+        ry += prompt_head - 8;
+        box.draw(ui, .{ .x = card.x + card_pad, .y = ry, .w = card.w - 2 * card_pad, .h = box_h }, focused);
+        return card.bottom();
+    }
+
+    /// How many picker rows a feature's card shows this frame.
+    fn pickerRows(feature: Feature) usize {
+        const cfg = config.get();
+        switch (feature) {
+            .fallback, .explain => {
+                const current = if (feature == .fallback) cfg.features.command_fallback_agent else cfg.features.explain_agent;
+                const missing = if (current) |name| cfg.findAgentByName(name) == null else false;
+                return 1 + cfg.agents.items.len + @intFromBool(missing);
+            },
+            .fix => {
+                const scan = coding_agents.get();
+                const f = &cfg.features;
+                const missing = !f.fixAuto() and !f.fixOff() and scan.find(f.fix_agent) == null;
+                return 2 + scan.found.items.len + @intFromBool(missing);
+            },
+        }
+    }
+
+    /// The line under the rows when there is nothing to pick from.
+    fn pickerNote(feature: Feature) ?[]const u8 {
+        const cfg = config.get();
+        switch (feature) {
+            .fallback, .explain => return if (cfg.agents.items.len == 0) "No APIs yet: add one under AI › APIs." else null,
+            .fix => return if (coding_agents.get().found.items.len == 0) "No coding agent found on this Mac: AI › Agents says how to install one." else null,
+        }
+    }
+
+    /// Which API agent does the job: "Off" first, then one row per
+    /// configured agent. A chosen agent that has since been removed is
+    /// still shown, so the choice can be seen and changed.
+    fn drawApiPicker(ui: *Ui, feature: Feature, card: Rect, y: f32, slot: *?[]u8) f32 {
+        const cfg = config.get();
+        const agents = cfg.agents.items;
+        const n: usize = @as(usize, @intFromEnum(feature)) * 64;
+        // `current` points into the config: a click below replaces that
+        // string, so it is re-read after one (and a stale choice is gone).
+        var current: ?[]const u8 = slot.*;
+        var missing = if (current) |name| cfg.findAgentByName(name) == null else false;
+
+        var ry = y;
+        const off_detail: []const u8 = if (feature == .fallback) "Unknown commands stay errors." else "The button says so when pressed.";
+        if (radioRow(ui, Ui.id("settings.features.pick", n), card, ry, "Off", off_detail, current == null, true)) {
+            cfg.setOptString(slot, null);
+            cfg.touch();
+            current = null;
+            missing = false;
+        }
+        ry += row_h;
+        for (agents, 0..) |a, i| {
+            const selected = if (current) |name| std.mem.eql(u8, name, a.name) else false;
+            var detail_buf: [96]u8 = undefined;
+            const detail = if (a.model.len == 0) a.provider.label() else std.fmt.bufPrint(&detail_buf, "{s} · {s}", .{ a.provider.label(), a.model }) catch a.provider.label();
+            if (radioRow(ui, Ui.id("settings.features.pick", n + 1 + i), card, ry, a.name, detail, selected, true)) {
+                cfg.setOptString(slot, a.name);
+                cfg.touch();
+                current = slot.*;
+                missing = false;
+            }
+            ry += row_h;
+        }
+        if (missing) {
+            _ = radioRow(ui, 0, card, ry, current.?, "No longer set up: pick another.", true, false);
+            ry += row_h;
+        }
+        return ry;
+    }
+
+    /// Which coding agent "Fix with agent" launches: "Automatic" (the first
+    /// one installed), "Off", then one row per installed agent. A chosen
+    /// agent that is gone stays listed until another is picked.
+    fn drawFixPicker(ui: *Ui, card: Rect, y: f32) f32 {
+        const cfg = config.get();
+        const f = &cfg.features;
+        const scan = coding_agents.get();
+        const n: usize = @as(usize, @intFromEnum(Feature.fix)) * 64;
+        var ry = y;
+
+        var auto_buf: [128]u8 = undefined;
+        const auto_detail: []const u8 = if (scan.first()) |first| (std.fmt.bufPrint(&auto_buf, "Whichever is installed: {s} right now.", .{first.known.label}) catch first.known.label) else "Whichever is installed: none found right now.";
+        if (radioRow(ui, Ui.id("settings.features.pick", n), card, ry, "Automatic", auto_detail, f.fixAuto(), true)) {
+            cfg.setString(&f.fix_agent, config.Features.fix_auto);
+            cfg.touch();
+        }
+        ry += row_h;
+        if (radioRow(ui, Ui.id("settings.features.pick", n + 1), card, ry, "Off", "The button says so when pressed.", f.fixOff(), true)) {
+            cfg.setString(&f.fix_agent, config.Features.fix_off);
+            cfg.touch();
+        }
+        ry += row_h;
+        for (scan.found.items, 0..) |found, i| {
+            var path_buf: [256]u8 = undefined;
+            const detail = sys.abbreviateHome(found.path, &path_buf);
+            const selected = std.mem.eql(u8, f.fix_agent, found.known.id);
+            if (radioRow(ui, Ui.id("settings.features.pick", n + 2 + i), card, ry, found.known.label, detail, selected, true)) {
+                cfg.setString(&f.fix_agent, found.known.id);
+                cfg.touch();
+            }
+            ry += row_h;
+        }
+        if (!f.fixAuto() and !f.fixOff() and scan.find(f.fix_agent) == null) {
+            const label = if (coding_agents.byId(f.fix_agent)) |k| k.label else f.fix_agent;
+            _ = radioRow(ui, 0, card, ry, label, "Not installed: pick another.", true, false);
+            ry += row_h;
+        }
+        return ry;
+    }
+};
+
 /// A pick-one row: a ring with a dot when selected, the label, and a dim
 /// detail at the right. True when clicked.
 fn radioRow(ui: *Ui, wid: u64, card: Rect, y: f32, label: []const u8, detail: []const u8, selected: bool, enabled: bool) bool {
@@ -520,11 +715,25 @@ fn radioRow(ui: *Ui, wid: u64, card: Rect, y: f32, label: []const u8, detail: []
     return st.clicked;
 }
 
-fn findAgent(agents: []const config.Agent, name: []const u8) ?usize {
-    for (agents, 0..) |a, i| {
-        if (std.mem.eql(u8, a.name, name)) return i;
+/// Byte offset closest to `x` points from the start of `row`.
+fn offsetInRow(text: *gfx_text.TextEngine, src: []const u8, row: Row, x: f32) usize {
+    var px: f32 = 0;
+    var it = gfx_text.Utf8Iter{ .bytes = src[row.start..row.end] };
+    while (true) {
+        const at = row.start + it.index;
+        const cp = it.next() orelse return row.end;
+        const adv = advanceOf(text, cp);
+        if (px + adv / 2 > x) return at;
+        px += adv;
     }
-    return null;
+}
+
+/// Points from the start of `row` to byte `c` on it.
+fn xOf(text: *gfx_text.TextEngine, src: []const u8, row: Row, c: usize) f32 {
+    var px: f32 = 0;
+    var it = gfx_text.Utf8Iter{ .bytes = src[row.start..@min(row.end, c)] };
+    while (it.next()) |cp| px += advanceOf(text, cp);
+    return px;
 }
 
 /// Width of a code point in the prompt's font; a tab is four spaces.

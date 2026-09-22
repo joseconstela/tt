@@ -23,6 +23,9 @@ pub const Mode = enum { none, menu, rename, confirm, icons };
 /// or resource (by id), or the default project (no id).
 pub const Subject = enum { tab, project, default_project, resource };
 
+/// What a confirm box leads to when it is accepted.
+pub const ConfirmKind = enum { close_tab, git_discard };
+
 /// What the user decided; the app carries it out.
 pub const Outcome = union(enum) {
     /// Tab menu → "Rename…": open the rename box for this tab.
@@ -37,6 +40,8 @@ pub const Outcome = union(enum) {
     renamed: struct { uid: u32, name: []const u8 },
     /// Close confirmation accepted.
     close_confirmed: u32,
+    /// The Git panel's "Discard" box accepted: the panel runs what it had pending.
+    discard_confirmed: void,
     /// Project menu → "Rename…": open the rename box for this project.
     rename_project: u32,
     /// Rename box confirmed for a project (`name` as in `renamed`; blank
@@ -124,11 +129,15 @@ pub const Overlay = struct {
     /// Caret in window coordinates (for the IME candidate window).
     caret: Rect = .{},
 
-    // Confirm box: the tab's title and its reason for asking.
-    title_buf: [96]u8 = undefined,
+    // Confirm box: its heading, its reason for asking and the label of
+    // the button that goes ahead.
+    title_buf: [160]u8 = undefined,
     title_len: usize = 0,
-    reason_buf: [160]u8 = undefined,
+    reason_buf: [200]u8 = undefined,
     reason_len: usize = 0,
+    ok_buf: [32]u8 = undefined,
+    ok_len: usize = 0,
+    confirm_kind: ConfirmKind = .close_tab,
 
     // Icon picker: the row of `icon_spec` that is set now, if any.
     icon_current: ?usize = null,
@@ -194,11 +203,23 @@ pub const Overlay = struct {
 
     /// The close confirmation; `reason` is the tab's sentence on what would be lost.
     pub fn openConfirm(self: *Overlay, uid: u32, title: []const u8, reason: []const u8) void {
+        var heading_buf: [160]u8 = undefined;
+        const heading = std.fmt.bufPrint(&heading_buf, "Close “{s}”?", .{title}) catch "Close this tab?";
+        self.openConfirmAction(.close_tab, uid, heading, reason, "Close");
+    }
+
+    /// A box asking before something that cannot be undone (the Git
+    /// panel's discards): `heading` as the question, `reason` under it,
+    /// `ok` on the destructive button. What follows is the kind's outcome
+    /// (`close_confirmed` for a tab, `discard_confirmed` for git).
+    pub fn openConfirmAction(self: *Overlay, kind: ConfirmKind, id: u32, heading: []const u8, reason: []const u8, ok: []const u8) void {
         self.mode = .confirm;
         self.subject = .tab;
-        self.id = uid;
-        self.title_len = copyInto(&self.title_buf, title);
+        self.confirm_kind = kind;
+        self.id = id;
+        self.title_len = copyInto(&self.title_buf, heading);
         self.reason_len = copyInto(&self.reason_buf, reason);
+        self.ok_len = copyInto(&self.ok_buf, ok);
     }
 
     // ── per-tick ────────────────────────────────────────────────────────
@@ -340,7 +361,9 @@ pub const Overlay = struct {
 
     fn confirmClose(self: *Overlay) Outcome {
         const uid = self.id;
+        const kind = self.confirm_kind;
         self.close();
+        if (kind == .git_discard) return .discard_confirmed;
         return .{ .close_confirmed = uid };
     }
 
@@ -474,16 +497,14 @@ pub const Overlay = struct {
         const x = box.x + box_pad;
         const w = box.w - 2 * box_pad;
         var y = box.y + box_pad;
-        var heading_buf: [128]u8 = undefined;
-        const heading = std.fmt.bufPrint(&heading_buf, "Close “{s}”?", .{self.title_buf[0..self.title_len]}) catch "Close this tab?";
-        _ = dl.textEllipsis(font_title, x, y + title_h / 2, heading, w, theme.text);
+        _ = dl.textEllipsis(font_title, x, y + title_h / 2, self.title_buf[0..self.title_len], w, theme.text);
         y += title_h + 8;
         _ = dl.textEllipsis(theme.font_hint, x, y + line_h / 2, self.reason_buf[0..self.reason_len], w, theme.text_2);
         y += line_h + 22;
 
         var out: ?Outcome = null;
         var right = box.right() - box_pad;
-        if (boxButton(ui, Ui.id("overlay.ok", 0), &right, y, "Close", .destructive)) out = self.confirmClose();
+        if (boxButton(ui, Ui.id("overlay.ok", 0), &right, y, self.ok_buf[0..self.ok_len], .destructive)) out = self.confirmClose();
         if (boxButton(ui, Ui.id("overlay.cancel", 0), &right, y, "Cancel", .plain)) self.close();
         return out;
     }

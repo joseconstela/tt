@@ -315,6 +315,7 @@ pub const App = struct {
         const fr = self.files.draw(ui, files_rect, true);
         if (fr.open_file) |path| self.openFile(path);
         if (fr.pin_file) |path| self.pinFile(path);
+        if (fr.confirm) |c| self.overlay.openConfirmAction(.git_discard, 0, c.heading, c.reason, "Discard");
 
         // The panes: each one's strip, its active tab, the dividers, and a
         // tab being dragged. Moves are applied to the tab manager inside.
@@ -669,6 +670,7 @@ pub const App = struct {
             .close_confirmed => |uid| if (self.tabs.focus(uid)) {
                 if (self.tabs.indexOf(uid)) |i| self.closeTab(i);
             },
+            .discard_confirmed => self.files.discardConfirmed(),
             .rename_project => |pid| if (self.projects.find(pid)) |p| {
                 self.overlay.openRename(.project, pid, p.name);
             },
@@ -853,12 +855,15 @@ pub const App = struct {
     }
 
     // Keyboard input goes to the palette while it is open, else to the tab
-    // menu / boxes while one is open, else to the active tab.
+    // menu / boxes while one is open, else to the files panel's commit
+    // message while it has the focus, else to the active tab.
     pub fn onText(self: *App, utf8: []const u8) void {
         if (self.palette.open) {
             self.palette.onText(utf8);
         } else if (self.overlay.isOpen()) {
             self.overlay.onText(utf8);
+        } else if (self.files.hasFocus()) {
+            self.files.onText(utf8);
         } else if (self.tabs.current()) |t| t.vtable.onText(t.ptr, utf8);
         self.invalidate();
     }
@@ -868,6 +873,8 @@ pub const App = struct {
             self.palette.onMarkedText(utf8);
         } else if (self.overlay.isOpen()) {
             self.overlay.onMarkedText(utf8);
+        } else if (self.files.hasFocus()) {
+            self.files.onMarkedText(utf8);
         } else if (self.tabs.current()) |t| t.vtable.onMarkedText(t.ptr, utf8);
         self.invalidate();
     }
@@ -877,6 +884,8 @@ pub const App = struct {
             if (self.palette.onEdit(cmd)) |pick| self.executePick(pick);
         } else if (self.overlay.isOpen()) {
             if (self.overlay.onEdit(cmd)) |out| self.applyOverlay(out);
+        } else if (self.files.hasFocus()) {
+            self.files.onEdit(cmd);
         } else if (self.tabs.current()) |t| t.vtable.onEdit(t.ptr, cmd);
         self.invalidate();
     }
@@ -896,6 +905,11 @@ pub const App = struct {
             self.perform(if (self.ui.mods.shift) .prev_tab else .next_tab);
             return;
         }
+        if (self.files.hasFocus()) {
+            self.files.onCtrl(key);
+            self.invalidate();
+            return;
+        }
         if (self.tabs.current()) |t| t.vtable.onCtrl(t.ptr, key);
         self.invalidate();
     }
@@ -905,6 +919,8 @@ pub const App = struct {
             self.palette.onPaste(utf8);
         } else if (self.overlay.isOpen()) {
             self.overlay.onPaste(utf8);
+        } else if (self.files.hasFocus()) {
+            self.files.paste(utf8);
         } else if (self.tabs.current()) |t| t.vtable.paste(t.ptr, utf8);
         self.invalidate();
     }
@@ -922,6 +938,11 @@ pub const App = struct {
             if (sel.len == 0) return null;
             out.appendSlice(self.gpa, sel) catch return null;
             if (cut) _ = self.overlay.editor.deleteSelection();
+        } else if (self.files.hasFocus()) {
+            if (!self.files.copy(&out, cut)) {
+                out.deinit(self.gpa);
+                return null;
+            }
         } else {
             const t = self.tabs.current() orelse return null;
             if (!t.vtable.copy(t.ptr, &out, cut)) {
@@ -936,6 +957,7 @@ pub const App = struct {
     pub fn hasMarkedText(self: *App) bool {
         if (self.palette.open) return self.palette.editor.marked.items.len > 0;
         if (self.overlay.mode == .rename) return self.overlay.editor.marked.items.len > 0;
+        if (self.files.hasFocus()) return self.files.hasMarkedText();
         const t = self.tabs.current() orelse return false;
         return t.vtable.hasMarkedText(t.ptr);
     }
@@ -943,6 +965,7 @@ pub const App = struct {
     pub fn caretRect(self: *App) draw.Rect {
         if (self.palette.open) return self.palette.caret;
         if (self.overlay.mode == .rename) return self.overlay.caret;
+        if (self.files.hasFocus()) return self.files.caretRect();
         const t = self.tabs.current() orelse return .{};
         return t.vtable.caretRect(t.ptr);
     }

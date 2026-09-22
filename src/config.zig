@@ -1,13 +1,14 @@
-//! The user's settings: appearance and the AI agents they have set up,
-//! kept in `~/.conch/config.yml`. The file is written by the Settings tab
-//! and meant to be edited by hand too, so it is a small, readable subset of
-//! YAML: two levels of `key: value` mappings and a list of mappings for the
-//! agents. Unknown keys are ignored, so older builds can read newer files.
+//! The user's settings: appearance, the model APIs they have set up and
+//! what the features use, kept in `~/.conch/config.yml`. The file is
+//! written by the Settings tab and meant to be edited by hand too, so it is
+//! a small, readable subset of YAML: two levels of `key: value` mappings and
+//! a list of mappings for the APIs. Unknown keys are ignored, so older
+//! builds can read newer files.
 //!
 //!   ui:
 //!     mode: system          # dark | light | system | eink
 //!     accent: amber         # amber | peach | lime | rose | "#RRGGBB"
-//!   agents:
+//!   apis:                   # (older files say `agents:`; both are read)
 //!     - name: Claude
 //!       provider: anthropic # anthropic | openai | google | mistral | ollama | custom
 //!       model: claude-sonnet-5
@@ -15,8 +16,15 @@
 //!       base_url: https://api.anthropic.com
 //!       default: true
 //!   features:
-//!     command_fallback_agent: Claude
+//!     command_fallback_agent: Claude      # an API by name; absent = off
 //!     command_fallback_prompt: "…"
+//!     explain_agent: Claude               # an API by name; absent = off
+//!     explain_prompt: "…"
+//!     fix_agent: auto                     # auto | off | a coding agent id (claude, codex …)
+//!     fix_prompt: "…"
+//!
+//! In the code an "agent" is one of the APIs (a model at a provider); the
+//! coding agents installed on the Mac live in `coding_agents.zig`.
 //!
 //! One instance lives for the whole app (`get()`); saves are debounced
 //! (`touch`) so typing into a field does not rewrite the file per keystroke.
@@ -150,12 +158,32 @@ pub const Agent = struct {
     }
 };
 
-/// Settings of the features that use the agents.
+/// Settings of the features that use the agents. Each prompt is what the
+/// agent is told first; blank means the feature's default.
 pub const Features = struct {
     /// Name of the agent that turns unrecognised terminal commands into a
     /// conversation, null = off.
     command_fallback_agent: ?[]u8 = null,
     command_fallback_prompt: []u8 = "",
+    /// Name of the agent behind a failed block's "Explain", null = off.
+    explain_agent: ?[]u8 = null,
+    explain_prompt: []u8 = "",
+    /// The coding agent "Fix with agent" launches: a `coding_agents` id,
+    /// "off", or "" (= `fix_auto`) for whichever one is installed.
+    fix_agent: []u8 = "",
+    fix_prompt: []u8 = "",
+
+    pub const fix_auto = "";
+    pub const fix_off = "off";
+
+    /// True when "Fix with agent" is switched off outright.
+    pub fn fixOff(self: *const Features) bool {
+        return std.mem.eql(u8, self.fix_agent, fix_off);
+    }
+
+    pub fn fixAuto(self: *const Features) bool {
+        return self.fix_agent.len == 0;
+    }
 };
 
 pub const Config = struct {
@@ -182,6 +210,10 @@ pub const Config = struct {
         self.agents.deinit(self.gpa);
         if (self.features.command_fallback_agent) |s| self.gpa.free(s);
         self.gpa.free(self.features.command_fallback_prompt);
+        if (self.features.explain_agent) |s| self.gpa.free(s);
+        self.gpa.free(self.features.explain_prompt);
+        self.gpa.free(self.features.fix_agent);
+        self.gpa.free(self.features.fix_prompt);
         if (self.path) |p| self.gpa.free(p);
         self.* = .{ .gpa = self.gpa };
     }
@@ -369,9 +401,9 @@ pub const Config = struct {
             .custom => |rgb| try out.print(gpa, "  accent: \"#{X:0>6}\"   # amber | peach | lime | rose | \"#RRGGBB\"\n", .{rgb}),
         }
         if (self.agents.items.len == 0) {
-            try out.appendSlice(gpa, "agents: []\n");
+            try out.appendSlice(gpa, "apis: []\n");
         } else {
-            try out.appendSlice(gpa, "agents:\n");
+            try out.appendSlice(gpa, "apis:\n");
             for (self.agents.items) |a| {
                 try out.appendSlice(gpa, "  - name: ");
                 try writeScalar(gpa, out, a.name);
@@ -387,14 +419,25 @@ pub const Config = struct {
             }
         }
         try out.appendSlice(gpa, "features:\n");
-        if (self.features.command_fallback_agent) |name| {
-            try out.appendSlice(gpa, "  command_fallback_agent: ");
-            try writeScalar(gpa, out, name);
-            try out.append(gpa, '\n');
-        }
-        try out.appendSlice(gpa, "  command_fallback_prompt: ");
-        try writeScalar(gpa, out, self.features.command_fallback_prompt);
+        try writeOptField(gpa, out, "command_fallback_agent", self.features.command_fallback_agent);
+        try writeField(gpa, out, "command_fallback_prompt", self.features.command_fallback_prompt);
+        try writeOptField(gpa, out, "explain_agent", self.features.explain_agent);
+        try writeField(gpa, out, "explain_prompt", self.features.explain_prompt);
+        try writeField(gpa, out, "fix_agent", if (self.features.fixAuto()) "auto" else self.features.fix_agent);
+        try writeField(gpa, out, "fix_prompt", self.features.fix_prompt);
+    }
+
+    fn writeField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
+        try out.appendSlice(gpa, "  ");
+        try out.appendSlice(gpa, key);
+        try out.appendSlice(gpa, ": ");
+        try writeScalar(gpa, out, value);
         try out.append(gpa, '\n');
+    }
+
+    /// An optional field is left out when null (absent = off).
+    fn writeOptField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, value: ?[]const u8) !void {
+        if (value) |v| try writeField(gpa, out, key, v);
     }
 
     /// A string as a YAML scalar: bare when it is unambiguous, else
@@ -434,7 +477,7 @@ pub const Config = struct {
         return true;
     }
 
-    const Section = enum { none, ui, agents, features };
+    const Section = enum { none, ui, agents, apis, features };
 
     /// Reads the subset `write` produces (plus hand edits of the same
     /// shape). Anything it does not understand is skipped.
@@ -456,7 +499,9 @@ pub const Config = struct {
             if (indent == 0 and !new_item) {
                 const kv = splitKey(body) orelse continue;
                 section = std.meta.stringToEnum(Section, kv.key) orelse .none;
-                // `agents: []` and any inline value: nothing to read under it.
+                // Files from before the rename to APIs say `agents:`.
+                if (section == .agents) section = .apis;
+                // `apis: []` and any inline value: nothing to read under it.
                 if (kv.value.len > 0) section = .none;
                 continue;
             }
@@ -473,19 +518,27 @@ pub const Config = struct {
                 },
                 .features => {
                     const kv = splitKey(body) orelse continue;
-                    if (std.mem.eql(u8, kv.key, "command_fallback_agent")) {
+                    const f = &self.features;
+                    const opt_slot: ?*?[]u8 = if (std.mem.eql(u8, kv.key, "command_fallback_agent")) &f.command_fallback_agent else if (std.mem.eql(u8, kv.key, "explain_agent")) &f.explain_agent else null;
+                    if (opt_slot) |slot| {
                         if (kv.value.len > 0 and !isNull(kv.value)) {
                             const v = try unquote(self.gpa, kv.value);
                             defer self.gpa.free(v);
-                            self.setOptString(&self.features.command_fallback_agent, v);
+                            self.setOptString(slot, v);
                         }
-                    } else if (std.mem.eql(u8, kv.key, "command_fallback_prompt")) {
+                        continue;
+                    }
+                    const slot: ?*[]u8 = if (std.mem.eql(u8, kv.key, "command_fallback_prompt")) &f.command_fallback_prompt else if (std.mem.eql(u8, kv.key, "explain_prompt")) &f.explain_prompt else if (std.mem.eql(u8, kv.key, "fix_agent")) &f.fix_agent else if (std.mem.eql(u8, kv.key, "fix_prompt")) &f.fix_prompt else null;
+                    if (slot) |s| {
                         const v = try unquote(self.gpa, kv.value);
                         defer self.gpa.free(v);
-                        self.setString(&self.features.command_fallback_prompt, v);
+                        // `auto` (and a blank) both mean "whichever is installed".
+                        const text = if (s == &f.fix_agent and std.ascii.eqlIgnoreCase(v, "auto")) "" else v;
+                        self.setString(s, text);
                     }
                 },
-                .agents => {
+                .agents => unreachable,
+                .apis => {
                     if (new_item) {
                         try self.agents.append(self.gpa, .{ .uid = self.takeUid() });
                         if (body.len == 0) continue;
@@ -664,6 +717,10 @@ test "round trip through the YAML subset" {
     a.setDefaultAgent(local.uid);
     a.setOptString(&a.features.command_fallback_agent, "Local: llama");
     a.setString(&a.features.command_fallback_prompt, "Line one\nLine two\ttabbed");
+    a.setOptString(&a.features.explain_agent, "Anthropic");
+    a.setString(&a.features.explain_prompt, "Why did it fail?");
+    a.setString(&a.features.fix_agent, "codex");
+    a.setString(&a.features.fix_prompt, "Fix: it");
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -688,7 +745,35 @@ test "round trip through the YAML subset" {
     try std.testing.expect(b.agents.items[1].is_default);
     try std.testing.expectEqualStrings("Local: llama", b.features.command_fallback_agent.?);
     try std.testing.expectEqualStrings("Line one\nLine two\ttabbed", b.features.command_fallback_prompt);
+    try std.testing.expectEqualStrings("Anthropic", b.features.explain_agent.?);
+    try std.testing.expectEqualStrings("Why did it fail?", b.features.explain_prompt);
+    try std.testing.expectEqualStrings("codex", b.features.fix_agent);
+    try std.testing.expectEqualStrings("Fix: it", b.features.fix_prompt);
     try std.testing.expect(b.defaultAgent().? == &b.agents.items[1]);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "apis:\n") != null);
+}
+
+test "fix_agent: auto is the blank default, off is off, and the defaults write back as auto" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try std.testing.expect(a.features.fixAuto() and !a.features.fixOff());
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try a.write(&out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "fix_agent: auto\n") != null);
+    // Nothing under features is absent: explain_agent is off, so it is not written.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "explain_agent") == null);
+
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse("features:\n  fix_agent: Auto\n  explain_agent: ~\n");
+    try std.testing.expect(b.features.fixAuto());
+    try std.testing.expect(b.features.explain_agent == null);
+    try b.parse("features:\n  fix_agent: off\n");
+    try std.testing.expect(b.features.fixOff());
+    try b.parse("features:\n  fix_agent: claude\n");
+    try std.testing.expectEqualStrings("claude", b.features.fix_agent);
 }
 
 test "e-ink mode parses and round-trips" {
@@ -719,7 +804,7 @@ test "hand-written file: comments, quotes, empty list, unknown keys" {
         \\  mode: Dark # trailing comment
         \\  accent: "#ff8800"
         \\  font: something-newer   # unknown, ignored
-        \\agents: []
+        \\apis: []
         \\features:
         \\  command_fallback_prompt: 'it''s quoted'
         \\  command_fallback_agent: ~
@@ -732,7 +817,8 @@ test "hand-written file: comments, quotes, empty list, unknown keys" {
     try std.testing.expect(c.features.command_fallback_agent == null);
     try std.testing.expect(c.defaultAgent() == null);
 
-    // The default when the file says nothing: the first agent.
+    // The default when the file says nothing: the first agent. An older
+    // file's `agents:` list is read as the APIs.
     var d = Config.init(gpa);
     defer d.deinit();
     try d.parse(

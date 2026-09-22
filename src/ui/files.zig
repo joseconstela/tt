@@ -1,12 +1,16 @@
 //! Files panel (right side): the directory the current shell is in, as a
 //! tree. Folders unfold in place, files open in a viewer tab, and a file can
 //! be pinned to a project from here. The tree re-reads its visible folders
-//! every couple of seconds so `touch`, `git checkout` … show up.
+//! every couple of seconds so `touch`, `git checkout` … show up. Inside a
+//! git repository the names take git's colours (new, changed …) and a
+//! Files / Git strip at the top switches to the Git view (`git_panel.zig`).
 const std = @import("std");
 const ui_mod = @import("ui.zig");
 const theme = @import("theme.zig");
 const sidebar = @import("sidebar.zig");
+const git_panel = @import("git_panel.zig");
 const sys = @import("../sys.zig");
+const EditCommand = @import("../events.zig").EditCommand;
 
 const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
@@ -26,7 +30,12 @@ const Node = struct {
 pub const Result = struct {
     open_file: ?[]const u8 = null,
     pin_file: ?[]const u8 = null,
+    /// The Git view wants a discard confirmed (see `discardConfirmed`).
+    confirm: ?git_panel.Confirm = null,
 };
+
+/// What the panel shows: the tree, or the Git view.
+pub const Mode = enum { files, git };
 
 pub const FileBrowser = struct {
     gpa: std.mem.Allocator,
@@ -44,12 +53,15 @@ pub const FileBrowser = struct {
     out_path: std.ArrayList(u8) = .empty,
     /// Scratch: path of the row being drawn.
     path: std.ArrayList(u8) = .empty,
+    mode: Mode = .files,
+    git: git_panel.Panel,
 
     pub fn init(gpa: std.mem.Allocator) FileBrowser {
-        return .{ .gpa = gpa };
+        return .{ .gpa = gpa, .git = git_panel.Panel.init(gpa) };
     }
 
     pub fn deinit(self: *FileBrowser) void {
+        self.git.deinit();
         freeNodes(self.gpa, &self.children);
         self.root.deinit(self.gpa);
         self.selected.deinit(self.gpa);
@@ -68,6 +80,7 @@ pub const FileBrowser = struct {
     /// Points the tree at `dir` (no-op if it already is).
     pub fn setRoot(self: *FileBrowser, dir: []const u8, now: f64) void {
         if (std.mem.eql(u8, self.root.items, dir)) return;
+        self.git.setDir(dir);
         self.root.clearRetainingCapacity();
         self.root.appendSlice(self.gpa, dir) catch return;
         freeNodes(self.gpa, &self.children);
@@ -76,12 +89,58 @@ pub const FileBrowser = struct {
         self.last_refresh = now;
     }
 
-    /// Re-reads the visible folders now and then. True if anything changed.
+    /// Re-reads the visible folders now and then, and collects git's
+    /// readings. True if anything changed.
     pub fn tick(self: *FileBrowser, now: f64) bool {
         if (!self.visible or self.root.items.len == 0) return false;
-        if (now - self.last_refresh < refresh_every) return false;
-        self.last_refresh = now;
-        return self.reload(self.root.items, &self.children);
+        var changed = self.git.tick(now);
+        if (now - self.last_refresh >= refresh_every) {
+            self.last_refresh = now;
+            if (self.reload(self.root.items, &self.children)) changed = true;
+        }
+        return changed;
+    }
+
+    // ── keyboard, routed by the app while the Git view's message field has it ──
+    pub fn hasFocus(self: *const FileBrowser) bool {
+        return self.visible and self.mode == .git and self.git.hasFocus();
+    }
+
+    pub fn onText(self: *FileBrowser, utf8: []const u8) void {
+        self.git.onText(utf8);
+    }
+
+    pub fn onMarkedText(self: *FileBrowser, utf8: []const u8) void {
+        self.git.onMarkedText(utf8);
+    }
+
+    pub fn onEdit(self: *FileBrowser, cmd: EditCommand) void {
+        self.git.onEdit(cmd);
+    }
+
+    pub fn onCtrl(self: *FileBrowser, key: u8) void {
+        self.git.onCtrl(key);
+    }
+
+    pub fn paste(self: *FileBrowser, utf8: []const u8) void {
+        self.git.paste(utf8);
+    }
+
+    pub fn copy(self: *FileBrowser, out: *std.ArrayList(u8), cut: bool) bool {
+        return self.git.copy(out, cut);
+    }
+
+    pub fn hasMarkedText(self: *const FileBrowser) bool {
+        return self.git.hasMarkedText();
+    }
+
+    pub fn caretRect(self: *const FileBrowser) ui_mod.Rect {
+        return self.git.caretRect();
+    }
+
+    /// The discard box was accepted.
+    pub fn discardConfirmed(self: *FileBrowser) void {
+        self.git.discardConfirmed();
     }
 
     fn load(self: *FileBrowser, dir: []const u8, out: *std.ArrayList(Node)) void {
@@ -153,8 +212,23 @@ pub const FileBrowser = struct {
         dl.pushClip(.{ .x = rect.x + 1, .y = rect.y, .w = rect.w - 1, .h = rect.h });
         defer dl.popClip();
 
-        // Header: the folder being shown.
         var y = rect.y + 8;
+        // Inside a repository the strip offers the Git view; elsewhere there is only the tree.
+        const is_repo = self.git.isRepoFor(self.root.items);
+        if (!is_repo) self.mode = .files;
+        if (is_repo) self.drawModeStrip(ui, rect, &y);
+        if (self.mode == .git) {
+            const area: Rect = .{ .x = rect.x + 1, .y = y, .w = rect.w - 1, .h = @max(0, rect.bottom() - y) };
+            const gr = self.git.draw(ui, area);
+            res.open_file = gr.open_file;
+            res.confirm = gr.confirm;
+            if (d.hover or d.dragging) {
+                dl.rect(.{ .x = rect.x, .y = rect.y, .w = 2, .h = rect.h }, theme.accent.alpha(if (d.dragging) 0.9 else 0.55));
+            }
+            return res;
+        }
+
+        // Header: the folder being shown.
         {
             var buf: [512]u8 = undefined;
             const shown = sys.abbreviateHome(self.root.items, &buf);
@@ -180,6 +254,38 @@ pub const FileBrowser = struct {
             dl.rect(.{ .x = rect.x, .y = rect.y, .w = 2, .h = rect.h }, theme.accent.alpha(if (d.dragging) 0.9 else 0.55));
         }
         return res;
+    }
+
+    /// The Files / Git strip (the screenshot's pills): Git carries the
+    /// number of changes.
+    fn drawModeStrip(self: *FileBrowser, ui: *Ui, rect: Rect, y: *f32) void {
+        const dl = ui.dl;
+        const strip_h: f32 = 28;
+        var x = rect.x + 10;
+        const modes = [_]struct { mode: Mode, label: []const u8 }{ .{ .mode = .files, .label = "Files" }, .{ .mode = .git, .label = "Git" } };
+        for (modes, 0..) |m, i| {
+            var count_buf: [16]u8 = undefined;
+            const count: []const u8 = if (m.mode == .git and self.git.changeCount() > 0)
+                std.fmt.bufPrint(&count_buf, "{d}", .{self.git.changeCount()}) catch ""
+            else
+                "";
+            const lw = ui.text.measure(theme.font_side_medium, m.label);
+            const cw: f32 = if (count.len > 0) ui.text.measure(git_panel.font_badge, count) + 14 else 0;
+            const r: Rect = .{ .x = x, .y = y.*, .w = lw + 24 + cw, .h = strip_h };
+            const st = ui.button(Ui.id("files.mode", i), r);
+            const selected = self.mode == m.mode;
+            if (selected) dl.rrect(r, 7, theme.chip_active) else ui.feedback(r, 7, st);
+            const color = if (selected) theme.text else if (st.hover) theme.text_2 else theme.text_3;
+            _ = dl.textCentered(theme.font_side_medium, r.x + 12, r.centerY(), m.label, color);
+            if (count.len > 0) {
+                const pill: Rect = .{ .x = r.x + 12 + lw + 6, .y = r.centerY() - 8, .w = cw - 6, .h = 16 };
+                dl.rrect(pill, 8, if (selected) theme.accent else theme.accent.alpha(0.55));
+                _ = dl.textCentered(git_panel.font_badge, pill.x + 4, pill.centerY(), count, theme.on_accent);
+            }
+            if (st.clicked) self.mode = m.mode;
+            x += r.w + 4;
+        }
+        y.* += strip_h + 6;
     }
 
     fn drawNodes(self: *FileBrowser, ui: *Ui, panel: Rect, nodes: *std.ArrayList(Node), depth: u32, y: *f32, can_pin: bool, res: *Result) void {
@@ -215,7 +321,15 @@ pub const FileBrowser = struct {
                 const x = row.x + 10 + @as(f32, @floatFromInt(depth)) * indent;
                 if (n.is_dir) dl.icon(if (n.expanded) .chevron_down else .chevron_right, x - 2, row.centerY() - 7, 14, theme.text_3);
                 const lx = x + 18;
-                const color = if (n.is_dir or selected) theme.text else theme.text_2;
+                // Git's colours: new, changed, ignored …; files also get the letter.
+                const kind = self.git.repo.snapshot.kindOfPath(self.path.items, n.is_dir);
+                var color = if (n.is_dir or selected) theme.text else theme.text_2;
+                if (kind == .ignored) {
+                    color = theme.text_3;
+                } else if (kind != .none) {
+                    color = git_panel.kindColor(kind);
+                    if (!n.is_dir) right -= dl.textRight(git_panel.font_badge, right, row.centerY(), git_panel.kindLetter(kind), color) + 6;
+                }
                 _ = dl.textEllipsis(theme.font_side, lx, row.centerY(), n.name, right - lx, color);
 
                 if (pin_st.clicked) {

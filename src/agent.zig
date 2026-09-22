@@ -806,7 +806,7 @@ pub const Request = struct {
         defer pool.pop();
         const nsurl = msg(id, objc.class("NSURL"), "URLWithString:", .{objc.nsString(prepared.url)});
         if (nsurl == null) {
-            self.stream.fail("The agent's base URL is not a valid address (Settings › AI › Agents).");
+            self.stream.fail("The agent's base URL is not a valid address (Settings › AI › APIs).");
             self.invalidated = true;
             return self;
         }

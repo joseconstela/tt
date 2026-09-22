@@ -31,6 +31,11 @@ pub const Icon = enum(u8) {
     arrow_right,
     reload,
     lock,
+    // Git panel.
+    check,
+    minus,
+    undo,
+    branch,
 };
 
 /// Transparent padding (device px) around every rasterised icon.
@@ -64,6 +69,10 @@ fn pathData(icon: Icon) []const u8 {
         .arrow_right => "M5 12h14 M13 6l6 6-6 6",
         .reload => "M20.5 12a8.5 8.5 0 1 1-2.5-6 M20.5 3.5V9h-5.5",
         .lock => "M6 11h12v9H6z M9 11V7.5a3 3 0 0 1 6 0V11",
+        .check => "M5 12.5l4.5 4.5L19 7",
+        .minus => "M5 12h14",
+        .undo => "M9 14L4 9l5-5 M4 9h10a6 6 0 0 1 0 12h-3",
+        .branch => "M6 3v12 M18 9a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M6 21a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M18 9a9 9 0 0 1-9 9",
     };
 }
 
