@@ -144,7 +144,7 @@ pub const Screen = struct {
     }
 
     fn xtversion(_: *Handler) []const u8 {
-        return "conch 0.1.0";
+        return "tt 0.1.0";
     }
 
     // ── the program's output ────────────────────────────────────────────

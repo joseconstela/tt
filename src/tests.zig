@@ -17,10 +17,17 @@ test {
     _ = @import("tabs/viewer.zig");
     _ = @import("tabs/layout.zig");
     _ = @import("ui/palette.zig");
+    _ = @import("ui/overlay.zig");
+    _ = @import("match.zig");
+    _ = @import("file_index.zig");
     _ = @import("ui/icon_spec.zig");
     _ = @import("config.zig");
     _ = @import("tabs/web_tab.zig");
+    _ = @import("tabs/web_bridge.zig");
+    _ = @import("tabs/web_menu.zig");
     _ = @import("agent.zig");
     _ = @import("git.zig");
     _ = @import("coding_agents.zig");
+    _ = @import("paths.zig");
+    _ = @import("search.zig");
 }

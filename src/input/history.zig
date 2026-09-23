@@ -29,7 +29,7 @@ pub const History = struct {
             } else |_| {}
         } else |_| {}
 
-        self.file_path = std.fmt.allocPrint(self.gpa, "{s}/.conch_history", .{home}) catch null;
+        self.file_path = std.fmt.allocPrint(self.gpa, "{s}/.tt_history", .{home}) catch null;
         if (self.file_path) |p| {
             if (sys.readFileTail(self.gpa, p, 512 * 1024)) |data| {
                 defer self.gpa.free(data);

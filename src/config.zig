@@ -1,5 +1,5 @@
 //! The user's settings: appearance, the model APIs they have set up and
-//! what the features use, kept in `~/.conch/config.yml`. The file is
+//! what the features use, kept in `~/.tt/config.yml`. The file is
 //! written by the Settings tab and meant to be edited by hand too, so it is
 //! a small, readable subset of YAML: two levels of `key: value` mappings and
 //! a list of mappings for the APIs. Unknown keys are ignored, so older
@@ -188,7 +188,7 @@ pub const Features = struct {
 
 pub const Config = struct {
     gpa: std.mem.Allocator,
-    /// `~/.conch/config.yml` (null when there is no home directory).
+    /// `~/.tt/config.yml` (null when there is no home directory).
     path: ?[]u8 = null,
     mode: Mode = .system,
     accent: Accent = .{ .named = 0 },
@@ -371,10 +371,10 @@ pub const Config = struct {
         };
     }
 
-    /// Reads `~/.conch/config.yml` if there is one. A file that cannot be
+    /// Reads `~/.tt/config.yml` if there is one. A file that cannot be
     /// read leaves the defaults.
     pub fn load(self: *Config) void {
-        self.path = std.fmt.allocPrint(self.gpa, "{s}/.conch/config.yml", .{sys.home()}) catch null;
+        self.path = std.fmt.allocPrint(self.gpa, "{s}/.tt/config.yml", .{sys.home()}) catch null;
         const path = self.path orelse return;
         const data = sys.readFileTail(self.gpa, path, 1 << 20) catch return;
         defer self.gpa.free(data);
@@ -393,7 +393,7 @@ pub const Config = struct {
     // ── the YAML subset ─────────────────────────────────────────────────
     pub fn write(self: *const Config, out: *std.ArrayList(u8)) !void {
         const gpa = self.gpa;
-        try out.appendSlice(gpa, "# conch settings. Changed from the Settings tab; safe to edit by hand.\n");
+        try out.appendSlice(gpa, "# tt settings. Changed from the Settings tab; safe to edit by hand.\n");
         try out.appendSlice(gpa, "ui:\n");
         try out.print(gpa, "  mode: {s}   # dark | light | system | eink\n", .{@tagName(self.mode)});
         switch (self.accent) {

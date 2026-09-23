@@ -1,4 +1,4 @@
-//! Settings › AI › APIs: the models conch can talk to. One card per
+//! Settings › AI › APIs: the models tt can talk to. One card per
 //! agent — name, provider, model, key, endpoint — and a card to add one at
 //! any of the main providers or Ollama. Everything edits the config in
 //! place (see `config.zig`); text fields share one keyboard focus.

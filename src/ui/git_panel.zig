@@ -30,12 +30,27 @@ pub const font_badge = Font.medium(12);
 /// until the next frame).
 pub const Confirm = struct { heading: []const u8, reason: []const u8 };
 
+/// The branch menu, for the app to open (rows valid until the next click
+/// on the branch): "Fetch All", then the branches, the current one ticked.
+pub const Menu = struct {
+    items: []const []const u8,
+    checked: ?usize,
+    sep_after: ?usize,
+    x: f32,
+    y: f32,
+};
+
 pub const Result = struct {
     /// A row was clicked: the file's absolute path (valid this frame).
     open_file: ?[]const u8 = null,
     /// A discard was asked for: the app shows this and confirms it back.
     confirm: ?Confirm = null,
+    /// The branch button was clicked: the app opens this menu and hands
+    /// the picked row back to `menuPicked`.
+    menu: ?Menu = null,
 };
+
+const MenuKind = enum { fetch, local, remote };
 
 /// The colour a path with `kind` gets, in the tree and here.
 pub fn kindColor(kind: git.Kind) Color {
@@ -70,6 +85,10 @@ fn letterColor(letter: u8) Color {
 
 const Section = enum { merge, staged, changes };
 
+fn dl_text(ui: *Ui, x: f32, cy: f32, s: []const u8, color: Color) f32 {
+    return ui.dl.textCentered(font_badge, x, cy, s, color);
+}
+
 pub const Panel = struct {
     gpa: std.mem.Allocator,
     repo: git.Repo,
@@ -92,6 +111,9 @@ pub const Panel = struct {
     out_path: std.ArrayList(u8) = .empty,
     /// Commit was pressed with no message: said until typing starts.
     need_message: bool = false,
+    /// The rows of the branch menu last opened, and what each one is.
+    menu_items: std.ArrayList([]const u8) = .empty,
+    menu_kinds: std.ArrayList(MenuKind) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Panel {
         return .{ .gpa = gpa, .repo = git.Repo.init(gpa), .focus = field.Focus.init(gpa) };
@@ -103,6 +125,56 @@ pub const Panel = struct {
         self.message.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.out_path.deinit(self.gpa);
+        self.clearMenu();
+        self.menu_items.deinit(self.gpa);
+        self.menu_kinds.deinit(self.gpa);
+    }
+
+    fn clearMenu(self: *Panel) void {
+        for (self.menu_items.items) |s| self.gpa.free(s);
+        self.menu_items.clearRetainingCapacity();
+        self.menu_kinds.clearRetainingCapacity();
+    }
+
+    fn addMenuRow(self: *Panel, label: []const u8, kind: MenuKind) void {
+        const owned = self.gpa.dupe(u8, label) catch return;
+        self.menu_items.append(self.gpa, owned) catch {
+            self.gpa.free(owned);
+            return;
+        };
+        self.menu_kinds.append(self.gpa, kind) catch {
+            _ = self.menu_items.pop();
+            self.gpa.free(owned);
+        };
+    }
+
+    /// Builds the branch menu: "Fetch All", the local branches (the
+    /// current one ticked), then the remote branches with no local one.
+    fn openBranchMenu(self: *Panel, x: f32, y: f32) Menu {
+        const s = &self.repo.snapshot;
+        self.clearMenu();
+        self.addMenuRow("Fetch All", .fetch);
+        var checked: ?usize = null;
+        for (s.branches.items) |b| {
+            if (std.mem.eql(u8, b, s.branch)) checked = self.menu_items.items.len;
+            self.addMenuRow(b, .local);
+        }
+        for (s.remotes.items) |r| {
+            const slash = std.mem.indexOfScalar(u8, r, '/') orelse continue;
+            if (s.hasBranch(r[slash + 1 ..])) continue;
+            self.addMenuRow(r, .remote);
+        }
+        return .{ .items = self.menu_items.items, .checked = checked, .sep_after = 0, .x = x, .y = y };
+    }
+
+    /// Row `i` of the branch menu was picked.
+    pub fn menuPicked(self: *Panel, i: usize) void {
+        if (i >= self.menu_kinds.items.len) return;
+        switch (self.menu_kinds.items[i]) {
+            .fetch => self.repo.fetchAll(),
+            .local => self.repo.switchBranch(self.menu_items.items[i]),
+            .remote => self.repo.switchRemote(self.menu_items.items[i]),
+        }
     }
 
     pub fn setDir(self: *Panel, dir: []const u8) void {
@@ -167,6 +239,12 @@ pub const Panel = struct {
 
     pub fn hasMarkedText(self: *const Panel) bool {
         return self.focus.hasMarkedText();
+    }
+
+    /// Gives the keyboard up (the message typed so far is kept).
+    pub fn dropFocus(self: *Panel) void {
+        self.syncMessage();
+        self.focus.drop();
     }
 
     pub fn caretRect(self: *const Panel) Rect {
@@ -256,7 +334,8 @@ pub const Panel = struct {
         const x = rect.x + pad;
         const w = rect.w - 2 * pad;
 
-        // The branch, and a refresh button.
+        // The branch; refresh, push and pull at the right (push and pull
+        // carry how many commits are ahead / behind).
         {
             const row: Rect = .{ .x = rect.x, .y = y, .w = rect.w, .h = 28 };
             var right = row.right() - pad;
@@ -265,13 +344,26 @@ pub const Panel = struct {
             ui.feedback(rr, 6, st);
             dl.icon(.reload, rr.x + 4, rr.y + 4, 14, if (self.repo.busy()) theme.text_3.alpha(0.5) else if (st.hover) theme.text else theme.text_3);
             if (st.clicked) self.repo.refreshSoon();
-            right = rr.x - 8;
+            right = rr.x - 6;
+            const can_push = s.isRepo() and !s.unborn and !s.detached and !self.repo.cmdRunning();
+            if (self.countButton(ui, Ui.id("git.push", 0), &right, row, .push, s.ahead, can_push)) self.repo.push();
+            const can_pull = s.isRepo() and s.upstream.len > 0 and !self.repo.cmdRunning();
+            if (self.countButton(ui, Ui.id("git.pull", 0), &right, row, .pull, s.behind, can_pull)) self.repo.pull();
+            right -= 4;
 
-            dl.icon(.branch, x, row.centerY() - 8, 16, theme.text_3);
-            var lx = x + 22;
+            // The branch is a button: its menu fetches and switches.
             const branch = if (s.branch.len > 0) s.branch else "no branch";
-            const bw = dl.textEllipsis(theme.font_side_medium, lx, row.centerY(), branch, @max(0, right - lx - 4), theme.text);
-            lx += bw + 8;
+            const name_w = @min(ui.text.measure(theme.font_side_medium, branch), @max(0, right - x - 60));
+            const br: Rect = .{ .x = x - 6, .y = row.centerY() - 12, .w = 6 + 22 + name_w + 4 + 14 + 6, .h = 24 };
+            const bst = ui.button(Ui.id("git.branch", 0), br);
+            ui.feedback(br, 6, bst);
+            dl.icon(.branch, x, row.centerY() - 8, 16, if (bst.hover) theme.text else theme.text_3);
+            var lx = x + 22;
+            _ = dl.textEllipsis(theme.font_side_medium, lx, row.centerY(), branch, name_w, theme.text);
+            lx += name_w + 4;
+            dl.icon(.chevron_down, lx, row.centerY() - 7, 14, if (bst.hover) theme.text else theme.text_3);
+            lx += 14 + 10;
+            if (bst.clicked and s.isRepo()) res.menu = self.openBranchMenu(br.x, br.bottom() + 4);
             var hint_buf: [48]u8 = undefined;
             const hint: []const u8 = if (s.unborn)
                 "no commits yet"
@@ -290,9 +382,7 @@ pub const Panel = struct {
         // The message.
         {
             const fr: Rect = .{ .x = x, .y = y, .w = w, .h = field.height };
-            var ph_buf: [96]u8 = undefined;
-            const ph = std.fmt.bufPrint(&ph_buf, "Message (↵ to commit on “{s}”)", .{if (s.branch.len > 0) s.branch else "HEAD"}) catch "Message";
-            const fres = field.draw(ui, &self.focus, field_id, fr, self.message.items, .{ .placeholder = ph, .font = theme.font_side });
+            const fres = field.draw(ui, &self.focus, field_id, fr, self.message.items, .{ .placeholder = "Message (↵ to commit)", .font = theme.font_side });
             if (fres.clicked) self.takeFocus(ui.now);
             // A press anywhere else gives the focus up.
             if (ui.pressed and self.focus.active() and !ui.mouseIn(fr)) {
@@ -323,12 +413,17 @@ pub const Panel = struct {
             y += button_h + 6;
         }
 
-        // What went wrong, if something did.
+        // What is under way, or what went wrong.
         {
-            const err: []const u8 = if (self.need_message) "A commit message is needed." else self.repo.last_error.items;
-            if (err.len > 0) {
-                _ = dl.textEllipsis(theme.font_hint, x, y + 10, err, w, theme.red);
+            if (self.repo.cmd_label.len > 0) {
+                _ = dl.textEllipsis(theme.font_hint, x, y + 10, self.repo.cmd_label, w, theme.text_3);
                 y += 20;
+            } else {
+                const err: []const u8 = if (self.need_message) "A commit message is needed." else self.repo.last_error.items;
+                if (err.len > 0) {
+                    _ = dl.textEllipsis(theme.font_hint, x, y + 10, err, w, theme.red);
+                    y += 20;
+                }
             }
         }
         y += 4;
@@ -471,6 +566,27 @@ pub const Panel = struct {
             self.out_path.appendSlice(self.gpa, e.path) catch return;
             res.open_file = self.out_path.items;
         }
+    }
+
+    /// An icon button with a count beside it (push: commits ahead, pull:
+    /// behind); dim and inert when `enabled` is false. Moves `right` past it.
+    fn countButton(_: *Panel, ui: *Ui, wid: u64, right: *f32, row: Rect, icon: @import("../gfx/icons.zig").Icon, count: u32, enabled: bool) bool {
+        var buf: [16]u8 = undefined;
+        const n: []const u8 = if (count > 0) std.fmt.bufPrint(&buf, "{d}", .{count}) catch "" else "";
+        const nw: f32 = if (n.len > 0) ui.text.measure(font_badge, n) + 2 else 0;
+        const r: Rect = .{ .x = right.* - small - nw, .y = row.centerY() - small / 2, .w = small + nw, .h = small };
+        var clicked = false;
+        var color = theme.text_3.alpha(0.5);
+        if (enabled) {
+            const st = ui.button(wid, r);
+            ui.feedback(r, 6, st);
+            color = if (st.hover) theme.text else theme.text_3;
+            clicked = st.clicked;
+        }
+        ui.dl.icon(icon, r.x + 4, r.y + 4, 14, color);
+        if (n.len > 0) _ = dl_text(ui, r.x + small - 1, r.centerY(), n, if (enabled) theme.accent else color);
+        right.* = r.x - 2;
+        return clicked;
     }
 
     /// A 22pt icon button at the right end of a row; moves `right` past it.

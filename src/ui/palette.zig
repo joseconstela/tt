@@ -1,12 +1,24 @@
-//! Floating command palette, from the "Command palette" artboard: a query row
-//! with a caret, scope chips, grouped fuzzy-matched rows and a keyboard
-//! footer, drawn over a dimmed window. The rows are real: app commands, the
-//! open tabs, the shell history and the accent setting.
+//! Floating palette, from the "Command palette" artboard: a query row with
+//! a caret, scope chips, grouped fuzzy-matched rows and a keyboard footer,
+//! drawn over a dimmed window. It opens two ways, as in VS Code:
+//!
+//!   ⌘K  the command palette — app commands, the open tabs, the shell
+//!       history and the accent setting; a leading `>` `@` `!` `:` narrows it.
+//!   ⌘P  quick open ("Go to File…") — the files of the workspace, matched by
+//!       name or path (see file_index.zig), the open documents first;
+//!       `name:12:5` opens at a line and column, `:12` alone goes to a line
+//!       of the current editor and previews it as the number is typed;
+//!       `@` lists the tabs, `>` turns it into the command palette and ⌫ on
+//!       an empty query turns it back; ⌘P again steps down the list.
 const std = @import("std");
 const ui_mod = @import("ui.zig");
 const theme = @import("theme.zig");
 const gfx_text = @import("../gfx/text.zig");
 const tab_mod = @import("../tabs/tab.zig");
+const match = @import("../match.zig");
+const file_index = @import("../file_index.zig");
+const projects_mod = @import("../projects.zig");
+const sys = @import("../sys.zig");
 const Editor = @import("../input/editor.zig").Editor;
 const History = @import("../input/history.zig").History;
 const EditCommand = @import("../events.zig").EditCommand;
@@ -17,21 +29,57 @@ const Rect = ui_mod.Rect;
 const Color = ui_mod.Color;
 const Font = ui_mod.Font;
 
+pub const Goto = file_index.Goto;
+
+/// A file or tab to bring forward, and where to put the caret in it.
+pub const Target = struct { id: u32, goto: Goto = .{} };
+
 /// What the user picked; the app carries it out.
 pub const Pick = union(enum) {
+    /// An informational row: nothing to do.
+    none,
     action: Action,
     select_tab: usize,
     /// Index into `History.entries`; run in the active terminal.
     run_history: usize,
     /// Index into `theme.accent_options`.
     set_accent: usize,
+    /// A file of the quick-open listing (`Palette.filePath` gives its path
+    /// — before the palette closes, the listing dies with it).
+    open_file: Target,
+    /// A tab by uid, brought forward.
+    focus_tab: Target,
+    /// The caret of the current editor.
+    goto_line: Goto,
 };
 
 /// Where the rows come from. Held while the palette is open.
 pub const Sources = struct {
     tabs: *tab_mod.TabManager,
     history: *const History,
+    projects: *projects_mod.Projects,
+    /// The folder the current tab works in: the first root of the file
+    /// listing (read when the palette opens).
+    cwd: []const u8 = "",
 };
+
+/// How the palette was opened, which decides the chips and the prefixes.
+pub const Mode = enum(u8) {
+    /// ⌘K.
+    commands,
+    /// ⌘P.
+    files,
+
+    fn chips(m: Mode) []const Scope {
+        return switch (m) {
+            .commands => &commands_chips,
+            .files => &files_chips,
+        };
+    }
+};
+
+const commands_chips = [_]Scope{ .everything, .commands, .tabs, .history, .settings };
+const files_chips = [_]Scope{ .files, .tabs, .line, .commands };
 
 pub const Scope = enum(u8) {
     everything,
@@ -39,15 +87,17 @@ pub const Scope = enum(u8) {
     tabs,
     history,
     settings,
+    files,
+    line,
 
     /// Typing this character first narrows the query to the scope.
     fn prefix(s: Scope) u8 {
         return switch (s) {
-            .everything => 0,
+            .everything, .files => 0,
             .commands => '>',
             .tabs => '@',
             .history => '!',
-            .settings => ':',
+            .settings, .line => ':',
         };
     }
 
@@ -58,18 +108,22 @@ pub const Scope = enum(u8) {
             .tabs => "Tabs",
             .history => "History",
             .settings => "Settings",
+            .files => "Files",
+            .line => "Go to line",
         };
     }
 
-    fn fromPrefix(c: u8) ?Scope {
-        inline for (std.meta.tags(Scope)) |s| {
+    /// The scope a leading character names in `mode` (`:` is settings in
+    /// the command palette and go-to-line in quick open).
+    fn fromPrefix(c: u8, mode: Mode) ?Scope {
+        for (mode.chips()) |s| {
             if (s.prefix() != 0 and s.prefix() == c) return s;
         }
         return null;
     }
 };
 
-const Group = enum { commands, tabs, history, settings };
+const Group = enum { commands, tabs, history, settings, open, files, line };
 
 fn groupTitle(g: Group) []const u8 {
     return switch (g) {
@@ -77,6 +131,9 @@ fn groupTitle(g: Group) []const u8 {
         .tabs => "TABS",
         .history => "HISTORY",
         .settings => "SETTINGS",
+        .open => "OPEN",
+        .files => "FILES",
+        .line => "GO TO LINE",
     };
 }
 
@@ -86,10 +143,13 @@ const Entry = struct {
     prefix: []const u8 = "",
     /// The matched text.
     label: []const u8,
-    /// Right-aligned note; a keyboard shortcut when `kbd`.
+    /// Right-aligned note; a keyboard shortcut when `kbd`, else a folder
+    /// or a word, shortened from the left when long.
     detail: []const u8 = "",
     kbd: bool = true,
     mono: bool = false,
+    /// A notice rather than something to pick: drawn dimmed.
+    dim: bool = false,
     dot: ?Color = null,
     pick: Pick,
     score: i32 = 0,
@@ -104,6 +164,8 @@ const commands = [_]Command{
     .{ .prefix = "Shell:", .label = "New website tab", .kbd = "⌘⇧N", .action = .new_web_tab },
     .{ .prefix = "Shell:", .label = "Close tab", .kbd = "⌘W", .action = .close_tab },
     .{ .prefix = "Shell:", .label = "Clear blocks", .kbd = "⌃L", .action = .clear },
+    .{ .prefix = "File:", .label = "Go to file…", .kbd = "⌘P", .action = .quick_open },
+    .{ .prefix = "File:", .label = "Go to line…", .kbd = "", .action = .go_to_line },
     .{ .prefix = "View:", .label = "Toggle sidebar", .kbd = "⌘B", .action = .toggle_sidebar },
     .{ .prefix = "View:", .label = "Next tab", .kbd = "⌘⇧]", .action = .next_tab },
     .{ .prefix = "View:", .label = "Previous tab", .kbd = "⌘⇧[", .action = .prev_tab },
@@ -126,6 +188,10 @@ const accent_names = [_][]const u8{ "Amber", "Peach", "Lime", "Rose" };
 
 const max_entries = 64;
 const max_tabs = 16;
+/// File rows for a query; fewer for an empty one, which is a browse.
+const max_hits = 40;
+const empty_hits = 24;
+const detail_len = 160;
 
 const header_h: f32 = 52;
 const chips_h: f32 = 44;
@@ -140,16 +206,33 @@ const list_pad_x: f32 = 8;
 pub const Palette = struct {
     gpa: std.mem.Allocator,
     open: bool = false,
+    mode: Mode = .commands,
     editor: Editor,
     scope: Scope = .everything,
     selected: usize = 0,
     /// Vertical scroll of the row list, in points.
     scroll: f32 = 0,
     src: ?Sources = null,
+    /// The command palette reached from quick open with `>`: ⌫ on an
+    /// empty query goes back, as in VS Code.
+    from_files: bool = false,
+
+    /// The files of the workspace while quick open is up.
+    index: ?*file_index.Index = null,
+    /// The rows were built after the listing finished.
+    index_seen: bool = false,
+    /// Where the current editor's caret was before a go-to-line preview
+    /// moved it; put back when the query leaves the line scope or the
+    /// palette is dismissed.
+    preview_from: ?tab_mod.Position = null,
 
     entries: [max_entries]Entry = undefined,
     count: usize = 0,
     title_bufs: [max_tabs][96]u8 = undefined,
+    detail_bufs: [max_entries][detail_len]u8 = undefined,
+    /// Paths of the OPEN rows of this build, so FILES does not repeat them.
+    open_paths: [max_tabs][]const u8 = undefined,
+    open_count: usize = 0,
 
     seen_version: u64 = 0,
     blink_t0: f64 = 0,
@@ -162,33 +245,122 @@ pub const Palette = struct {
     }
 
     pub fn deinit(self: *Palette) void {
+        self.dropIndex();
         self.editor.deinit();
     }
 
-    pub fn show(self: *Palette, src: Sources) void {
+    pub fn show(self: *Palette, mode: Mode, src: Sources) void {
         self.open = true;
         self.src = src;
+        self.mode = mode;
+        self.from_files = false;
+        self.preview_from = null;
         self.editor.clear();
-        self.scope = .everything;
+        self.scope = mode.chips()[0];
         self.selected = 0;
         self.scroll = 0;
+        self.dropIndex();
+        if (mode == .files) self.startIndex();
         self.rebuild();
     }
 
+    /// Quick open with `:` typed: go to a line of the current editor.
+    pub fn showLine(self: *Palette, src: Sources) void {
+        self.show(.files, src);
+        self.editor.setText(":");
+        self.rebuild();
+    }
+
+    /// Dismisses the palette: a go-to-line preview is undone.
     pub fn close(self: *Palette) void {
+        self.restorePreview();
         self.open = false;
         self.src = null;
         self.count = 0;
+        self.dropIndex();
     }
 
-    pub fn toggle(self: *Palette, src: Sources) void {
-        if (self.open) self.close() else self.show(src);
+    /// Closes after a pick: what a preview moved stays where it is.
+    pub fn accept(self: *Palette) void {
+        self.preview_from = null;
+        self.close();
+    }
+
+    /// ⌘K / ⌘P: opens in `mode`; switches an open palette to the other
+    /// mode; closes the command palette; steps down quick open's list.
+    pub fn toggle(self: *Palette, mode: Mode, src: Sources) void {
+        if (!self.open) {
+            self.show(mode, src);
+            return;
+        }
+        if (self.mode != mode) {
+            self.switchMode(mode, mode.chips()[0]);
+            return;
+        }
+        if (mode == .files) {
+            self.moveSelection(1);
+            return;
+        }
+        self.close();
+    }
+
+    /// The same panel, the other set of chips; the query starts over.
+    fn switchMode(self: *Palette, mode: Mode, scope: Scope) void {
+        self.restorePreview();
+        self.from_files = self.mode == .files and mode == .commands;
+        self.mode = mode;
+        self.scope = scope;
+        self.editor.clear();
+        self.selected = 0;
+        self.scroll = 0;
+        if (mode == .files and self.index == null) self.startIndex();
+        self.rebuild();
+    }
+
+    // ── the file listing ────────────────────────────────────────────────
+    /// Starts listing the roots: the project the current folder belongs
+    /// to — else that folder, widened to its git repository — then the
+    /// other projects.
+    fn startIndex(self: *Palette) void {
+        const src = self.src orelse return;
+        const ix = file_index.Index.create(self.gpa) catch return;
+        const cwd = src.cwd;
+        if (src.projects.containing(cwd)) |p| {
+            ix.addRoot(p.root, p.name) catch {};
+        } else if (cwd.len > 0) {
+            ix.addRoot(cwd, "") catch {};
+            ix.roots.items[0].widen_to_repo = true;
+        }
+        for (src.projects.items.items) |p| ix.addRoot(p.root, p.name) catch {};
+        ix.start();
+        self.index = ix;
+        self.index_seen = false;
+    }
+
+    fn dropIndex(self: *Palette) void {
+        if (self.index) |ix| {
+            ix.release();
+            self.index = null;
+        }
+        self.index_seen = false;
+    }
+
+    /// The absolute path of an `open_file` pick, while the palette is open.
+    pub fn filePath(self: *const Palette, id: u32, buf: []u8) ?[]const u8 {
+        const ix = self.index orelse return null;
+        if (!ix.ready()) return null;
+        return ix.absPath(id, buf);
     }
 
     // ── per-tick ────────────────────────────────────────────────────────
-    /// Caret blink; true when a redraw is needed.
+    /// Caret blink and the file listing finishing; true when a redraw is needed.
     pub fn tick(self: *Palette, now: f64) bool {
         if (!self.open) return false;
+        if (self.index) |ix| if (!self.index_seen and ix.ready()) {
+            self.index_seen = true;
+            self.rebuild();
+            return true;
+        };
         if (self.editor.version != self.seen_version) {
             self.seen_version = self.editor.version;
             self.blink_t0 = now;
@@ -206,7 +378,7 @@ pub const Palette = struct {
     fn effectiveScope(self: *const Palette) Scope {
         const t = self.editor.bytes();
         if (t.len > 0) {
-            if (Scope.fromPrefix(t[0])) |s| return s;
+            if (Scope.fromPrefix(t[0], self.mode)) |s| return s;
         }
         return self.scope;
     }
@@ -214,14 +386,18 @@ pub const Palette = struct {
     /// The query text without its scope prefix.
     fn query(self: *const Palette) []const u8 {
         var t = self.editor.bytes();
-        if (t.len > 0 and Scope.fromPrefix(t[0]) != null) t = t[1..];
+        if (t.len > 0 and Scope.fromPrefix(t[0], self.mode) != null) t = t[1..];
         return std.mem.trim(u8, t, " ");
     }
 
     fn setScope(self: *Palette, s: Scope) void {
+        if (self.mode == .files and s == .commands) {
+            self.switchMode(.commands, .commands);
+            return;
+        }
         // A typed prefix would override the chip: drop it.
         const t = self.editor.bytes();
-        if (t.len > 0 and Scope.fromPrefix(t[0]) != null) {
+        if (t.len > 0 and Scope.fromPrefix(t[0], self.mode) != null) {
             var buf: [512]u8 = undefined;
             const n = @min(buf.len, t.len - 1);
             @memcpy(buf[0..n], t[1 .. 1 + n]);
@@ -234,9 +410,27 @@ pub const Palette = struct {
     }
 
     fn cycleScope(self: *Palette, delta: i32) void {
-        const n: i32 = @intCast(std.meta.tags(Scope).len);
-        const cur: i32 = @intFromEnum(self.effectiveScope());
-        self.setScope(@enumFromInt(@as(u8, @intCast(@mod(cur + delta, n)))));
+        const chips = self.mode.chips();
+        const cur = self.effectiveScope();
+        var at: i32 = 0;
+        for (chips, 0..) |s, i| if (s == cur) {
+            at = @intCast(i);
+        };
+        const n: i32 = @intCast(chips.len);
+        self.setScope(chips[@intCast(@mod(at + delta, n))]);
+    }
+
+    /// In quick open a leading `>` is the command palette (VS Code): the
+    /// character goes and the mode switches.
+    fn normalize(self: *Palette) void {
+        const t = self.editor.bytes();
+        if (self.mode != .files or t.len == 0 or t[0] != '>') return;
+        var buf: [512]u8 = undefined;
+        const n = @min(buf.len, t.len - 1);
+        @memcpy(buf[0..n], t[1 .. 1 + n]);
+        self.switchMode(.commands, .commands);
+        self.editor.setText(buf[0..n]);
+        self.rebuild();
     }
 
     // ── input ───────────────────────────────────────────────────────────
@@ -244,6 +438,7 @@ pub const Palette = struct {
         self.editor.insert(utf8);
         self.selected = 0;
         self.scroll = 0;
+        self.normalize();
         self.rebuild();
     }
 
@@ -259,11 +454,19 @@ pub const Palette = struct {
 
     /// Returns a pick to carry out, if any. `Escape` closes the palette.
     pub fn onEdit(self: *Palette, cmd: EditCommand) ?Pick {
+        // ⌫ on the empty command palette that `>` made: back to the files.
+        if (cmd == .delete_backward and self.mode == .commands and self.from_files and self.editor.isEmpty()) {
+            self.switchMode(.files, .files);
+            return null;
+        }
         switch (cmd) {
             .cancel => self.close(),
             .insert_newline, .insert_line_break => {
                 self.rebuild();
-                if (self.selected < self.count) return self.entries[self.selected].pick;
+                if (self.selected < self.count) {
+                    const pick = self.entries[self.selected].pick;
+                    if (pick != .none) return pick;
+                }
             },
             .insert_tab => self.cycleScope(1),
             .insert_backtab => self.cycleScope(-1),
@@ -277,6 +480,7 @@ pub const Palette = struct {
                 if (self.editor.version != before) {
                     self.selected = 0;
                     self.scroll = 0;
+                    self.normalize();
                     self.rebuild();
                 }
             },
@@ -308,69 +512,24 @@ pub const Palette = struct {
     // ── rows ────────────────────────────────────────────────────────────
     fn rebuild(self: *Palette) void {
         self.count = 0;
+        self.open_count = 0;
         const src = self.src orelse return;
         const q = self.query();
         const scope = self.effectiveScope();
+        if (scope != .line) self.restorePreview();
 
-        if (scope == .everything or scope == .commands) {
-            for (commands) |c| self.push(q, .{
-                .group = .commands,
-                .prefix = c.prefix,
-                .label = c.label,
-                .detail = c.kbd,
-                .pick = .{ .action = c.action },
-            });
-        }
-        if (scope == .everything or scope == .tabs) {
-            // The tabs in the strip (the group on show), so the ⌘n hints hold.
-            const n = @min(src.tabs.items().len, max_tabs);
-            for (0..n) |i| {
-                const t = src.tabs.items()[i];
-                const kbd = [_][]const u8{ "⌘1", "⌘2", "⌘3", "⌘4", "⌘5", "⌘6", "⌘7", "⌘8" };
-                const dot: ?Color = switch (t.vtable.status(t.ptr)) {
-                    .none => null,
-                    .running => theme.teal,
-                    .attention => theme.accent,
-                    .failed => theme.red,
-                };
-                self.push(q, .{
-                    .group = .tabs,
-                    .prefix = "Go to",
-                    .label = t.title(&self.title_bufs[i]),
-                    .detail = if (i < kbd.len) kbd[i] else if (i == n - 1) "⌘9" else "",
-                    .dot = dot,
-                    .pick = .{ .select_tab = i },
-                });
-            }
-        }
-        if (scope == .everything or scope == .history) {
-            const limit: usize = if (scope == .history) 14 else if (q.len == 0) 4 else 6;
-            const before = self.count;
-            var i = src.history.entries.items.len;
-            while (i > 0 and self.count - before < limit) {
-                i -= 1;
-                self.pushWith(q, .substring, .{
-                    .group = .history,
-                    .label = src.history.entries.items[i],
-                    .detail = "↵ run",
-                    .mono = true,
-                    .pick = .{ .run_history = i },
-                });
-            }
-        }
-        if (scope == .everything or scope == .settings) {
-            for (theme.accent_options, 0..) |c, i| {
-                const current = std.meta.eql(c, theme.accent);
-                self.push(q, .{
-                    .group = .settings,
-                    .prefix = "Accent colour ›",
-                    .label = accent_names[i],
-                    .detail = if (current) "current" else "",
-                    .kbd = false,
-                    .dot = c,
-                    .pick = .{ .set_accent = i },
-                });
-            }
+        switch (self.mode) {
+            .commands => {
+                if (scope == .everything or scope == .commands) self.pushCommands(q);
+                if (scope == .everything or scope == .tabs) self.pushTabs(src, q);
+                if (scope == .everything or scope == .history) self.pushHistory(src, q, scope);
+                if (scope == .everything or scope == .settings) self.pushSettings(q);
+            },
+            .files => switch (scope) {
+                .tabs => self.pushTabs(src, q),
+                .line => self.pushLine(src, q),
+                else => self.pushFiles(src, q),
+            },
         }
 
         // Best matches first within each group (stable, so ties keep their order).
@@ -386,6 +545,202 @@ pub const Palette = struct {
         if (self.count == 0) self.selected = 0 else self.selected = @min(self.selected, self.count - 1);
     }
 
+    fn pushCommands(self: *Palette, q: []const u8) void {
+        for (commands) |c| self.push(q, .{
+            .group = .commands,
+            .prefix = c.prefix,
+            .label = c.label,
+            .detail = c.kbd,
+            .pick = .{ .action = c.action },
+        });
+    }
+
+    /// The tabs in the strip (the group on show), so the ⌘n hints hold.
+    fn pushTabs(self: *Palette, src: Sources, q: []const u8) void {
+        const n = @min(src.tabs.items().len, max_tabs);
+        for (0..n) |i| {
+            const t = src.tabs.items()[i];
+            const kbd = [_][]const u8{ "⌘1", "⌘2", "⌘3", "⌘4", "⌘5", "⌘6", "⌘7", "⌘8" };
+            const dot: ?Color = switch (t.vtable.status(t.ptr)) {
+                .none => null,
+                .running => theme.teal,
+                .attention => theme.accent,
+                .failed => theme.red,
+            };
+            self.push(q, .{
+                .group = .tabs,
+                .prefix = "Go to",
+                .label = t.title(&self.title_bufs[i]),
+                .detail = if (i < kbd.len) kbd[i] else if (i == n - 1) "⌘9" else "",
+                .dot = dot,
+                .pick = .{ .select_tab = i },
+            });
+        }
+    }
+
+    fn pushHistory(self: *Palette, src: Sources, q: []const u8, scope: Scope) void {
+        const limit: usize = if (scope == .history) 14 else if (q.len == 0) 4 else 6;
+        const before = self.count;
+        var i = src.history.entries.items.len;
+        while (i > 0 and self.count - before < limit) {
+            i -= 1;
+            self.pushWith(q, .substring, .{
+                .group = .history,
+                .label = src.history.entries.items[i],
+                .detail = "↵ run",
+                .mono = true,
+                .pick = .{ .run_history = i },
+            });
+        }
+    }
+
+    fn pushSettings(self: *Palette, q: []const u8) void {
+        for (theme.accent_options, 0..) |c, i| {
+            const current = std.meta.eql(c, theme.accent);
+            self.push(q, .{
+                .group = .settings,
+                .prefix = "Accent colour ›",
+                .label = accent_names[i],
+                .detail = if (current) "current" else "",
+                .kbd = false,
+                .dot = c,
+                .pick = .{ .set_accent = i },
+            });
+        }
+    }
+
+    /// Quick open: the documents open in the group on show (the one on
+    /// show excluded, so ↵ on an empty query goes to another), then the
+    /// workspace files that match — a `:line:col` suffix rides along.
+    fn pushFiles(self: *Palette, src: Sources, q: []const u8) void {
+        const sp = file_index.splitGoto(q);
+        const fq = sp.text;
+        const goto = sp.goto orelse Goto{};
+
+        const cur = src.tabs.current();
+        var slot: usize = 0;
+        const grp = src.tabs.group();
+        outer: for (grp.layout.owned.items) |p| {
+            for (p.tabs.items) |t| {
+                if (slot >= max_tabs) break :outer;
+                const path = t.vtable.path(t.ptr);
+                if (path.len == 0) continue;
+                if (cur != null and cur.?.uid == t.uid) continue;
+                const before = self.count;
+                self.pushWith(fq, .fuzzy, .{
+                    .group = .open,
+                    .label = t.title(&self.title_bufs[slot]),
+                    .detail = self.folderDetail(path, slot),
+                    .kbd = false,
+                    .pick = .{ .focus_tab = .{ .id = t.uid, .goto = goto } },
+                });
+                if (self.count > before) {
+                    self.open_paths[self.open_count] = path;
+                    self.open_count += 1;
+                }
+                slot += 1;
+            }
+        }
+
+        const ix = self.index orelse return;
+        if (!ix.ready()) {
+            self.pushScored(.{ .group = .files, .label = "Listing files…", .kbd = false, .dim = true, .pick = .none });
+            return;
+        }
+        var hits: [max_hits]file_index.Hit = undefined;
+        const limit: usize = if (fq.len == 0) empty_hits else max_hits;
+        const n = ix.search(fq, hits[0..limit]);
+        var buf: [1024]u8 = undefined;
+        for (hits[0..n], 0..) |h, k| {
+            const f = ix.files.items[h.index];
+            if (self.open_count > 0) {
+                const abs = ix.absPath(h.index, &buf) orelse continue;
+                if (self.listedOpen(abs)) continue;
+            }
+            self.pushScored(.{
+                .group = .files,
+                .label = sys.basename(f.rel),
+                .detail = self.fileDetail(ix, f, max_tabs + k),
+                .kbd = false,
+                .pick = .{ .open_file = .{ .id = h.index, .goto = goto } },
+                .score = h.score,
+                .mask = h.mask,
+            });
+        }
+    }
+
+    fn listedOpen(self: *const Palette, path: []const u8) bool {
+        for (self.open_paths[0..self.open_count]) |p| if (std.mem.eql(u8, p, path)) return true;
+        return false;
+    }
+
+    /// A file's folder, led by its root's name when there are several roots.
+    fn fileDetail(self: *Palette, ix: *const file_index.Index, f: file_index.File, slot: usize) []const u8 {
+        const folder = file_index.Index.folderOf(f);
+        if (ix.roots.items.len < 2) return folder;
+        const root = ix.roots.items[f.root].name;
+        if (folder.len == 0) return root;
+        return std.fmt.bufPrint(&self.detail_bufs[slot], "{s}/{s}", .{ root, folder }) catch folder;
+    }
+
+    /// An open document's folder the way `fileDetail` spells it when the
+    /// document is under a root, "~/…" otherwise.
+    fn folderDetail(self: *Palette, path: []const u8, slot: usize) []const u8 {
+        const dir = sys.dirname(path);
+        if (self.index) |ix| {
+            for (ix.roots.items) |r| {
+                if (!std.mem.startsWith(u8, dir, r.path)) continue;
+                if (dir.len > r.path.len and dir[r.path.len] != '/') continue;
+                const rel = if (dir.len > r.path.len) dir[r.path.len + 1 ..] else "";
+                if (ix.roots.items.len < 2) return rel;
+                if (rel.len == 0) return r.name;
+                return std.fmt.bufPrint(&self.detail_bufs[slot], "{s}/{s}", .{ r.name, rel }) catch rel;
+            }
+        }
+        return sys.abbreviateHome(dir, &self.detail_bufs[slot]);
+    }
+
+    /// `:12:5` — a row that names the target, previewed in the editor as
+    /// it is typed; a hint about the current position until a number is.
+    fn pushLine(self: *Palette, src: Sources, q: []const u8) void {
+        const goto = file_index.parseGoto(q);
+        const tab = src.tabs.current();
+        const pos: ?tab_mod.Position = if (tab) |t| t.vtable.position(t.ptr) else null;
+        const p = pos orelse {
+            self.restorePreview();
+            self.pushScored(.{ .group = .line, .label = "Open a text file first to go to a line", .kbd = false, .dim = true, .pick = .none });
+            return;
+        };
+        if (goto == null or goto.?.line == 0) {
+            self.restorePreview();
+            const label = std.fmt.bufPrint(&self.detail_bufs[0], "Current line {d}, column {d}. Type a line number between 1 and {d}", .{ p.line, p.col, p.lines }) catch "";
+            self.pushScored(.{ .group = .line, .label = label, .kbd = false, .dim = true, .pick = .none });
+            return;
+        }
+        const g = goto.?;
+        const line: u32 = @intCast(@min(g.line, p.lines));
+        const label = if (g.col > 0)
+            std.fmt.bufPrint(&self.detail_bufs[0], "Go to line {d}, column {d}", .{ line, g.col }) catch ""
+        else
+            std.fmt.bufPrint(&self.detail_bufs[0], "Go to line {d}", .{line}) catch "";
+        self.pushScored(.{ .group = .line, .label = label, .detail = "↵ go", .pick = .{ .goto_line = .{ .line = line, .col = g.col } } });
+        self.previewLine(src, line, g.col);
+    }
+
+    fn previewLine(self: *Palette, src: Sources, line: u32, col: u32) void {
+        const t = src.tabs.current() orelse return;
+        if (self.preview_from == null) self.preview_from = t.vtable.position(t.ptr) orelse return;
+        _ = t.vtable.goTo(t.ptr, line, col);
+    }
+
+    fn restorePreview(self: *Palette) void {
+        const p = self.preview_from orelse return;
+        self.preview_from = null;
+        const src = self.src orelse return;
+        const t = src.tabs.current() orelse return;
+        _ = t.vtable.goTo(t.ptr, p.line, p.col);
+    }
+
     const Match = enum { fuzzy, substring };
 
     fn push(self: *Palette, q: []const u8, entry: Entry) void {
@@ -397,17 +752,24 @@ pub const Palette = struct {
         var e = entry;
         if (q.len > 0) {
             const matched: ?i32 = switch (mode) {
-                .fuzzy => fuzzy(q, e.label, &e.mask),
-                .substring => substring(q, e.label, &e.mask),
+                .fuzzy => match.fuzzy(q, e.label, &e.mask),
+                .substring => match.substring(q, e.label, &e.mask),
             };
             if (matched) |s| {
                 e.score = s;
-            } else if (e.prefix.len > 0 and fuzzy(q, e.prefix, &e.mask) != null) {
+            } else if (e.prefix.len > 0 and match.fuzzy(q, e.prefix, &e.mask) != null) {
                 e.mask = 0;
                 e.score = -8;
             } else return;
         }
         self.entries[self.count] = e;
+        self.count += 1;
+    }
+
+    /// A row already matched (or one that never is).
+    fn pushScored(self: *Palette, entry: Entry) void {
+        if (self.count >= max_entries) return;
+        self.entries[self.count] = entry;
         self.count += 1;
     }
 
@@ -477,11 +839,14 @@ pub const Palette = struct {
         const q_r: Rect = .{ .x = panel.x, .y = panel.y, .w = panel.w, .h = header_h };
         dl.rect(.{ .x = q_r.x, .y = q_r.bottom() - 1, .w = q_r.w, .h = 1 }, theme.line);
         const shown = self.editor.bytes();
-        // A typed prefix character is drawn as the prompt itself.
-        const typed_prefix = shown.len > 0 and Scope.fromPrefix(shown[0]) != null;
-        const prompt = [_]u8{if (scope.prefix() == 0) '>' else scope.prefix()};
+        // A typed prefix character is drawn as the prompt itself. The
+        // command palette always has one (`>` for everything); quick open
+        // has none unless a chip narrowed it.
+        const typed_prefix = shown.len > 0 and Scope.fromPrefix(shown[0], self.mode) != null;
+        const prompt_char: u8 = if (scope.prefix() != 0) scope.prefix() else if (self.mode == .commands) '>' else 0;
+        const prompt = [_]u8{prompt_char};
         var x = q_r.x + 16;
-        if (!typed_prefix) x += dl.textCentered(theme.font_palette_prompt, x, q_r.centerY(), &prompt, theme.accent) + 10;
+        if (!typed_prefix and prompt_char != 0) x += dl.textCentered(theme.font_palette_prompt, x, q_r.centerY(), &prompt, theme.accent) + 10;
         {
             // "Esc" chip at the right.
             const label = "Esc";
@@ -500,7 +865,11 @@ pub const Palette = struct {
         const d = ui.drag(Ui.id("palette.text", 0), text_rect);
         if (d.hover or d.dragging) ui.cursor = .ibeam;
         if (shown.len == 0 and self.editor.marked.items.len == 0) {
-            _ = dl.textEllipsis(theme.font_palette, x + 5, q_r.centerY(), "Search commands, tabs, history…", text_right - x - 5, theme.text_3);
+            const hint = switch (self.mode) {
+                .commands => "Search commands, tabs, history…",
+                .files => "Search files by name (append :line to go to a line)",
+            };
+            _ = dl.textEllipsis(theme.font_palette, x + 5, q_r.centerY(), hint, text_right - x - 5, theme.text_3);
         }
         // Text with selection, then the caret.
         {
@@ -554,7 +923,7 @@ pub const Palette = struct {
         const c_r: Rect = .{ .x = panel.x, .y = q_r.bottom(), .w = panel.w, .h = chips_h };
         dl.rect(.{ .x = c_r.x, .y = c_r.bottom() - 1, .w = c_r.w, .h = 1 }, theme.line);
         var cx = c_r.x + 16;
-        inline for (std.meta.tags(Scope), 0..) |s, si| {
+        for (self.mode.chips(), 0..) |s, si| {
             const active = s == scope;
             const has_prefix = s.prefix() != 0;
             const glyph = [_]u8{s.prefix()};
@@ -605,7 +974,9 @@ pub const Palette = struct {
             var right = r.right() - 10;
             if (e.detail.len > 0) {
                 const dfont = if (e.kbd) theme.font_kbd else theme.font_status;
-                right -= dl.textRight(dfont, right, r.centerY(), e.detail, theme.text_3) + 10;
+                var fit_buf: [detail_len]u8 = undefined;
+                const detail = if (e.kbd) e.detail else fitLeft(ui, dfont, e.detail, (r.w - 20) * 0.45, &fit_buf);
+                right -= dl.textRight(dfont, right, r.centerY(), detail, theme.text_3) + 10;
             }
             if (e.dot) |c| {
                 dl.circle(tx + 3.5, r.centerY(), 3.5, c);
@@ -614,7 +985,7 @@ pub const Palette = struct {
             if (e.prefix.len > 0) tx += dl.textCentered(theme.font_row, tx, r.centerY(), e.prefix, theme.text_2) + 5;
             const lf = if (e.mono) theme.font_row_mono else theme.font_row;
             const lb = if (e.mono) theme.font_row_mono_bold else theme.font_row_bold;
-            drawHighlighted(ui, lf, lb, tx, r.centerY(), e.label, e.mask, right - tx, if (selected) theme.text else theme.text);
+            drawHighlighted(ui, lf, lb, tx, r.centerY(), e.label, e.mask, right - tx, if (e.dim) theme.text_2 else theme.text);
         }
         dl.popClip();
 
@@ -623,14 +994,22 @@ pub const Palette = struct {
         dl.rect(f_r, theme.bg_panel_footer);
         dl.rect(.{ .x = f_r.x, .y = f_r.y, .w = f_r.w, .h = 1 }, theme.line);
         var fx = f_r.x + 16;
-        const hints = [_][]const u8{ "↑↓ move", "↵ run", "Tab switch scope", "Esc close" };
+        const hints: []const []const u8 = switch (self.mode) {
+            .commands => &.{ "↑↓ move", "↵ run", "Tab switch scope", "Esc close" },
+            .files => &.{ "↑↓ move", "↵ open", "Tab switch scope", "Esc close" },
+        };
         for (hints) |h| fx += dl.textCentered(theme.font_kbd, fx, f_r.centerY(), h, theme.text_3) + 16;
-        const tail = "type a prefix to narrow: > @ ! :";
+        const tail: []const u8 = switch (self.mode) {
+            .commands => "type a prefix to narrow: > @ ! :",
+            .files => "type a prefix to narrow: @ : >",
+        };
         if (f_r.right() - 16 - ui.text.measure(theme.font_kbd, tail) > fx) {
             _ = dl.textRight(theme.font_kbd, f_r.right() - 16, f_r.centerY(), tail, theme.text_3);
         }
 
-        if (pick != null) self.close();
+        if (pick) |p| {
+            if (p == .none) pick = null else self.accept();
+        }
         return pick;
     }
 };
@@ -665,92 +1044,35 @@ fn drawHighlighted(ui: *Ui, font: Font, bold: Font, x: f32, center_y: f32, str: 
     }
 }
 
-fn isWordByte(b: u8) bool {
-    return std.ascii.isAlphanumeric(b) or b >= 0x80;
-}
-
-/// Case-insensitive subsequence match of `q` in `hay`. Sets the bits of the
-/// matched code point indices (first 64) and returns a score, higher is
-/// better: runs and word starts score, a late first hit costs.
-fn fuzzy(q: []const u8, hay: []const u8, mask: *u64) ?i32 {
-    mask.* = 0;
-    if (q.len == 0) return 0;
-    var score: i32 = 0;
-    var qi: usize = 0;
-    var prev_matched = false;
-    var prev_byte: u8 = ' ';
-    var first: ?usize = null;
-    var idx: usize = 0;
-    var it = gfx_text.Utf8Iter{ .bytes = hay };
-    while (true) : (idx += 1) {
-        const at = it.index;
-        _ = it.next() orelse break;
-        const hb = hay[at..it.index];
-        const qlen = std.unicode.utf8ByteSequenceLength(q[qi]) catch 1;
-        const qb = q[qi..@min(q.len, qi + qlen)];
-        var eq = hb.len == qb.len;
-        if (eq) for (hb, qb) |a, b| {
-            if (std.ascii.toLower(a) != std.ascii.toLower(b)) {
-                eq = false;
-                break;
-            }
-        };
-        if (eq) {
-            const word_start = idx == 0 or !isWordByte(prev_byte);
-            score += if (prev_matched) 4 else if (word_start) 3 else 1;
-            if (first == null) first = idx;
-            if (idx < 64) mask.* |= @as(u64, 1) << @intCast(idx);
-            qi += qb.len;
-            prev_matched = true;
-            if (qi >= q.len) break;
-        } else prev_matched = false;
-        prev_byte = hb[0];
+/// `s` shortened from the left to fit `max_w`: whole path components go
+/// first ("…/ui/panes"), then characters. Uses `buf` for the result.
+fn fitLeft(ui: *Ui, font: Font, s: []const u8, max_w: f32, buf: []u8) []const u8 {
+    if (ui.text.measure(font, s) <= max_w) return s;
+    const ell_w = ui.text.measure(font, "…");
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, s, start, '/')) |slash| {
+        start = slash + 1;
+        const tail = s[start..];
+        if (ell_w + ui.text.measure(font, tail) <= max_w) return std.fmt.bufPrint(buf, "…{s}", .{tail}) catch tail;
     }
-    if (qi < q.len) return null;
-    return score - @as(i32, @intCast(@min(first.?, 20)));
-}
-
-/// Case-insensitive contiguous match, for long shell commands where a
-/// subsequence match would hit almost anything. Earlier hits score higher.
-fn substring(q: []const u8, hay: []const u8, mask: *u64) ?i32 {
-    mask.* = 0;
-    if (q.len == 0) return 0;
-    const at = std.ascii.indexOfIgnoreCase(hay, q) orelse return null;
-    // Byte offsets → code point indices for the highlight mask.
-    var idx: usize = 0;
-    var it = gfx_text.Utf8Iter{ .bytes = hay };
-    while (it.index < at) : (idx += 1) _ = it.next() orelse break;
-    const first = idx;
-    while (it.index < at + q.len) : (idx += 1) {
-        if (idx < 64) mask.* |= @as(u64, 1) << @intCast(idx);
-        _ = it.next() orelse break;
+    var it = gfx_text.Utf8Iter{ .bytes = s[start..] };
+    while (it.next()) |_| {
+        const tail = s[start + it.index ..];
+        if (tail.len == 0) break;
+        if (ell_w + ui.text.measure(font, tail) <= max_w) return std.fmt.bufPrint(buf, "…{s}", .{tail}) catch tail;
     }
-    return 50 - @as(i32, @intCast(@min(first, 40)));
+    return "…";
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
-test "substring match is contiguous and case-insensitive" {
-    var m: u64 = 0;
-    try std.testing.expect(substring("STAT", "git status -sb", &m) != null);
-    try std.testing.expectEqual(@as(u64, 0b1111 << 4), m);
-    try std.testing.expect(substring("gs", "git status", &m) == null);
-    try std.testing.expect(substring("ndú", "echo ñandú", &m) != null);
-    try std.testing.expectEqual(@as(u64, 0b111 << 7), m);
-}
-
-test "fuzzy prefers word starts and runs, ignores case" {
-    var m: u64 = 0;
-    const a = fuzzy("nt", "New terminal tab", &m).?;
-    try std.testing.expectEqual(@as(u64, 0b10001), m); // "N" and the "t" of "terminal"
-    const b = fuzzy("nt", "Untangle", &m).?;
-    try std.testing.expect(a > b);
-    try std.testing.expect(fuzzy("xyz", "New terminal tab", &m) == null);
-    try std.testing.expect(fuzzy("close tab", "Close tab", &m) != null);
-    try std.testing.expect(fuzzy("ñ", "ñandú", &m) != null);
-}
-
-test "scope prefixes" {
-    try std.testing.expectEqual(Scope.commands, Scope.fromPrefix('>').?);
-    try std.testing.expectEqual(Scope.history, Scope.fromPrefix('!').?);
-    try std.testing.expect(Scope.fromPrefix('x') == null);
+test "scope prefixes depend on the mode" {
+    try std.testing.expectEqual(Scope.commands, Scope.fromPrefix('>', .commands).?);
+    try std.testing.expectEqual(Scope.history, Scope.fromPrefix('!', .commands).?);
+    try std.testing.expectEqual(Scope.settings, Scope.fromPrefix(':', .commands).?);
+    try std.testing.expect(Scope.fromPrefix('x', .commands) == null);
+    // Quick open: `:` is go to line, `!` means nothing, `>` the commands.
+    try std.testing.expectEqual(Scope.line, Scope.fromPrefix(':', .files).?);
+    try std.testing.expect(Scope.fromPrefix('!', .files) == null);
+    try std.testing.expectEqual(Scope.commands, Scope.fromPrefix('>', .files).?);
+    try std.testing.expectEqual(Scope.tabs, Scope.fromPrefix('@', .files).?);
 }

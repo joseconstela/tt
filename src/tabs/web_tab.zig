@@ -8,6 +8,10 @@
 //! WebKit is driven through the Objective-C runtime like AppKit is. Without
 //! a window (headless scripts, tests) there is no web view: the chrome still
 //! works and the body says so.
+//!
+//! The app runs JavaScript of its own in every page and hears back from it
+//! (web_bridge.zig); the first use is the context menu, which offers what
+//! the app can do with the text selected in the page (web_menu.zig).
 const std = @import("std");
 const records = @import("../records.zig");
 const tab_mod = @import("tab.zig");
@@ -16,6 +20,8 @@ const theme = @import("../ui/theme.zig");
 const gfx_text = @import("../gfx/text.zig");
 const icons = @import("../gfx/icons.zig");
 const objc = @import("../objc.zig");
+const web_bridge = @import("web_bridge.zig");
+const web_menu = @import("web_menu.zig");
 const Editor = @import("../input/editor.zig").Editor;
 const EditCommand = @import("../events.zig").EditCommand;
 
@@ -62,6 +68,10 @@ pub const WebTab = struct {
     /// A load that failed: what WebKit said, and the address for "Try again".
     error_text: ?[]u8 = null,
     error_url: ?[]u8 = null,
+    /// What the page says is selected, and the link under the pointer when
+    /// its context menu last opened — from the `selection` bridge.
+    selection: std.ArrayList(u8) = .empty,
+    link_url: std.ArrayList(u8) = .empty,
 
     // The address bar.
     editor: Editor,
@@ -104,6 +114,8 @@ pub const WebTab = struct {
         }
         objc.release(self.delegate);
         self.clearError();
+        self.selection.deinit(self.gpa);
+        self.link_url.deinit(self.gpa);
         self.url.deinit(self.gpa);
         self.page_title.deinit(self.gpa);
         self.editor.deinit();
@@ -116,11 +128,37 @@ pub const WebTab = struct {
         return @ptrCast(@alignCast(t.ptr));
     }
 
+    /// The tab whose web view this is (WebKit callbacks name the view).
+    pub fn fromView(view: id) ?*WebTab {
+        if (view == null) return null;
+        var t = live_head;
+        while (t) |tab| : (t = tab.next_live) {
+            if (tab.view == view) return tab;
+        }
+        return null;
+    }
+
+    // ── the page's side ─────────────────────────────────────────────────
+    /// The `selection` bridge reports what the page has selected and, when
+    /// it knows (the context menu is opening), the link under the pointer.
+    pub fn setSelection(self: *WebTab, text: []const u8, href: ?[]const u8) void {
+        _ = self.setText(&self.selection, text);
+        if (href) |h| _ = self.setText(&self.link_url, h);
+    }
+
+    /// Runs JavaScript in the page, in the bridges' world (web_bridge.zig);
+    /// nothing without a web view.
+    pub fn eval(self: *WebTab, js: []const u8) void {
+        const v = self.view orelse return;
+        web_bridge.eval(v, js);
+    }
+
     // ── the web view ────────────────────────────────────────────────────
     fn createView(self: *WebTab) void {
         const config = objc.new("WKWebViewConfiguration");
         defer objc.release(config);
         msg(void, config, "setApplicationNameForUserAgent:", .{objc.nsString(ua_suffix)});
+        web_bridge.install(config);
         // "Inspect Element" in the page's context menu.
         const prefs = msg(id, config, "preferences", .{});
         const yes = msg(id, objc.class("NSNumber"), "numberWithBool:", .{true});
@@ -292,6 +330,9 @@ pub const WebTab = struct {
             if (url.len > 0 and self.setText(&self.url, url)) {
                 changed = true;
                 if (!self.bar_focused) self.editor.setText(url);
+                // Another page: what was selected on the last one is gone.
+                self.selection.clearRetainingCapacity();
+                self.link_url.clearRetainingCapacity();
             }
             if (self.setText(&self.page_title, objc.utf8(msg(id, v, "title", .{})))) changed = true;
 
@@ -610,13 +651,7 @@ pub const WebTab = struct {
 
 var live_head: ?*WebTab = null;
 
-fn fromView(view: id) ?*WebTab {
-    var t = live_head;
-    while (t) |tab| : (t = tab.next_live) {
-        if (tab.view == view) return tab;
-    }
-    return null;
-}
+const fromView = WebTab.fromView;
 
 // ── the view class ──────────────────────────────────────────────────────
 // A WKWebView that is first responder claims every ⌘ chord for the page and
@@ -629,11 +664,27 @@ var web_view_class: objc.Class = null;
 
 fn webViewClass() objc.Class {
     if (web_view_class == null) {
-        const b = objc.ClassBuilder.begin("ConchWebView", "WKWebView");
+        const b = objc.ClassBuilder.begin("TTWebView", "WKWebView");
         b.method("performKeyEquivalent:", performKeyEquivalent, "B@:@");
+        b.method("willOpenMenu:withEvent:", willOpenMenu, "v@:@@");
+        b.method("ttMenuAction:", menuAction, "v@:@");
         web_view_class = b.register();
     }
     return web_view_class;
+}
+
+/// The page's context menu is about to open, WebKit's items already in
+/// it: the app's entries go in front (web_menu.zig).
+fn willOpenMenu(self: id, _: SEL, menu: id, event: id) callconv(.c) void {
+    objc.msgSuper(void, self, objc.class("WKWebView"), "willOpenMenu:withEvent:", .{ menu, event });
+    const tab = fromView(self) orelse return;
+    web_menu.fill(tab, self, menu);
+}
+
+/// One of those entries was picked; its tag says which.
+fn menuAction(self: id, _: SEL, sender: id) callconv(.c) void {
+    const tab = fromView(self) orelse return;
+    web_menu.perform(tab, msg(NSInteger, sender, "tag", .{}));
 }
 
 fn performKeyEquivalent(self: id, _: SEL, event: id) callconv(.c) bool {
@@ -643,7 +694,7 @@ fn performKeyEquivalent(self: id, _: SEL, event: id) callconv(.c) bool {
     const nsapp = msg(id, objc.class("NSApplication"), "sharedApplication", .{});
     const menu = msg(id, nsapp, "mainMenu", .{});
     const by_menu = menu != null and msg(bool, menu, "performKeyEquivalent:", .{event});
-    if (@import("../sys.zig").getenv("CONCH_DEBUG_EVENTS") != null) {
+    if (@import("../sys.zig").getenv("TT_DEBUG_EVENTS") != null) {
         std.debug.print("web performKeyEquivalent '{s}' menu_took_it={}\n", .{ objc.utf8(msg(id, event, "charactersIgnoringModifiers", .{})), by_menu });
     }
     if (by_menu) return true;
@@ -659,7 +710,7 @@ var delegate_class: objc.Class = null;
 
 fn delegateClass() objc.Class {
     if (delegate_class == null) {
-        const b = objc.ClassBuilder.begin("ConchWebDelegate", "NSObject");
+        const b = objc.ClassBuilder.begin("TTWebDelegate", "NSObject");
         b.protocol("WKNavigationDelegate");
         b.protocol("WKUIDelegate");
         b.method("webView:didFailProvisionalNavigation:withError:", didFail, "v@:@@@");
@@ -702,7 +753,7 @@ fn createWebView(_: id, _: SEL, web_view: id, _: id, action: id, _: id) callconv
 /// The address a typed string means: as is with a scheme, https:// (http://
 /// for local hosts) in front of something host-like, else a web search.
 /// Caller frees.
-fn resolve(gpa: std.mem.Allocator, typed: []const u8) ![]u8 {
+pub fn resolve(gpa: std.mem.Allocator, typed: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     const t = std.mem.trim(u8, typed, " \t\r\n");
@@ -727,6 +778,12 @@ fn resolve(gpa: std.mem.Allocator, typed: []const u8) ![]u8 {
         }
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// True when `resolve` would take `t` as an address rather than search for it.
+pub fn isAddress(t: []const u8) bool {
+    const trimmed = std.mem.trim(u8, t, " \t\r\n");
+    return trimmed.len > 0 and (hasScheme(trimmed) or looksLikeHost(trimmed));
 }
 
 fn hasScheme(t: []const u8) bool {
@@ -758,7 +815,7 @@ fn isLocal(t: []const u8) bool {
 }
 
 /// "https://zig.news/foo" → "zig.news".
-fn hostOf(url: []const u8) []const u8 {
+pub fn hostOf(url: []const u8) []const u8 {
     const start = if (std.mem.indexOf(u8, url, "://")) |i| i + 3 else 0;
     const rest = url[start..];
     const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
@@ -783,6 +840,15 @@ test "resolve: scheme, host, search" {
         defer gpa.free(got);
         try std.testing.expectEqualStrings(c[1], got);
     }
+}
+
+test "isAddress" {
+    try std.testing.expect(isAddress("https://ziglang.org/"));
+    try std.testing.expect(isAddress(" ziglang.org/download "));
+    try std.testing.expect(isAddress("localhost:8080"));
+    try std.testing.expect(!isAddress("zig comptime tricks"));
+    try std.testing.expect(!isAddress("what is 2+2?"));
+    try std.testing.expect(!isAddress(""));
 }
 
 test "hostOf" {

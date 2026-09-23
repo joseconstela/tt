@@ -42,7 +42,7 @@ const note_no_explain_agent = "No agent explains failures yet: pick one under Se
 const note_no_explanation = "The agent sent no explanation.";
 const note_fix_off = "Fix with agent is off (Settings › AI › Features).";
 const note_fix_none = "No coding agent found on this Mac: Settings › AI › Agents says how to install one.";
-const note_fix_unknown = "The coding agent chosen under Settings › AI › Features is not one conch knows.";
+const note_fix_unknown = "The coding agent chosen under Settings › AI › Features is not one tt knows.";
 /// Line height of the explanation under a failed command.
 const explain_line_h: f32 = 21;
 /// Gap above the explanation's label, and the label row itself.
@@ -490,6 +490,25 @@ pub const TerminalTab = struct {
     // under Settings › AI › Features. The block becomes the conversation's
     // turn: the reply streams into its output, the earlier turns of the tab
     // go along as context.
+
+    /// The terminal tab behind a generic tab, when that is what it is.
+    pub fn fromTab(t: tab_mod.Tab) ?*TerminalTab {
+        if (!std.mem.eql(u8, t.kind, "terminal")) return null;
+        return @ptrCast(@alignCast(t.ptr));
+    }
+
+    /// A question from elsewhere in the app (a website tab's context menu):
+    /// a block headed `label` asks the agent `question`, as a `# question`
+    /// typed here would.
+    pub fn askAgent(self: *TerminalTab, label: []const u8, question: []const u8) void {
+        if (config.get().features.command_fallback_agent == null) {
+            self.session.addNote(label, note_no_agent);
+            return;
+        }
+        const b = self.session.restoreBlock(label) orelse return;
+        self.scroll = 0;
+        self.ask(b, question);
+    }
 
     /// A `# question` never reaches the shell.
     fn askQuestion(self: *TerminalTab, cmd: []const u8) void {

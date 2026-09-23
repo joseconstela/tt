@@ -1,7 +1,7 @@
 .{
-    .name = .conch,
+    .name = .tt,
     .version = "0.1.0",
-    .fingerprint = 0x34052af16b149e22,
+    .fingerprint = 0x5de21b2891841d2a,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ghostty = .{

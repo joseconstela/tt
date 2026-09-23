@@ -1,52 +1,34 @@
 //! What every document viewer shares — file, image, PDF and whatever comes
-//! next: the centred card with its header row (icon, name, meta on the
-//! right), a one-line notice for the failure cases, scroll-key handling
-//! and size formatting. A new viewer draws only its body.
+//! next: the body they draw into, a one-line notice for the failure cases,
+//! scroll-key handling and size formatting. A viewer gets the whole tab,
+//! edge to edge, the way a full-screen program takes a terminal: no card,
+//! no margins, no header row. The file's name is the tab's title and what
+//! it is (kind, size, state) goes in the tab's `info`, the context line at
+//! the right of the tab strip, so the content starts right under the strip.
 const std = @import("std");
 const records = @import("../records.zig");
 const sys = @import("../sys.zig");
 const ui_mod = @import("../ui/ui.zig");
 const theme = @import("../ui/theme.zig");
-const icons = @import("../gfx/icons.zig");
+const filetype = @import("../filetype.zig");
 const EditCommand = @import("../events.zig").EditCommand;
 
 const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
 
-pub const head_h: f32 = 46;
-
-/// The card a viewer lives in, centred in the content area.
-pub fn card(rect: Rect) Rect {
-    const col_w = @max(240, @min(theme.content_max_w, rect.w - 2 * theme.content_pad));
-    const col_x = rect.x + (rect.w - col_w) / 2;
-    return .{ .x = col_x, .y = rect.y + theme.content_pad, .w = col_w, .h = rect.h - 2 * theme.content_pad };
+/// Clears the tab's area and returns it as the body: all of it, from the
+/// line under the strip to the pane's edges.
+pub fn frame(ui: *Ui, rect: Rect) Rect {
+    ui.dl.rect(rect, theme.bg);
+    return rect;
 }
 
-/// Draws the card and its header; returns the body under the divider.
-pub fn header(ui: *Ui, c: Rect, icon: icons.Icon, name: []const u8, meta: []const u8) Rect {
-    return headerWith(ui, c, icon, name, meta, 0);
-}
-
-/// `header` with `trailing` points kept free at the right end of the header
-/// row, for a control the viewer draws there itself (see `trailingRect`).
-pub fn headerWith(ui: *Ui, c: Rect, icon: icons.Icon, name: []const u8, meta: []const u8, trailing: f32) Rect {
-    const dl = ui.dl;
-    dl.shape(c, theme.block_radius, theme.bg_block, theme.block_border, theme.line);
-    const px = c.x + theme.block_pad_x;
-    const hcy = c.y + head_h / 2;
-    dl.icon(icon, px, hcy - 8, 16, theme.text_3);
-    const meta_right = c.right() - theme.block_pad_x - (if (trailing > 0) trailing + 14 else 0);
-    const mw = dl.textRight(theme.font_hint, meta_right, hcy, meta, theme.text_3);
-    const name_x = px + 16 + 10;
-    _ = dl.textEllipsis(theme.font_ui_medium, name_x, hcy, name, meta_right - mw - 12 - name_x, theme.text);
-    dl.rect(.{ .x = c.x, .y = c.y + head_h, .w = c.w, .h = 1 }, theme.line);
-    return .{ .x = c.x, .y = c.y + head_h + 1, .w = c.w, .h = @max(0, c.h - head_h - 1) };
-}
-
-/// The area `headerWith` kept free: `w` × `h` points, right-aligned and
-/// vertically centred in the header row of card `c`.
-pub fn trailingRect(c: Rect, w: f32, h: f32) Rect {
-    return .{ .x = c.right() - theme.block_pad_x - w, .y = c.y + (head_h - h) / 2, .w = w, .h = h };
+/// The kind a viewer names first in its context line: the extension in
+/// capitals ("PNG", "HEIC"), or `fallback` when the file has none.
+pub fn kindLabel(path: []const u8, fallback: []const u8, buf: []u8) []const u8 {
+    const ext = filetype.extension(path);
+    if (ext.len == 0 or ext.len > buf.len) return fallback;
+    return std.ascii.upperString(buf[0..ext.len], ext);
 }
 
 /// A quiet one-liner in the body: empty file, cannot open, …

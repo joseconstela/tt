@@ -153,6 +153,9 @@ pub const Options = struct {
     /// Shown in place of an empty value.
     placeholder: []const u8 = "",
     font: Font = theme.font_ui,
+    /// Room kept free at the right end, inside the box, for controls the
+    /// owner draws there (the search field's switches).
+    right_pad: f32 = 0,
 };
 
 pub const Result = struct {
@@ -178,15 +181,18 @@ pub fn draw(ui: *Ui, focus: *Focus, id: u64, r: Rect, value: []const u8, opts: O
         // editor holds the value; a plain click selects all for now.
     }
 
-    const inner = r.inset(12, 1);
-    dl.pushClip(r.inset(6, 1));
+    var inner = r.inset(12, 1);
+    inner.w = @max(0, inner.w - opts.right_pad);
+    dl.pushClip(.{ .x = r.x + 6, .y = r.y + 1, .w = @max(0, r.w - 12 - opts.right_pad), .h = r.h - 2 });
     defer dl.popClip();
     const cy = r.centerY();
 
     const text = if (focused) focus.editor.bytes() else value;
-    if (text.len == 0 and !focused) {
+    if (text.len == 0) {
+        // The placeholder shows in an empty box, focused (the caret sits
+        // in front of it) or not.
         _ = dl.textEllipsis(font, inner.x, cy, opts.placeholder, inner.w, theme.text_3);
-        return res;
+        if (!focused) return res;
     }
 
     const hide = opts.masked and !opts.revealed;

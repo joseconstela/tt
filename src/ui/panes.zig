@@ -28,6 +28,9 @@ pub const Result = struct {
     toggle_files: bool = false,
     /// Focus, a divider or a tab moved.
     changed: bool = false,
+    /// A file dragged from the files panel was let go over a strip or a
+    /// pane: where. The app opens it there.
+    file_drop: ?tabbar.DropTarget = null,
 };
 
 pub const PaneView = struct {
@@ -132,7 +135,7 @@ pub const PaneView = struct {
 
         if (self.drag) |*d| {
             if (ui.released) {
-                applyDrop(tabs, d);
+                if (d.kind == .file) res.file_drop = d.target else applyDrop(tabs, d);
                 self.drag = null;
                 res.changed = true;
             } else if (!ui.down) {

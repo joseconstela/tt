@@ -26,7 +26,11 @@ const apple = @import("apple.zig");
 const sys = @import("sys.zig");
 const EditCommand = @import("events.zig").EditCommand;
 
-fn noClipboard(_: []const u8) void {}
+/// What the app puts on the clipboard is printed instead (there is no
+/// pasteboard to check headless).
+fn printClipboard(text: []const u8) void {
+    std.debug.print("clipboard → {s}\n", .{text});
+}
 
 fn pump(app: *app_mod.App, ms: f64) void {
     const t0 = apple.CACurrentMediaTime();
@@ -56,7 +60,7 @@ pub fn runHeadless(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
     const source = try sys.readFileTail(gpa, path, 1 << 20);
     defer gpa.free(source);
 
-    const app = try app_mod.App.create(gpa, opts, null, noClipboard);
+    const app = try app_mod.App.create(gpa, opts, null, printClipboard);
     defer app.destroy();
     app.chrome = .{ .inset_left = 79, .fake_lights = true };
     pump(app, 50);

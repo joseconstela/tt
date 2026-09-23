@@ -1,5 +1,5 @@
 //! A project's or resource's icon of the user's choosing, kept as a short
-//! string in ~/.conch_projects: either the name of a stroke icon ("folder")
+//! string in ~/.tt_projects: either the name of a stroke icon ("folder")
 //! or a colour ("#E5484D") drawn as a filled circle. Unknown strings draw
 //! nothing, so a hand-edited file cannot break the sidebar.
 const std = @import("std");

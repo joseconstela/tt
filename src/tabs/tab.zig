@@ -32,6 +32,10 @@ pub const Status = enum { none, running, attention, failed };
 /// The last four are for website tabs: history, reload, focus the address bar.
 pub const Command = enum { save, undo, redo, toggle_view, back, forward, reload, open_location };
 
+/// Where a text document's caret is, the way "go to line" counts:
+/// 1-based line and column, and how many lines there are.
+pub const Position = struct { line: usize, col: usize, lines: usize };
+
 /// What a tab is opened on. Kinds read the fields they care about.
 pub const OpenArgs = struct {
     /// Terminal: directory to start in (default: where the app was launched).
@@ -62,6 +66,56 @@ pub const Env = struct {
     /// Where a tab can hang a native view (a website tab's WKWebView) over
     /// the Metal layer. Null when there is no window: headless scripts, tests.
     host: ?*const Host = null,
+    /// What tabs asked the app for since the last tick (see `Request`);
+    /// the app serves and frees them. Queued with the methods below.
+    requests: std.ArrayList(Request) = .empty,
+
+    /// A new website tab on `url`.
+    pub fn openUrl(self: *Env, url: []const u8) void {
+        const copy = self.gpa.dupe(u8, url) catch return;
+        self.requests.append(self.gpa, .{ .open_url = copy }) catch self.gpa.free(copy);
+    }
+
+    /// `text` into the input box of a shell in the row on show; nothing runs.
+    pub fn sendToShell(self: *Env, text: []const u8) void {
+        const copy = self.gpa.dupe(u8, text) catch return;
+        self.requests.append(self.gpa, .{ .send_to_shell = copy }) catch self.gpa.free(copy);
+    }
+
+    /// `question` to the agent that takes plain-English lines, in a shell
+    /// of the row on show, as a block headed `label`.
+    pub fn askAgent(self: *Env, label: []const u8, question: []const u8) void {
+        const l = self.gpa.dupe(u8, label) catch return;
+        const q = self.gpa.dupe(u8, question) catch {
+            self.gpa.free(l);
+            return;
+        };
+        self.requests.append(self.gpa, .{ .ask_agent = .{ .label = l, .question = q } }) catch {
+            self.gpa.free(l);
+            self.gpa.free(q);
+        };
+    }
+};
+
+/// Something a tab wants done beyond its own rect — another tab opened,
+/// text handed to a shell, the agent asked — queued on `Env` and served by
+/// the app between ticks (`App.update`). The text is the queue's until then.
+pub const Request = union(enum) {
+    open_url: []u8,
+    send_to_shell: []u8,
+    ask_agent: Ask,
+
+    pub const Ask = struct { label: []u8, question: []u8 };
+
+    pub fn free(self: Request, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .open_url, .send_to_shell => |s| gpa.free(s),
+            .ask_agent => |a| {
+                gpa.free(a.label);
+                gpa.free(a.question);
+            },
+        }
+    }
 };
 
 /// Native views hosted in the window, implemented by the platform layer.
@@ -110,6 +164,10 @@ pub const Tab = struct {
         /// Called every tick, even in the background. True = needs redraw.
         tick: *const fn (*anyopaque, now: f64, active: bool) bool,
         draw: *const fn (*anyopaque, ui: *Ui, rect: Rect, focused: bool) void,
+        /// Controls the tab keeps in its strip (a viewer's mode switch …):
+        /// drawn right-aligned in `room`, the strip's spare space left of
+        /// the context line. Returns their width; 0 for none, the default.
+        strip: *const fn (*anyopaque, ui: *Ui, room: Rect) f32,
         onText: *const fn (*anyopaque, utf8: []const u8) void,
         onMarkedText: *const fn (*anyopaque, utf8: []const u8) void,
         onEdit: *const fn (*anyopaque, cmd: EditCommand) void,
@@ -127,8 +185,20 @@ pub const Tab = struct {
         cwd: *const fn (*anyopaque) []const u8,
         /// Document the tab shows ("" if none).
         path: *const fn (*anyopaque) []const u8,
+        /// The document was renamed or moved on disk (by the files panel):
+        /// the tab follows it. Nothing for tabs without one.
+        relocate: *const fn (*anyopaque, path: []const u8) void,
         /// Runs a document command; false when the tab has no use for it.
         command: *const fn (*anyopaque, Command) bool,
+        /// The caret of a text document; null for a tab without one.
+        position: *const fn (*anyopaque) ?Position,
+        /// Moves a text document's caret to a 1-based line and column
+        /// (0 = the line's start), clamped, and scrolls to it; false for
+        /// a tab without one.
+        goTo: *const fn (*anyopaque, line: usize, col: usize) bool,
+        /// Selects `len` bytes at a 0-based line and byte column of the
+        /// document (the Search view's matches); nothing for other tabs.
+        selectSpan: *const fn (*anyopaque, line: u32, col: u32, len: u32) void,
         /// Why closing the tab needs a confirmation — a running command,
         /// unsent input, unsaved changes … — as a short sentence (may use
         /// `buf` as scratch). Null when nothing would be lost.
@@ -172,6 +242,10 @@ pub const Tab = struct {
             fn draw(p: *anyopaque, ui: *Ui, rect: Rect, focused: bool) void {
                 self(p).draw(ui, rect, focused);
             }
+            fn strip(p: *anyopaque, ui: *Ui, room: Rect) f32 {
+                if (@hasDecl(T, "strip")) return self(p).strip(ui, room);
+                return 0;
+            }
             fn onText(p: *anyopaque, utf8: []const u8) void {
                 if (@hasDecl(T, "onText")) self(p).onText(utf8);
             }
@@ -211,8 +285,22 @@ pub const Tab = struct {
                 if (@hasDecl(T, "path")) return self(p).path();
                 return "";
             }
+            fn relocate(p: *anyopaque, new_path: []const u8) void {
+                if (@hasDecl(T, "relocate")) self(p).relocate(new_path);
+            }
             fn command(p: *anyopaque, cmd: Command) bool {
                 if (@hasDecl(T, "command")) return self(p).command(cmd);
+                return false;
+            }
+            fn selectSpan(p: *anyopaque, line: u32, col: u32, len: u32) void {
+                if (@hasDecl(T, "selectSpan")) self(p).selectSpan(line, col, len);
+            }
+            fn position(p: *anyopaque) ?Position {
+                if (@hasDecl(T, "position")) return self(p).position();
+                return null;
+            }
+            fn goTo(p: *anyopaque, line: usize, col: usize) bool {
+                if (@hasDecl(T, "goTo")) return self(p).goTo(line, col);
                 return false;
             }
             fn closeWarning(p: *anyopaque, buf: []u8) ?[]const u8 {
@@ -234,6 +322,7 @@ pub const Tab = struct {
                 .info = info,
                 .tick = tick,
                 .draw = draw,
+                .strip = strip,
                 .onText = onText,
                 .onMarkedText = onMarkedText,
                 .onEdit = onEdit,
@@ -245,7 +334,11 @@ pub const Tab = struct {
                 .wantsClose = wantsClose,
                 .cwd = cwd,
                 .path = path,
+                .relocate = relocate,
                 .command = command,
+                .selectSpan = selectSpan,
+                .position = position,
+                .goTo = goTo,
                 .closeWarning = closeWarning,
                 .save = save,
                 .saveVersion = saveVersion,

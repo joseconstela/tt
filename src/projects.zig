@@ -2,7 +2,7 @@
 //! keeping at hand and groups of shells that start inside the project — and
 //! the *default project*, the one for what belongs to no folder, which has
 //! resources of its own too. The sidebar shows them; this file owns the
-//! model and its persistence (tab-separated lines in ~/.conch_projects).
+//! model and its persistence (tab-separated lines in ~/.tt_projects).
 //! Every project and every resource owns a set of tabs, kept by the tab
 //! manager under its id (the default project's under id 0). Ids are handed
 //! out afresh on every load, so nothing on disk refers to them.
@@ -96,7 +96,7 @@ pub const Projects = struct {
 
     // ── persistence ─────────────────────────────────────────────────────
     pub fn load(self: *Projects) void {
-        self.file_path = std.fmt.allocPrint(self.gpa, "{s}/.conch_projects", .{sys.home()}) catch null;
+        self.file_path = std.fmt.allocPrint(self.gpa, "{s}/.tt_projects", .{sys.home()}) catch null;
         const path = self.file_path orelse return;
         const data = sys.readFileTail(self.gpa, path, 1 << 20) catch return;
         defer self.gpa.free(data);
@@ -342,6 +342,51 @@ pub const Projects = struct {
         return null;
     }
 
+    /// A file or folder was renamed or moved on disk (`old` → `new`, both
+    /// absolute): every project root and resource path that was it, or
+    /// lived under it, follows; a resource named after the old file name
+    /// takes the new one. True when anything changed (worth saving).
+    pub fn relocate(self: *Projects, old: []const u8, new: []const u8) bool {
+        var changed = false;
+        for (self.items.items) |*p| {
+            if (self.moved(&p.root, old, new)) changed = true;
+            for (p.resources.items) |*r| {
+                if (self.relocateResource(r, old, new)) changed = true;
+            }
+        }
+        for (self.default_resources.items) |*r| {
+            if (self.relocateResource(r, old, new)) changed = true;
+        }
+        return changed;
+    }
+
+    fn relocateResource(self: *Projects, r: *Resource, old: []const u8, new: []const u8) bool {
+        const old_base = sys.basename(old);
+        const new_base = sys.basename(new);
+        const named_after = std.mem.eql(u8, r.path, old) and std.mem.endsWith(u8, r.name, old_base) and !std.mem.eql(u8, old_base, new_base);
+        if (!self.moved(&r.path, old, new)) return false;
+        if (named_after) {
+            const keep = r.name[0 .. r.name.len - old_base.len];
+            if (std.mem.concat(self.gpa, u8, &.{ keep, new_base })) |name| {
+                self.gpa.free(r.name);
+                r.name = name;
+            } else |_| {}
+        }
+        return true;
+    }
+
+    /// Rewrites `slot` when it is `old` or lies under it.
+    fn moved(self: *Projects, slot: *[]u8, old: []const u8, new: []const u8) bool {
+        const cur = slot.*;
+        const under = cur.len > old.len and std.mem.startsWith(u8, cur, old) and cur[old.len] == '/';
+        if (!under and !std.mem.eql(u8, cur, old)) return false;
+        const rest = if (under) cur[old.len..] else "";
+        const fresh = std.mem.concat(self.gpa, u8, &.{ new, rest }) catch return false;
+        self.gpa.free(cur);
+        slot.* = fresh;
+        return true;
+    }
+
     /// Gives a resource a name of the user's choosing: the sidebar label
     /// only, the file or folder keeps its name. A blank name is ignored.
     pub fn renameResource(self: *Projects, r: *Resource, name: []const u8) !void {
@@ -463,4 +508,32 @@ test "projects: round trip through the file format, icons included" {
     // Clearing frees and writes nothing.
     try back.setIcon(&back.items.items[0].icon, null);
     try std.testing.expect(back.items.items[0].icon == null);
+}
+
+test "projects: resources and roots follow a rename or move on disk" {
+    var ps = Projects.init(std.testing.allocator);
+    defer ps.deinit();
+    const p = try ps.add("/tmp/demo");
+    const readme = try ps.addFile(p, "/tmp/demo/docs/README.md");
+    try std.testing.expectEqualStrings("docs/README.md", readme.name);
+    _ = try ps.addShells(p, "/tmp/demo/docs");
+    _ = try ps.addFile(null, "/tmp/other/notes.txt");
+
+    // A rename: the resource's path and name follow.
+    try std.testing.expect(ps.relocate("/tmp/demo/docs/README.md", "/tmp/demo/docs/GUIDE.md"));
+    try std.testing.expectEqualStrings("/tmp/demo/docs/GUIDE.md", p.resources.items[0].path);
+    try std.testing.expectEqualStrings("docs/GUIDE.md", p.resources.items[0].name);
+
+    // A folder move: everything under it follows, the names stay.
+    try std.testing.expect(ps.relocate("/tmp/demo/docs", "/tmp/demo/manual"));
+    try std.testing.expectEqualStrings("/tmp/demo/manual/GUIDE.md", p.resources.items[0].path);
+    try std.testing.expectEqualStrings("/tmp/demo/manual", p.resources.items[1].path);
+    try std.testing.expectEqualStrings("docs/GUIDE.md", p.resources.items[0].name);
+
+    // Prefixes that are not whole components are left alone; the project root moves too.
+    try std.testing.expect(!ps.relocate("/tmp/dem", "/tmp/x"));
+    try std.testing.expect(ps.relocate("/tmp/demo", "/tmp/demo2"));
+    try std.testing.expectEqualStrings("/tmp/demo2", p.root);
+    try std.testing.expectEqualStrings("/tmp/demo2/manual/GUIDE.md", p.resources.items[0].path);
+    try std.testing.expectEqualStrings("/tmp/other/notes.txt", ps.default_resources.items[0].path);
 }

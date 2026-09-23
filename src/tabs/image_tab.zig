@@ -1,5 +1,5 @@
 //! Image viewer: PNG, JPEG, GIF, HEIC, TIFF, BMP, WebP, PSD, RAW … whatever
-//! ImageIO decodes. The picture is fitted to the card; a click switches to
+//! ImageIO decodes. The picture is fitted to the tab; a click switches to
 //! one image pixel per point (wheel to pan) and back.
 const std = @import("std");
 const tab_mod = @import("tab.zig");
@@ -33,7 +33,7 @@ pub const ImageTab = struct {
     native_h: u32 = 0,
     frames: usize = 1,
     failed: bool = false,
-    /// false: fitted to the card; true: 1 px = 1 pt, scrollable.
+    /// false: fitted to the tab; true: 1 px = 1 pt, scrollable.
     actual_size: bool = false,
     scroll_x: f32 = 0,
     scroll_y: f32 = 0,
@@ -78,6 +78,12 @@ pub const ImageTab = struct {
         return self.file_path;
     }
 
+    pub fn relocate(self: *ImageTab, new_path: []const u8) void {
+        const copy = self.gpa.dupe(u8, new_path) catch return;
+        self.gpa.free(self.file_path);
+        self.file_path = copy;
+    }
+
     pub fn cwd(self: *ImageTab) []const u8 {
         return sys.dirname(self.file_path);
     }
@@ -92,14 +98,16 @@ pub const ImageTab = struct {
         return viewer.keptVersion(self.file_path, if (self.actual_size) "1" else "0");
     }
 
+    /// "PNG  ·  1600×1000  ·  1.2 MB": the context line at the right of
+    /// the tab strip (the name is the tab's title).
     pub fn info(self: *ImageTab, buf: []u8) []const u8 {
-        var path_buf: [512]u8 = undefined;
-        const shown = sys.abbreviateHome(self.file_path, &path_buf);
-        if (self.failed) return std.fmt.bufPrint(buf, "{s}", .{shown}) catch "";
+        var kind_buf: [12]u8 = undefined;
+        const kind = viewer.kindLabel(self.file_path, "Image", &kind_buf);
+        if (self.failed) return std.fmt.bufPrint(buf, "{s}  ·  Could not decode", .{kind}) catch "";
         var size_buf: [32]u8 = undefined;
         const size = viewer.formatSize(self.total_size, &size_buf);
-        if (self.frames > 1) return std.fmt.bufPrint(buf, "{s}  ·  {d}×{d}  ·  {d} frames  ·  {s}", .{ shown, self.native_w, self.native_h, self.frames, size }) catch "";
-        return std.fmt.bufPrint(buf, "{s}  ·  {d}×{d}  ·  {s}", .{ shown, self.native_w, self.native_h, size }) catch "";
+        if (self.frames > 1) return std.fmt.bufPrint(buf, "{s}  ·  {d}×{d}  ·  {d} frames  ·  {s}", .{ kind, self.native_w, self.native_h, self.frames, size }) catch "";
+        return std.fmt.bufPrint(buf, "{s}  ·  {d}×{d}  ·  {s}", .{ kind, self.native_w, self.native_h, size }) catch "";
     }
 
     pub fn onEdit(self: *ImageTab, cmd: EditCommand) void {
@@ -117,16 +125,7 @@ pub const ImageTab = struct {
     pub fn draw(self: *ImageTab, ui: *Ui, rect: Rect, focused: bool) void {
         _ = focused;
         const dl = ui.dl;
-        const c = viewer.card(rect);
-
-        var meta_buf: [96]u8 = undefined;
-        var size_buf: [32]u8 = undefined;
-        const size = viewer.formatSize(self.total_size, &size_buf);
-        const meta: []const u8 = if (self.failed)
-            "Could not decode"
-        else
-            (std.fmt.bufPrint(&meta_buf, "{d}×{d}  ·  {s}", .{ self.native_w, self.native_h, size }) catch "");
-        const body = viewer.header(ui, c, .image, sys.basename(self.file_path), meta);
+        const body = viewer.frame(ui, rect);
         self.view_h = body.h;
 
         self.ensureTexture();

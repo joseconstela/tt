@@ -23,7 +23,7 @@ struct VOut {
     uint   iid [[flat]];
 };
 
-vertex VOut conch_vs(uint vid [[vertex_id]],
+vertex VOut tt_vs(uint vid [[vertex_id]],
                      uint iid [[instance_id]],
                      const device Instance* instances [[buffer(0)]],
                      constant Uniforms& u [[buffer(1)]])
@@ -48,7 +48,7 @@ static float sd_round_rect(float2 p, float2 half_size, float r)
     return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
 }
 
-fragment float4 conch_fs(VOut in [[stage_in]],
+fragment float4 tt_fs(VOut in [[stage_in]],
                          const device Instance* instances [[buffer(0)]],
                          texture2d<float> atlas [[texture(0)]],
                          texture2d<float> image [[texture(1)]])

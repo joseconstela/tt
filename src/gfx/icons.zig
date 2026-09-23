@@ -36,6 +36,14 @@ pub const Icon = enum(u8) {
     minus,
     undo,
     branch,
+    pull,
+    push,
+    // Search view.
+    ellipsis,
+    replace,
+    collapse_all,
+    expand_all,
+    clear_all,
 };
 
 /// Transparent padding (device px) around every rasterised icon.
@@ -73,6 +81,13 @@ fn pathData(icon: Icon) []const u8 {
         .minus => "M5 12h14",
         .undo => "M9 14L4 9l5-5 M4 9h10a6 6 0 0 1 0 12h-3",
         .branch => "M6 3v12 M18 9a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M6 21a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M18 9a9 9 0 0 1-9 9",
+        .pull => "M12 4v11 M7.5 10.5L12 15l4.5-4.5 M4 19.5h16",
+        .push => "M12 15V4 M7.5 8.5L12 4l4.5 4.5 M4 19.5h16",
+        .ellipsis => "M4 12a1.2 1.2 0 1 0 2.4 0a1.2 1.2 0 1 0-2.4 0 M10.8 12a1.2 1.2 0 1 0 2.4 0a1.2 1.2 0 1 0-2.4 0 M17.6 12a1.2 1.2 0 1 0 2.4 0a1.2 1.2 0 1 0-2.4 0",
+        .replace => "M4 8h11 M12 4.5L15.5 8 12 11.5 M20 16H9 M12 12.5L8.5 16l3.5 3.5",
+        .collapse_all => "M5 5h14v14H5z M9 12h6",
+        .expand_all => "M5 5h14v14H5z M9 12h6 M12 9v6",
+        .clear_all => "M4 6h11 M4 11h8 M4 16h6 M14 14l6 6 M20 14l-6 6",
     };
 }
 

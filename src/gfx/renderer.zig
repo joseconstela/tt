@@ -50,8 +50,8 @@ pub const Renderer = struct {
             return error.ShaderCompileFailed;
         }
         defer objc.release(library);
-        const vs = msg(id, library, "newFunctionWithName:", .{objc.nsString("conch_vs")});
-        const fs = msg(id, library, "newFunctionWithName:", .{objc.nsString("conch_fs")});
+        const vs = msg(id, library, "newFunctionWithName:", .{objc.nsString("tt_vs")});
+        const fs = msg(id, library, "newFunctionWithName:", .{objc.nsString("tt_fs")});
         defer objc.release(vs);
         defer objc.release(fs);
 

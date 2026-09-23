@@ -1,7 +1,7 @@
 //! The Settings tab. Its pages are grouped in sections; while the tab is in
 //! front the sidebar shows them as the navigation menu (see `sidebar.zig`)
 //! and this file draws the selected page. What the pages change lives in
-//! `config.zig` and is written to `~/.conch/config.yml`.
+//! `config.zig` and is written to `~/.tt/config.yml`.
 const std = @import("std");
 const tab_mod = @import("tab.zig");
 const ui_mod = @import("../ui/ui.zig");
@@ -57,7 +57,7 @@ pub const Page = enum {
         return switch (self) {
             .mode => "Light, dark, e-ink, or follow the system.",
             .theme => "Colours for the workspace.",
-            .apis => "The models conch can talk to: hosted providers, or Ollama on this Mac.",
+            .apis => "The models tt can talk to: hosted providers, or Ollama on this Mac.",
             .agents => "The coding agents installed on this Mac, for fixing what fails.",
             .mcps => "Model Context Protocol servers your agents can use.",
             .features => "What your APIs and agents are used for.",
@@ -267,7 +267,7 @@ pub const SettingsTab = struct {
 
         // Where all of this is kept.
         y += 22;
-        _ = dl.textCentered(theme.font_hint, x, y, "Saved in ~/.conch/config.yml, which can be edited by hand.", theme.text_3);
+        _ = dl.textCentered(theme.font_hint, x, y, "Saved in ~/.tt/config.yml, which can be edited by hand.", theme.text_3);
         y += 24;
         self.content_h = y - top;
 

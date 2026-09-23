@@ -162,17 +162,17 @@ pub const Session = struct {
         const overrides = [_][]const u8{
             "TERM=xterm-256color",
             "COLORTERM=truecolor",
-            "TERM_PROGRAM=conch",
+            "TERM_PROGRAM=tt",
             "TERM_PROGRAM_VERSION=0.1.0",
             "CLICOLOR=1",
             "PAGER=cat",
             "GIT_PAGER=cat",
             try std.fmt.allocPrint(arena, "ZDOTDIR={s}", .{self.integration_dir}),
-            try std.fmt.allocPrint(arena, "CONCH_ZDOTDIR={s}", .{self.integration_dir}),
-            try std.fmt.allocPrint(arena, "CONCH_USER_ZDOTDIR={s}", .{self.user_zdotdir}),
-            // Inherited from whatever launched us; meaningless inside conch.
+            try std.fmt.allocPrint(arena, "TT_ZDOTDIR={s}", .{self.integration_dir}),
+            try std.fmt.allocPrint(arena, "TT_USER_ZDOTDIR={s}", .{self.user_zdotdir}),
+            // Inherited from whatever launched us; meaningless inside tt.
             "TERM_SESSION_ID",
-            "__conch_loaded",
+            "__tt_loaded",
         };
 
         self.pty.deinit();

@@ -5,8 +5,9 @@
 //! at the band's right edge, in front of whatever strip runs under it;
 //! Settings has no button, it is ⌘, (and the palette).
 //!
-//! Tabs have no close button: a right-click opens their menu (rename, split,
-//! close). Pressing a tab and moving it starts a *drag*: the pane view draws
+//! Tabs have no close button: a right-click opens their menu (close, close
+//! others / to the right, rename, copy path, reveal, split; see overlay.zig).
+//! Pressing a tab and moving it starts a *drag*: the pane view draws
 //! the ghost, and the strip or pane under the mouse says where the tab would
 //! land (`Drag.target`). `left_inset` keeps the first tab clear of the
 //! traffic lights when the sidebar is collapsed; empty space in the band
@@ -61,8 +62,14 @@ pub const DropTarget = union(enum) {
     zone: Zone,
 };
 
-/// A tab being dragged by its title.
+/// What is on the move: a tab (by its title), or a file the files panel
+/// handed over — not a tab yet, it becomes one where it is dropped.
+pub const DragKind = enum { tab, file };
+
+/// A tab being dragged by its title (or a file, see `fileDrag`).
 pub const Drag = struct {
+    kind: DragKind = .tab,
+    /// The tab (0 for a file: no tab has that uid).
     uid: u32,
     from_pane: u32,
     title: [tab_mod.TabManager.max_title_len]u8 = undefined,
@@ -78,6 +85,17 @@ pub const Drag = struct {
         return self.title[0..self.title_len];
     }
 };
+
+/// A drag of a file from the files panel: the ghost shows `name` the way
+/// a tab would, and the strips and panes say where it would land.
+pub fn fileDrag(ui: *Ui, name: []const u8) Drag {
+    var d: Drag = .{ .kind = .file, .uid = 0, .from_pane = 0, .grab_dx = 0, .w = 0, .has_dot = false };
+    d.title_len = @min(name.len, d.title.len);
+    @memcpy(d.title[0..d.title_len], name[0..d.title_len]);
+    d.w = tabWidth(@min(max_title_w, ui.text.measure(theme.font_tab_active, d.titleText())), false);
+    d.grab_dx = d.w / 2;
+    return d;
+}
 
 pub const tab_pad: f32 = 12;
 const tab_gap: f32 = 4;
@@ -106,7 +124,8 @@ pub fn drawCluster(ui: *Ui, band: Rect, files_visible: bool) Cluster {
     return res;
 }
 
-/// One pane's strip in `rect`: its tabs, "+", and the context line.
+/// One pane's strip in `rect`: its tabs, "+", the active tab's own
+/// controls and the context line.
 pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag) Result {
     var res: Result = .{};
     if (rect.w < 40 or rect.h < 20) return res;
@@ -234,10 +253,18 @@ pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag
         x += plus_w;
     }
 
-    if (info.len > 0 and right - info_w > x + 16) {
-        _ = dl.textCentered(theme.font_hint, right - info_w, rect.centerY(), info, theme.text_3);
-    } else if (info.len > 0 and right - x > 120) {
-        _ = dl.textEllipsis(theme.font_hint, x + 16, rect.centerY(), info, right - x - 16, theme.text_3);
+    // The active tab's own controls take the right end; the context line
+    // sits to their left.
+    var info_right = right;
+    if (pane.current()) |cur| {
+        const room: Rect = .{ .x = x + 16, .y = rect.y, .w = @max(0, right - x - 16), .h = rect.h };
+        const used = cur.vtable.strip(cur.ptr, ui, room);
+        if (used > 0) info_right = right - used - 14;
+    }
+    if (info.len > 0 and info_right - info_w > x + 16) {
+        _ = dl.textCentered(theme.font_hint, info_right - info_w, rect.centerY(), info, theme.text_3);
+    } else if (info.len > 0 and info_right - x > 120) {
+        _ = dl.textEllipsis(theme.font_hint, x + 16, rect.centerY(), info, info_right - x - 16, theme.text_3);
     }
     return res;
 }

@@ -4,8 +4,8 @@
 //! be registered after the viewers for specific formats.
 //!
 //! `FileDoc` is the part every text-editing tab shares: loading, the syntax
-//! language, saving atomically, watching the file on disk and the header
-//! wording. `FileTab` is that plus the plain code editor.
+//! language, saving atomically, watching the file on disk and the wording
+//! of the context line. `FileTab` is that plus the plain code editor.
 const std = @import("std");
 const tab_mod = @import("tab.zig");
 const viewer = @import("viewer.zig");
@@ -40,7 +40,7 @@ pub const FileDoc = struct {
     disk_changed: bool = false,
     missing: bool = false,
     save_failed: bool = false,
-    /// Set by a save; `tick` turns it into a short "Saved" in the header.
+    /// Set by a save; `tick` turns it into a short "Saved" in the context line.
     just_saved: bool = false,
     saved_at: f64 = -1e9,
     last_check: f64 = 0,
@@ -59,6 +59,13 @@ pub const FileDoc = struct {
     pub fn deinit(self: *FileDoc) void {
         self.ed.deinit();
         self.gpa.free(self.file_path);
+    }
+
+    /// The file was renamed or moved on disk: saves go to the new place.
+    pub fn relocate(self: *FileDoc, path: []const u8) void {
+        const copy = self.gpa.dupe(u8, path) catch return;
+        self.gpa.free(self.file_path);
+        self.file_path = copy;
     }
 
     fn load(self: *FileDoc) void {
@@ -188,14 +195,16 @@ pub const FileDoc = struct {
         return if (self.modified()) .attention else .none;
     }
 
-    /// "SQL  ·  120 lines  ·  4 KB  ·  Modified" for the header (uses `buf`).
-    pub fn meta(self: *const FileDoc, buf: []u8) []const u8 {
+    /// "SQL  ·  4 KB  ·  Read-only": the context line at the right of the
+    /// tab strip — the kind, the size and the state (uses `buf`). The name
+    /// is the tab's title; the path is not shown.
+    pub fn info(self: *const FileDoc, buf: []u8) []const u8 {
         var size_buf: [32]u8 = undefined;
         const size = viewer.formatSize(self.total_size, &size_buf);
         return switch (self.state) {
             .failed => "Could not read this file",
             .binary => std.fmt.bufPrint(buf, "Binary  ·  {s}", .{size}) catch "Binary",
-            else => std.fmt.bufPrint(buf, "{s}  ·  {d} lines  ·  {s}{s}", .{ self.lang.label(), self.ed.doc.lineCount(), size, self.suffix() }) catch "",
+            else => std.fmt.bufPrint(buf, "{s}  ·  {s}{s}", .{ self.lang.label(), size, self.suffix() }) catch "",
         };
     }
 
@@ -205,30 +214,15 @@ pub const FileDoc = struct {
         if (self.missing) return "  ·  Deleted on disk";
         if (self.now - self.saved_at < saved_flash) return "  ·  Saved";
         if (self.modified()) return "  ·  Modified";
-        if (self.state == .too_big) return "  ·  First 10 MB, read-only"; // keep in step with max_bytes
+        if (self.state == .too_big) return "  ·  Read-only, first 10 MB"; // keep in step with max_bytes
         if (!self.writable) return "  ·  Read-only";
         return "";
     }
 
-    /// Context line at the right of the tab strip.
-    pub fn info(self: *const FileDoc, buf: []u8) []const u8 {
-        var path_buf: [512]u8 = undefined;
-        const shown = sys.abbreviateHome(self.file_path, &path_buf);
-        if (self.state == .failed or self.state == .binary) return std.fmt.bufPrint(buf, "{s}", .{shown}) catch "";
-        return std.fmt.bufPrint(buf, "{s}  ·  {s}{s}", .{ shown, self.lang.label(), self.suffix() }) catch "";
-    }
-
-    /// The card, header and the notices that replace an editor. Returns the
-    /// body to draw into, or null when a notice was shown instead.
-    pub fn frame(self: *const FileDoc, ui: *Ui, rect: Rect, buf: []u8) ?Rect {
-        return self.frameWith(ui, rect, buf, 0);
-    }
-
-    /// `frame`, keeping `trailing` points free at the right of the header
-    /// row for a control of the tab's own (`viewer.trailingRect`).
-    pub fn frameWith(self: *const FileDoc, ui: *Ui, rect: Rect, buf: []u8, trailing: f32) ?Rect {
-        const card = viewer.card(rect);
-        const body = viewer.headerWith(ui, card, .file, sys.basename(self.file_path), self.meta(buf), trailing);
+    /// The body and the notices that replace an editor. Returns the body
+    /// to draw into, or null when a notice was shown instead.
+    pub fn frame(self: *const FileDoc, ui: *Ui, rect: Rect) ?Rect {
+        const body = viewer.frame(ui, rect);
         const notice: ?[]const u8 = switch (self.state) {
             .failed => "The file could not be opened.",
             .binary => "This is a binary file; there is nothing to show as text.",
@@ -278,6 +272,10 @@ pub const FileTab = struct {
         return self.file.file_path;
     }
 
+    pub fn relocate(self: *FileTab, new_path: []const u8) void {
+        self.file.relocate(new_path);
+    }
+
     pub fn cwd(self: *FileTab) []const u8 {
         return sys.dirname(self.file.file_path);
     }
@@ -322,8 +320,21 @@ pub const FileTab = struct {
         return self.file.ed.caret;
     }
 
+    pub fn selectSpan(self: *FileTab, line: u32, col: u32, len: u32) void {
+        self.file.ed.selectSpan(line, col, len);
+    }
+
     pub fn command(self: *FileTab, cmd: tab_mod.Command) bool {
         return self.file.command(cmd);
+    }
+
+    pub fn position(self: *FileTab) ?tab_mod.Position {
+        return self.file.ed.position();
+    }
+
+    pub fn goTo(self: *FileTab, line: usize, col: usize) bool {
+        self.file.ed.goTo(line, col);
+        return true;
     }
 
     pub fn closeWarning(self: *FileTab, _: []u8) ?[]const u8 {
@@ -344,8 +355,7 @@ pub const FileTab = struct {
     }
 
     pub fn draw(self: *FileTab, ui: *Ui, rect: Rect, focused: bool) void {
-        var meta_buf: [128]u8 = undefined;
-        const body = self.file.frame(ui, rect, &meta_buf) orelse return;
+        const body = self.file.frame(ui, rect) orelse return;
         self.file.ed.draw(ui, body, focused);
     }
 };

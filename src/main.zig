@@ -5,9 +5,9 @@ const apple = @import("apple.zig");
 pub const std_options: std.Options = .{ .log_level = .info };
 
 const usage =
-    \\conch — a calm, block-based terminal for macOS (Zig + Metal)
+    \\tt — a calm, block-based terminal for macOS (Zig + Metal)
     \\
-    \\usage: conch [options]
+    \\usage: tt [options]
     \\  --probe <cmd>...        run commands headlessly and print the captured blocks
     \\  --script <file>         drive the UI from a script (testing; see src/script.zig)
     \\  --size <W>x<H>          window / snapshot size in points (default 1440x900)

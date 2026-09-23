@@ -124,6 +124,50 @@ pub fn mkdir(gpa: std.mem.Allocator, path: []const u8) void {
     _ = c.mkdir(path_z.ptr, 0o700);
 }
 
+// ── the files panel's operations ────────────────────────────────────────
+const EEXIST: c_int = 17;
+
+pub fn exists(gpa: std.mem.Allocator, path: []const u8) bool {
+    const path_z = gpa.dupeZ(u8, path) catch return false;
+    defer gpa.free(path_z);
+    return c.access(path_z.ptr, c.F_OK) == 0;
+}
+
+pub fn isDirectory(gpa: std.mem.Allocator, path: []const u8) bool {
+    const path_z = gpa.dupeZ(u8, path) catch return false;
+    defer gpa.free(path_z);
+    const d = c.opendir(path_z.ptr) orelse return false;
+    _ = c.closedir(d);
+    return true;
+}
+
+/// Renames or moves a file or folder. Refuses to replace something that
+/// is already at `to` (`error.Exists`), except for a change of case only.
+pub fn renamePath(gpa: std.mem.Allocator, from: []const u8, to: []const u8) !void {
+    if (!std.ascii.eqlIgnoreCase(from, to) and exists(gpa, to)) return error.Exists;
+    const from_z = try gpa.dupeZ(u8, from);
+    defer gpa.free(from_z);
+    const to_z = try gpa.dupeZ(u8, to);
+    defer gpa.free(to_z);
+    if (c.rename(from_z.ptr, to_z.ptr) != 0) return error.RenameFailed;
+}
+
+/// A new, empty file; `error.Exists` when something is there already.
+pub fn createFile(gpa: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try gpa.dupeZ(u8, path);
+    defer gpa.free(path_z);
+    const fd = c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(c_uint, 0o644));
+    if (fd < 0) return if (__error().* == EEXIST) error.Exists else error.OpenFailed;
+    _ = c.close(fd);
+}
+
+/// A new folder; `error.Exists` when something is there already.
+pub fn createDir(gpa: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try gpa.dupeZ(u8, path);
+    defer gpa.free(path_z);
+    if (c.mkdir(path_z.ptr, 0o755) != 0) return if (__error().* == EEXIST) error.Exists else error.MkdirFailed;
+}
+
 pub const DirEntry = struct { name: []const u8, is_dir: bool };
 
 /// Iterates a directory, calling `visit(ctx, entry)` for every entry except
@@ -198,7 +242,7 @@ pub fn isWritable(gpa: std.mem.Allocator, path: []const u8) bool {
 pub fn writeFileAtomic(gpa: std.mem.Allocator, path: []const u8, data: []const u8) !void {
     const dir = dirname(path);
     const name = basename(path);
-    const tmpl = try std.fmt.allocPrintSentinel(gpa, "{s}/.{s}.conch-XXXXXX", .{ dir, name }, 0);
+    const tmpl = try std.fmt.allocPrintSentinel(gpa, "{s}/.{s}.tt-XXXXXX", .{ dir, name }, 0);
     defer gpa.free(tmpl);
     const fd = mkstemp(tmpl.ptr);
     if (fd < 0) return error.OpenFailed;

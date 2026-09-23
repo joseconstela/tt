@@ -1,5 +1,5 @@
 //! The workspace: which tabs were open, under which sidebar row, and what
-//! they showed, kept in ~/.conch_workspace so a relaunch brings them back.
+//! they showed, kept in ~/.tt_workspace so a relaunch brings them back.
 //! A kind takes part by implementing `save` (see tabs/tab.zig); the terminal
 //! does, so a shell tab comes back with its blocks — commands, output,
 //! colours, exit codes — and starts its shell again the first time it is
@@ -8,7 +8,7 @@
 //! most every couple of seconds, and once more on quit.
 //!
 //! Format, one record per line, fields escaped as in records.zig:
-//!   conch-workspace <tab> 2
+//!   tt-workspace <tab> 2
 //!   shown <tab> group…                         the row whose tabs are on show
 //!   layout <tab> tree <tab> focused <tab> group…   how a group's panes are split
 //!   tab <tab> 1|0 (in front of its pane) <tab> kind <tab> title <tab> cwd <tab> pane <tab> group…
@@ -42,17 +42,17 @@ const max_file: usize = 1 << 26;
 
 pub const Workspace = struct {
     gpa: std.mem.Allocator,
-    /// Null = not kept: tests and the headless runner, unless CONCH_WORKSPACE names a file.
+    /// Null = not kept: tests and the headless runner, unless TT_WORKSPACE names a file.
     path: ?[]u8 = null,
     saved_version: u64 = 0,
     last_check: f64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, enabled: bool) Workspace {
         var self: Workspace = .{ .gpa = gpa };
-        if (sys.getenv("CONCH_WORKSPACE")) |p| {
+        if (sys.getenv("TT_WORKSPACE")) |p| {
             self.path = gpa.dupe(u8, p) catch null;
         } else if (enabled) {
-            self.path = std.fmt.allocPrint(gpa, "{s}/.conch_workspace", .{sys.home()}) catch null;
+            self.path = std.fmt.allocPrint(gpa, "{s}/.tt_workspace", .{sys.home()}) catch null;
         }
         return self;
     }
@@ -128,7 +128,7 @@ pub fn version(tabs: *TabManager, projects: *Projects) u64 {
 }
 
 pub fn serialize(gpa: std.mem.Allocator, tabs: *TabManager, projects: *Projects, out: *std.ArrayList(u8)) !void {
-    try out.appendSlice(gpa, "conch-workspace\t2\nshown\t");
+    try out.appendSlice(gpa, "tt-workspace\t2\nshown\t");
     try writeGroup(gpa, projects, tabs.shown, out);
     try out.append(gpa, '\n');
     var body: std.ArrayList(u8) = .empty;
@@ -465,7 +465,7 @@ test "workspace: a resource that is gone sends its tabs to its project; the defa
     defer projects.deinit();
     const project = try projects.add("/tmp/demo");
     const old =
-        "conch-workspace\t2\n" ++
+        "tt-workspace\t2\n" ++
         "shown\tshells\t/tmp/demo\tShells\t/tmp/demo\n" ++
         "tab\t1\tkept\t\t/tmp/demo\t0\tshells\t/tmp/demo\tShells\t/tmp/demo\n\tone\n\ttwo\t2\n" ++
         "tab\t0\tkept\t\t/tmp\t0\tfile\t/tmp/demo\tREADME.md\t/tmp/demo/README.md\n\tone\n";
@@ -482,7 +482,7 @@ test "workspace: a resource that is gone sends its tabs to its project; the defa
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try serialize(gpa, &tm, &projects, &out);
-    try std.testing.expect(std.mem.startsWith(u8, out.items, "conch-workspace\t2\nshown\tshells\t\tnotes\t/tmp/notes\n"));
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "tt-workspace\t2\nshown\tshells\t\tnotes\t/tmp/notes\n"));
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\t0\tproject\t/tmp/demo\t\t\n") != null);
 
     var tm2 = try testManager(&env);
@@ -525,7 +525,7 @@ test "workspace: tabs come back in their groups with their names, directories an
     defer out.deinit(gpa);
     try serialize(gpa, &tm, &projects, &out);
     try std.testing.expectEqualStrings(
-        "conch-workspace\t2\n" ++
+        "tt-workspace\t2\n" ++
             "shown\tshells\t/tmp/demo\tShells\t/tmp/demo\n" ++
             "tab\t0\tkept\t\t-\t0\tdefault\t\t\t\n\tone\n\ttwo\t2\n" ++
             "tab\t1\tkept\tNamed\t-\t0\tdefault\t\t\t\n\tone\n\ttwo\t2\n" ++
@@ -615,7 +615,7 @@ test "workspace: split panes come back as they were, version 1 files still read"
     defer out.deinit(gpa);
     try serialize(gpa, &tm, &none, &out);
     try std.testing.expectEqualStrings(
-        "conch-workspace\t2\n" ++
+        "tt-workspace\t2\n" ++
             "shown\tdefault\t\t\t\n" ++
             "layout\th(0.6000:_,0.4000:v(0.5000:_,0.5000:_))\t1\tdefault\t\t\t\n" ++
             "tab\t0\tkept\t\t-\t0\tdefault\t\t\t\n\tone\n\ttwo\t2\n" ++
@@ -660,7 +660,7 @@ test "workspace: split panes come back as they were, version 1 files still read"
     var tm3 = try testManager(&env);
     defer tm3.deinit();
     const old =
-        "conch-workspace\t1\n" ++
+        "tt-workspace\t1\n" ++
         "shown\tdefault\t\t\t\n" ++
         "tab\t1\tkept\tOld\t-\tdefault\t\t\t\n\tx\n";
     try std.testing.expectEqual(@as(usize, 1), parse(gpa, old, &tm3, &none));
@@ -670,7 +670,7 @@ test "workspace: split panes come back as they were, version 1 files still read"
     var tm4 = try testManager(&env);
     defer tm4.deinit();
     const sparse =
-        "conch-workspace\t2\n" ++
+        "tt-workspace\t2\n" ++
         "shown\tdefault\t\t\t\n" ++
         "layout\th(0.5000:_,0.5000:_)\t1\tdefault\t\t\t\n" ++
         "tab\t1\tkept\t\t-\t0\tdefault\t\t\t\n\tx\n";

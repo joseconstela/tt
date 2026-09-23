@@ -17,10 +17,10 @@ const info_plist =
     \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
     \\<plist version="1.0">
     \\<dict>
-    \\  <key>CFBundleName</key><string>conch</string>
-    \\  <key>CFBundleDisplayName</key><string>conch</string>
-    \\  <key>CFBundleIdentifier</key><string>es.lab34.conch</string>
-    \\  <key>CFBundleExecutable</key><string>conch</string>
+    \\  <key>CFBundleName</key><string>tt</string>
+    \\  <key>CFBundleDisplayName</key><string>tt</string>
+    \\  <key>CFBundleIdentifier</key><string>es.lab34.tt</string>
+    \\  <key>CFBundleExecutable</key><string>tt</string>
     \\  <key>CFBundlePackageType</key><string>APPL</string>
     \\  <key>CFBundleShortVersionString</key><string>0.1.0</string>
     \\  <key>CFBundleVersion</key><string>1</string>
@@ -55,7 +55,7 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("font_sans", .{ .root_source_file = b.path("assets/fonts/SplineSans.ttf") });
     mod.addAnonymousImport("font_mono", .{ .root_source_file = b.path("assets/fonts/SplineSansMono.ttf") });
     mod.addAnonymousImport("shaders_metal", .{ .root_source_file = b.path("src/gfx/shaders.metal") });
-    mod.addAnonymousImport("zsh_integration", .{ .root_source_file = b.path("assets/shell/conch.zsh") });
+    mod.addAnonymousImport("zsh_integration", .{ .root_source_file = b.path("assets/shell/tt.zsh") });
 
     // Full-screen programs (vim, htop, Claude Code …) run on libghostty-vt,
     // Ghostty's terminal emulation core, pinned to a commit in build.zig.zon.
@@ -64,24 +64,24 @@ pub fn build(b: *std.Build) void {
     const ghostty = b.lazyDependency("ghostty", .{ .target = target, .optimize = optimize, .simd = false });
     if (ghostty) |dep| mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
 
-    const exe = b.addExecutable(.{ .name = "conch", .root_module = mod });
+    const exe = b.addExecutable(.{ .name = "tt", .root_module = mod });
     b.installArtifact(exe);
 
     // `zig build run`
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Run conch");
+    const run_step = b.step("run", "Run tt");
     run_step.dependOn(&run_cmd.step);
 
-    // `zig build app` → zig-out/conch.app
-    const app_step = b.step("app", "Build the macOS app bundle (zig-out/conch.app)");
+    // `zig build app` → zig-out/tt.app
+    const app_step = b.step("app", "Build the macOS app bundle (zig-out/tt.app)");
     const install_bin = b.addInstallArtifact(exe, .{
-        .dest_dir = .{ .override = .{ .custom = "conch.app/Contents/MacOS" } },
+        .dest_dir = .{ .override = .{ .custom = "tt.app/Contents/MacOS" } },
     });
     const wf = b.addWriteFiles();
     const plist = wf.add("Info.plist", info_plist);
-    const install_plist = b.addInstallFile(plist, "conch.app/Contents/Info.plist");
+    const install_plist = b.addInstallFile(plist, "tt.app/Contents/Info.plist");
     app_step.dependOn(&install_bin.step);
     app_step.dependOn(&install_plist.step);
 

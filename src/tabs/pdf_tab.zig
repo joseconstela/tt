@@ -1,4 +1,4 @@
-//! PDF viewer: the pages one under another at the card's width, rendered
+//! PDF viewer: the pages one under another at the tab's width, rendered
 //! by CGPDF at the backing scale as they scroll into view and dropped
 //! again once they are far off, so long documents stay cheap.
 const std = @import("std");
@@ -92,6 +92,12 @@ pub const PdfTab = struct {
         return self.file_path;
     }
 
+    pub fn relocate(self: *PdfTab, new_path: []const u8) void {
+        const copy = self.gpa.dupe(u8, new_path) catch return;
+        self.gpa.free(self.file_path);
+        self.file_path = copy;
+    }
+
     pub fn cwd(self: *PdfTab) []const u8 {
         return sys.dirname(self.file_path);
     }
@@ -108,12 +114,17 @@ pub const PdfTab = struct {
         return viewer.keptVersion(self.file_path, std.fmt.bufPrint(&buf, "{d}", .{self.current}) catch "");
     }
 
+    /// "PDF  ·  page 2 of 12  ·  3.4 MB": the context line at the right of
+    /// the tab strip (the name is the tab's title).
     pub fn info(self: *PdfTab, buf: []u8) []const u8 {
-        var path_buf: [512]u8 = undefined;
-        const shown = sys.abbreviateHome(self.file_path, &path_buf);
+        if (self.failed) return "PDF  ·  Could not open";
+        var size_buf: [32]u8 = undefined;
+        const size = viewer.formatSize(self.total_size, &size_buf);
+        const locked = if (self.doc) |d| d.locked else false;
+        if (locked) return std.fmt.bufPrint(buf, "PDF  ·  Locked  ·  {s}", .{size}) catch "";
         const n = self.pages.items.len;
-        if (n == 0) return std.fmt.bufPrint(buf, "{s}", .{shown}) catch "";
-        return std.fmt.bufPrint(buf, "{s}  ·  page {d} of {d}", .{ shown, self.current + 1, n }) catch "";
+        if (n == 0) return std.fmt.bufPrint(buf, "PDF  ·  {s}", .{size}) catch "";
+        return std.fmt.bufPrint(buf, "PDF  ·  page {d} of {d}  ·  {s}", .{ self.current + 1, n, size }) catch "";
     }
 
     pub fn onEdit(self: *PdfTab, cmd: EditCommand) void {
@@ -140,20 +151,9 @@ pub const PdfTab = struct {
     pub fn draw(self: *PdfTab, ui: *Ui, rect: Rect, focused: bool) void {
         _ = focused;
         const dl = ui.dl;
-        const c = viewer.card(rect);
         const n = self.pages.items.len;
-
-        var meta_buf: [96]u8 = undefined;
-        var size_buf: [32]u8 = undefined;
-        const size = viewer.formatSize(self.total_size, &size_buf);
         const locked = if (self.doc) |d| d.locked else false;
-        const meta: []const u8 = if (self.failed)
-            "Could not open"
-        else if (locked)
-            (std.fmt.bufPrint(&meta_buf, "Locked  ·  {s}", .{size}) catch "Locked")
-        else
-            (std.fmt.bufPrint(&meta_buf, "{d} / {d}  ·  {s}", .{ self.current + 1, n, size }) catch "");
-        const body = viewer.header(ui, c, .document, sys.basename(self.file_path), meta);
+        const body = viewer.frame(ui, rect);
         self.view_h = body.h;
 
         if (self.failed) return viewer.notice(ui, body, "The file could not be opened as a PDF.");

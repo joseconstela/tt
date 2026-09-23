@@ -10,8 +10,11 @@ const theme = @import("ui/theme.zig");
 const sidebar_mod = @import("ui/sidebar.zig");
 const files_mod = @import("ui/files.zig");
 const panes_mod = @import("ui/panes.zig");
+const tabbar_mod = @import("ui/tabbar.zig");
 const palette_mod = @import("ui/palette.zig");
 const overlay_mod = @import("ui/overlay.zig");
+const desktop = @import("desktop.zig");
+const paths = @import("paths.zig");
 const tab_mod = @import("tabs/tab.zig");
 const TerminalTab = @import("tabs/terminal_tab.zig").TerminalTab;
 const FileTab = @import("tabs/file_tab.zig").FileTab;
@@ -59,9 +62,16 @@ pub const Action = enum {
     prev_pane,
     toggle_sidebar,
     toggle_files,
+    /// The files panel's Search view, its box focused (⌘⇧F).
+    find_in_files,
     open_settings,
     clear,
+    /// ⌘K: the palette in command mode.
     command_palette,
+    /// ⌘P: the palette in quick-open mode ("Go to File…", as in VS Code).
+    quick_open,
+    /// Quick open with `:` typed: go to a line of the current editor.
+    go_to_line,
     /// Asks the platform for a folder picker (see `folder_pick_requested`).
     add_project,
     /// Adds the current shell's directory as a project.
@@ -117,6 +127,9 @@ pub const App = struct {
     /// Directory of the last tab that had one; what the files panel shows
     /// while a tab without a directory (Settings) is active.
     last_cwd: std.ArrayList(u8) = .empty,
+    /// The path being dragged from the files panel (the ghost is the pane
+    /// view's `drag`); empty when none.
+    file_drag: std.ArrayList(u8) = .empty,
     /// When macOS's appearance was last read (mode "system" polls it).
     appearance_checked: f64 = 0,
 
@@ -148,8 +161,8 @@ pub const App = struct {
             .history = History.init(gpa),
             .projects = projects_mod.Projects.init(gpa),
             // Test runs (scripts, the selftest) leave the user's workspace alone
-            // unless CONCH_WORKSPACE names a file of their own.
-            .workspace = workspace_mod.Workspace.init(gpa, opts.script_path == null and sys.getenv("CONCH_SELFTEST") == null),
+            // unless TT_WORKSPACE names a file of their own.
+            .workspace = workspace_mod.Workspace.init(gpa, opts.script_path == null and sys.getenv("TT_SELFTEST") == null),
             .env = .{
                 .gpa = gpa,
                 .history = undefined,
@@ -190,6 +203,8 @@ pub const App = struct {
         self.workspace.save(&self.tabs, &self.projects);
         self.workspace.deinit();
         self.tabs.deinit();
+        for (self.env.requests.items) |r| r.free(self.gpa);
+        self.env.requests.deinit(self.gpa);
         config.get().save();
         config.deinit();
         self.palette.deinit();
@@ -198,6 +213,7 @@ pub const App = struct {
         self.files.deinit();
         self.history.deinit();
         self.last_cwd.deinit(self.gpa);
+        self.file_drag.deinit(self.gpa);
         self.ui.deinit();
         self.dl.deinit();
         self.gpa.destroy(self);
@@ -245,9 +261,10 @@ pub const App = struct {
                 }
             }
         }
+        self.serveRequests();
         self.keepShowingSomething();
         // A menu or box about a tab that has since closed itself has nothing left to act on.
-        if (self.overlay.isOpen() and self.overlay.subject == .tab and self.tabs.byUid(self.overlay.id) == null) self.overlay.close();
+        if (self.overlay.aboutTab()) |uid| if (self.tabs.byUid(uid) == null) self.overlay.close();
         if (self.overlay.tick(now)) self.invalidate();
         if (self.files.tick(now)) self.invalidate();
         if (self.palette.tick(now)) self.invalidate();
@@ -305,22 +322,30 @@ pub const App = struct {
         const content: draw.Rect = .{ .x = side_w, .y = theme.header_h, .w = self.width - side_w - files_w, .h = self.height - theme.header_h };
         const files_rect: draw.Rect = .{ .x = self.width - files_w, .y = theme.header_h, .w = files_w, .h = self.height - theme.header_h };
 
-        // The sidebar handles its splitter before anything else claims the mouse.
-        var ctx: sidebar_mod.Context = .{ .projects = &self.projects, .tabs = &self.tabs };
+        // The sidebar handles its splitter before anything else claims the
+        // mouse. A path dragged from the files panel is known to every part.
+        const dragged = self.draggedFile();
+        var ctx: sidebar_mod.Context = .{ .projects = &self.projects, .tabs = &self.tabs, .dragging_file = dragged != null };
         if (self.projects.containing(cwd)) |p| ctx.current_project = p.id;
         const side = self.sidebar.draw(ui, self.height, self.chrome, ctx);
         self.applySidebar(side);
 
         // The files panel owns the splitter on its left edge, so it goes before the panes.
-        const fr = self.files.draw(ui, files_rect, true);
+        const fr = self.files.draw(ui, files_rect, true, dragged);
         if (fr.open_file) |path| self.openFile(path);
+        if (fr.open_at) |o| self.openFileAt(o);
         if (fr.pin_file) |path| self.pinFile(path);
         if (fr.confirm) |c| self.overlay.openConfirmAction(.git_discard, 0, c.heading, c.reason, "Discard");
+        if (fr.replace) |c| self.overlay.openConfirmAction(.search_replace, 0, c.heading, c.reason, "Replace");
+        if (fr.menu) |m| self.overlay.openList(m.items, m.checked, m.sep_after, m.x, m.y);
+        if (fr.file_menu) |m| self.openFileMenu(m);
+        if (fr.drag_file) |path| self.startFileDrag(path);
+        if (fr.drop_into) |dir| self.moveDroppedInto(dir);
 
         // The panes: each one's strip, its active tab, the dividers, and a
         // tab being dragged. Moves are applied to the tab manager inside.
         const pv = self.panes.draw(ui, &self.tabs, bar, content, lights_inset, self.files.visible, self.chrome.window_focused);
-        if (pv.menu) |m| self.overlay.openMenu(.tab, m.uid, m.x, m.y, self.tabs.canRename(m.uid));
+        if (pv.menu) |m| self.openTabMenu(m);
         if (pv.new_tab) |pane| {
             _ = self.tabs.focusPane(pane);
             self.perform(.new_tab);
@@ -330,7 +355,10 @@ pub const App = struct {
             self.perform(.new_web_tab);
         }
         if (pv.toggle_files) self.perform(.toggle_files);
+        if (pv.file_drop) |target| self.openDroppedAt(target);
         if (pv.changed) self.invalidate();
+        // The drag is over once the pane view has let go of it.
+        if (self.panes.drag == null) self.file_drag.clearRetainingCapacity();
 
         if (self.chrome.fake_lights) {
             const colors = [_]draw.Color{ draw.Color.hex(0xFF5F57), draw.Color.hex(0xFEBC2E), draw.Color.hex(0x28C840) };
@@ -359,8 +387,9 @@ pub const App = struct {
                 .default_project => .default_project,
                 .resource => .resource,
             };
-            self.overlay.openMenu(subject, m.id, m.x, m.y, true);
+            self.overlay.openMenu(subject, m.id, m.x, m.y);
         }
+        if (side.drop_file) |drop| self.pinDropped(drop);
         if (side.changed) self.projects.save();
     }
 
@@ -432,7 +461,7 @@ pub const App = struct {
             .default_project => &self.projects.default_icon,
             .project => if (self.projects.find(id)) |p| &p.icon else null,
             .resource => if (self.projects.findResource(id)) |f| &f.resource.icon else null,
-            .tab => null,
+            .tab, .file => null,
         };
     }
 
@@ -501,12 +530,14 @@ pub const App = struct {
 
     // ── actions ─────────────────────────────────────────────────────────
     pub fn perform(self: *App, action: Action) void {
-        // Any command closes the palette (⌘K toggles it) and whatever the
-        // tab menu had open.
-        if (action != .command_palette) self.palette.close();
+        // Any command closes the palette (⌘K / ⌘P toggle it) and whatever
+        // the tab menu had open.
+        if (action != .command_palette and action != .quick_open and action != .go_to_line) self.palette.close();
         self.overlay.close();
         switch (action) {
-            .command_palette => self.palette.toggle(.{ .tabs = &self.tabs, .history = &self.history }),
+            .command_palette => self.palette.toggle(.commands, self.paletteSources()),
+            .quick_open => self.palette.toggle(.files, self.paletteSources()),
+            .go_to_line => self.palette.showLine(self.paletteSources()),
             .new_tab => self.newTerminal(),
             .new_empty_tab => _ = self.tabs.openWith("terminal", .{ .start_shell = false, .cwd = self.currentCwd() }) catch |err| {
                 std.log.err("could not open a tab: {s}", .{@errorName(err)});
@@ -520,6 +551,7 @@ pub const App = struct {
             .prev_pane => self.tabs.cyclePane(-1),
             .toggle_sidebar => self.sidebar.toggle(),
             .toggle_files => self.files.toggle(),
+            .find_in_files => self.files.openSearch(self.now),
             .open_settings => _ = self.tabs.open("settings") catch {},
             .clear => if (self.tabs.current()) |t| t.vtable.onCtrl(t.ptr, 'l'),
             .add_project => self.folder_pick_requested = true,
@@ -544,11 +576,28 @@ pub const App = struct {
         _ = t.vtable.command(t.ptr, cmd);
     }
 
+    fn paletteSources(self: *App) palette_mod.Sources {
+        return .{ .tabs = &self.tabs, .history = &self.history, .projects = &self.projects, .cwd = self.currentCwd() };
+    }
+
     /// Carries out what the user picked in the palette.
     fn executePick(self: *App, pick: palette_mod.Pick) void {
-        self.palette.close();
+        // The file listing dies with the palette: a file's path is read first.
+        var path_buf: [1024]u8 = undefined;
+        const file_path: ?[]const u8 = switch (pick) {
+            .open_file => |t| self.palette.filePath(t.id, &path_buf),
+            else => null,
+        };
+        self.palette.accept();
         switch (pick) {
+            .none => {},
             .action => |a| self.perform(a),
+            .open_file => |t| if (file_path) |p| {
+                self.openFile(p);
+                self.goTo(t.goto);
+            },
+            .focus_tab => |t| if (self.tabs.focus(t.id)) self.goTo(t.goto),
+            .goto_line => |g| self.goTo(g),
             .select_tab => |i| self.tabs.activate(i),
             .run_history => |i| {
                 if (i >= self.history.entries.items.len) return;
@@ -570,6 +619,58 @@ pub const App = struct {
             },
         }
         self.invalidate();
+    }
+
+    /// Puts the current editor's caret on a line (and column) from a
+    /// quick-open `:line:col` suffix; nothing without one.
+    fn goTo(self: *App, g: palette_mod.Goto) void {
+        if (g.line == 0) return;
+        const t = self.tabs.current() orelse return;
+        _ = t.vtable.goTo(t.ptr, g.line, g.col);
+    }
+
+    /// What tabs asked for since the last tick (`tab_mod.Request`): a
+    /// website tab's context menu sending its selection to a shell, to the
+    /// agent, or opening an address.
+    fn serveRequests(self: *App) void {
+        if (self.env.requests.items.len == 0) return;
+        // Taken as a whole first: serving one may queue another, for the next tick.
+        var list = self.env.requests;
+        self.env.requests = .empty;
+        defer list.deinit(self.gpa);
+        for (list.items) |r| {
+            defer r.free(self.gpa);
+            switch (r) {
+                .open_url => |url| _ = self.tabs.openWith("web", .{ .url = url }) catch |err| {
+                    std.log.err("could not open a website tab: {s}", .{@errorName(err)});
+                },
+                .send_to_shell => |text| if (self.shellTab()) |t| {
+                    t.vtable.paste(t.ptr, text);
+                    if (self.env.host) |h| h.focusApp();
+                },
+                .ask_agent => |q| if (self.shellTab()) |t| {
+                    if (TerminalTab.fromTab(t)) |term| term.askAgent(q.label, q.question);
+                    if (self.env.host) |h| h.focusApp();
+                },
+            }
+        }
+        self.invalidate();
+    }
+
+    /// A shell of the row on show, brought to the front, for text sent from
+    /// another tab: the active tab when it is one, else the first in the
+    /// focused pane, else a new one. Null when none could be opened.
+    fn shellTab(self: *App) ?tab_mod.Tab {
+        if (self.tabs.current()) |t| if (std.mem.eql(u8, t.kind, "terminal")) return t;
+        for (self.tabs.items()) |t| {
+            if (std.mem.eql(u8, t.kind, "terminal")) {
+                _ = self.tabs.focus(t.uid);
+                return t;
+            }
+        }
+        self.newShellIn(self.tabs.groupId());
+        const t = self.tabs.current() orelse return null;
+        return if (std.mem.eql(u8, t.kind, "terminal")) t else null;
     }
 
     fn newTerminal(self: *App) void {
@@ -595,7 +696,116 @@ pub const App = struct {
         self.invalidate();
     }
 
-    /// The tab menu's "Split Right / Down": the tab moves into a new pane
+    /// A secondary click on a tab: its menu, with the rows that apply to it.
+    fn openTabMenu(self: *App, m: tabbar_mod.MenuRequest) void {
+        const p = self.tabs.paneOf(m.uid) orelse return;
+        const i = p.indexOf(m.uid) orelse return;
+        const n = p.tabs.items.len;
+        self.overlay.openTabMenu(m.uid, m.x, m.y, .{
+            .renamable = self.tabs.canRename(m.uid),
+            .has_path = self.tabPath(m.uid) != null,
+            .document = if (self.tabs.byUid(m.uid)) |t| t.vtable.path(t.ptr).len > 0 else false,
+            .others = n - 1,
+            .to_right = n - 1 - i,
+        });
+    }
+
+    /// The path a tab stands for: its document, else its directory; null
+    /// for a tab with neither (Settings, a website).
+    fn tabPath(self: *App, uid: u32) ?[]const u8 {
+        const t = self.tabs.byUid(uid) orelse return null;
+        const doc = t.vtable.path(t.ptr);
+        if (doc.len > 0) return doc;
+        const dir = t.vtable.cwd(t.ptr);
+        return if (dir.len > 0) dir else null;
+    }
+
+    /// The tab menu's "Copy Path" / "Copy Relative Path": the latter is
+    /// relative to the project the path belongs to, else to the folder the
+    /// files panel shows ("." for that folder itself; a path under neither
+    /// is copied as it is).
+    fn copyTabPath(self: *App, uid: u32, relative: bool) void {
+        const path = self.tabPath(uid) orelse return;
+        var text: []const u8 = path;
+        if (relative) {
+            const base: []const u8 = if (self.projects.containing(path)) |p| p.root else self.files.rootPath();
+            if (base.len > 0) {
+                text = paths.relativeTo(base, path);
+                if (text.len == 0) text = ".";
+            }
+        }
+        self.env.setClipboard(text);
+    }
+
+    /// Which other tabs of a strip "Close Others" / "Close to the Right" mean.
+    const CloseScope = enum { others, right };
+
+    /// The tab menu's "Close Others" / "Close to the Right": closes the
+    /// other tabs of the strip right away, or asks once when any of them
+    /// has work that would be lost.
+    fn closeMany(self: *App, uid: u32, scope: CloseScope) void {
+        const p = self.tabs.paneOf(uid) orelse return;
+        const keep = p.indexOf(uid) orelse return;
+        const from: usize = if (scope == .right) keep + 1 else 0;
+        var count: usize = 0;
+        var at_risk: usize = 0;
+        var why_buf: [160]u8 = undefined;
+        var why: []const u8 = "";
+        for (p.tabs.items[from..], from..) |t, i| {
+            if (i == keep) continue;
+            count += 1;
+            var buf: [160]u8 = undefined;
+            const w = t.vtable.closeWarning(t.ptr, &buf) orelse continue;
+            at_risk += 1;
+            if (why.len == 0) {
+                const n = @min(w.len, why_buf.len);
+                @memcpy(why_buf[0..n], w[0..n]);
+                why = why_buf[0..n];
+            }
+        }
+        if (count == 0) return;
+        if (at_risk == 0) return self.closeManyNow(uid, scope);
+        var heading_buf: [96]u8 = undefined;
+        const heading = switch (scope) {
+            .others => if (count == 1) "Close the other tab?" else std.fmt.bufPrint(&heading_buf, "Close the other {d} tabs?", .{count}) catch "Close the other tabs?",
+            .right => if (count == 1) "Close the tab to the right?" else std.fmt.bufPrint(&heading_buf, "Close the {d} tabs to the right?", .{count}) catch "Close the tabs to the right?",
+        };
+        // One busy tab: its own sentence. More: how many.
+        var reason_buf: [200]u8 = undefined;
+        const reason = if (at_risk == 1) why else std.fmt.bufPrint(&reason_buf, "{d} of them have work that would be lost.", .{at_risk}) catch why;
+        const kind: overlay_mod.ConfirmKind = if (scope == .right) .close_right else .close_others;
+        self.overlay.openConfirmAction(kind, uid, heading, reason, "Close");
+        self.invalidate();
+    }
+
+    /// Closes the other tabs of the strip (all of them, or those after the
+    /// kept one), background shells and all. The kept tab stays, so its
+    /// pane does too.
+    fn closeManyNow(self: *App, uid: u32, scope: CloseScope) void {
+        const g = self.tabs.group();
+        const p = self.tabs.paneOf(uid) orelse return;
+        var i = p.tabs.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (p.tabs.items[i].uid == uid) {
+                if (scope == .right) break;
+                continue;
+            }
+            self.tabs.closeIn(g, p, i);
+        }
+        self.keepShowingSomething();
+        self.invalidate();
+    }
+
+    /// The tab menu's "Split Right": a new pane on that side of the tab's
+    /// own, with a shell in the tab's directory — what ⌘D does for the
+    /// focused pane, so the tab is brought forward first.
+    fn splitBeside(self: *App, uid: u32, side: tab_mod.Side) void {
+        if (!self.tabs.focus(uid)) return;
+        self.splitFocused(side);
+    }
+
+    /// The tab menu's "Split & Move" → a side: the tab moves into a new pane
     /// on that side of its own. A tab alone in its pane has nothing to move
     /// away from, so it gets a new shell beside it instead.
     fn splitTab(self: *App, uid: u32, side: tab_mod.Side) void {
@@ -661,7 +871,16 @@ pub const App = struct {
                 self.overlay.openRename(.tab, uid, t.title(&buf));
             },
             .close_tab => |uid| self.closeByUid(uid),
-            .split_tab => |st| self.splitTab(st.uid, if (st.down) .bottom else .right),
+            .close_others => |uid| self.closeMany(uid, .others),
+            .close_right => |uid| self.closeMany(uid, .right),
+            .close_others_confirmed => |uid| self.closeManyNow(uid, .others),
+            .close_right_confirmed => |uid| self.closeManyNow(uid, .right),
+            .split_tab => |st| self.splitTab(st.uid, st.side),
+            .split_beside => |st| self.splitBeside(st.uid, st.side),
+            .copy_tab_path => |c| self.copyTabPath(c.uid, c.relative),
+            .reveal_tab => |uid| if (self.tabPath(uid)) |path| {
+                _ = desktop.revealInFinder(path);
+            },
             .renamed => |r| {
                 // The name lives in the overlay's editor: copy it before closing.
                 self.tabs.rename(r.uid, r.name);
@@ -671,6 +890,8 @@ pub const App = struct {
                 if (self.tabs.indexOf(uid)) |i| self.closeTab(i);
             },
             .discard_confirmed => self.files.discardConfirmed(),
+            .replace_confirmed => self.files.replaceConfirmed(),
+            .list_picked => |i| self.files.menuPicked(i),
             .rename_project => |pid| if (self.projects.find(pid)) |p| {
                 self.overlay.openRename(.project, pid, p.name);
             },
@@ -696,8 +917,270 @@ pub const App = struct {
                 self.setIcon(pk.subject, pk.id, pk.icon);
                 self.overlay.close();
             },
+            .open_externally => _ = desktop.openExternally(self.files.menuPath()),
+            .open_with => |app| desktop.openWith(app, self.files.menuPath()),
+            .reveal_in_finder => _ = desktop.revealInFinder(self.files.menuPath()),
+            .copy_path => |c| self.copyPath(c.absolute),
+            .name_file => |kind| self.askName(kind),
+            .file_named => |f| self.fileNamed(f.kind, f.name),
+            .delete_file => self.askDelete(),
+            .delete_confirmed => self.deleteConfirmed(),
         }
         self.invalidate();
+    }
+
+    // ── files panel: its menu ───────────────────────────────────────────
+    /// A secondary click in the files panel: the menu for its path, with
+    /// the applications that open it in the "Open with" submenu.
+    fn openFileMenu(self: *App, m: files_mod.FileMenu) void {
+        const path = self.files.menuPath();
+        const apps: []const desktop.App = desktop.appsFor(self.gpa, path) catch &.{};
+        defer desktop.freeApps(self.gpa, apps);
+        var rows: std.ArrayList(overlay_mod.SubItem) = .empty;
+        defer rows.deinit(self.gpa);
+        for (apps) |a| rows.append(self.gpa, .{ .label = a.name, .value = a.path }) catch break;
+        self.overlay.openFileMenu(m.kind, m.x, m.y, rows.items);
+    }
+
+    /// "Copy path" (relative to the folder on show) / "Copy absolute path".
+    fn copyPath(self: *App, absolute: bool) void {
+        const path = self.files.menuPath();
+        var text: []const u8 = path;
+        if (!absolute) {
+            text = paths.relativeTo(self.files.rootPath(), path);
+            if (text.len == 0) text = sys.basename(path);
+        }
+        self.env.setClipboard(text);
+    }
+
+    /// The name box for the menu's path: a new name for it, or the name
+    /// of a new file or folder inside it.
+    fn askName(self: *App, kind: overlay_mod.NameKind) void {
+        const path = self.files.menuPath();
+        const is_dir = sys.isDirectory(self.gpa, path);
+        var hint_buf: [200]u8 = undefined;
+        var shown_buf: [512]u8 = undefined;
+        const hint: []const u8 = switch (kind) {
+            .rename => "It stays where it is; only the name changes.",
+            .new_file, .new_folder => std.fmt.bufPrint(&hint_buf, "Inside {s}.", .{sys.abbreviateHome(path, &shown_buf)}) catch "Inside this folder.",
+        };
+        const file_kind: overlay_mod.FileKind = if (std.mem.eql(u8, path, self.files.rootPath())) .root else if (is_dir) .folder else .file;
+        self.overlay.openName(kind, file_kind, if (kind == .rename) sys.basename(path) else "", hint);
+    }
+
+    /// The name box confirmed: renames the path, or creates the file or
+    /// folder, and shows the result in the tree. A bad name or a clash
+    /// keeps the box open with the reason.
+    fn fileNamed(self: *App, kind: overlay_mod.NameKind, raw: []const u8) void {
+        const name = std.mem.trim(u8, raw, " \t\r\n");
+        if (paths.nameProblem(name)) |why| return self.overlay.setNameError(why);
+        const target = self.files.menuPath();
+        const dir = if (kind == .rename) sys.dirname(target) else target;
+        const dest = paths.join(self.gpa, dir, name) catch return;
+        defer self.gpa.free(dest);
+        var failed: ?anyerror = null;
+        switch (kind) {
+            .rename => if (!std.mem.eql(u8, dest, target)) self.renamePath(target, dest) catch |err| {
+                failed = err;
+            },
+            .new_file => sys.createFile(self.gpa, dest) catch |err| {
+                failed = err;
+            },
+            .new_folder => sys.createDir(self.gpa, dest) catch |err| {
+                failed = err;
+            },
+        }
+        if (failed) |err| {
+            std.log.err("{s} {s}: {s}", .{ @tagName(kind), dest, @errorName(err) });
+            return self.overlay.setNameError(if (err == error.Exists) "Something with that name is there already." else switch (kind) {
+                .rename => "It could not be renamed.",
+                .new_file => "The file could not be created.",
+                .new_folder => "The folder could not be created.",
+            });
+        }
+        self.overlay.close();
+        self.files.refresh(self.now);
+        self.files.reveal(dest);
+        if (kind == .new_file) self.openFile(dest);
+        self.invalidate();
+    }
+
+    /// Renames or moves a path on disk and lets what refers to it follow:
+    /// the tabs showing it (or something under it) and the pinned resources.
+    fn renamePath(self: *App, old: []const u8, new: []const u8) !void {
+        try sys.renamePath(self.gpa, old, new);
+        self.relocateTabs(old, new);
+        if (self.projects.relocate(old, new)) self.projects.save();
+    }
+
+    fn relocateTabs(self: *App, old: []const u8, new: []const u8) void {
+        for (self.tabs.groups.items) |*g| {
+            for (g.layout.owned.items) |p| {
+                for (p.tabs.items) |t| {
+                    const cur = t.vtable.path(t.ptr);
+                    if (cur.len == 0 or !paths.isUnder(old, cur)) continue;
+                    const fresh = std.mem.concat(self.gpa, u8, &.{ new, cur[old.len..] }) catch continue;
+                    defer self.gpa.free(fresh);
+                    t.vtable.relocate(t.ptr, fresh);
+                }
+            }
+        }
+    }
+
+    /// The menu's "Delete": asks first. The Trash keeps what goes.
+    fn askDelete(self: *App) void {
+        const path = self.files.menuPath();
+        const is_dir = sys.isDirectory(self.gpa, path);
+        var heading_buf: [160]u8 = undefined;
+        const heading = std.fmt.bufPrint(&heading_buf, "Delete “{s}”?", .{sys.basename(path)}) catch "Delete this?";
+        const reason: []const u8 = if (is_dir) "The folder and everything in it go to the Trash." else "It goes to the Trash, where it can be put back.";
+        self.overlay.openConfirmAction(.delete_file, 0, heading, reason, "Delete");
+    }
+
+    fn deleteConfirmed(self: *App) void {
+        const path = self.files.menuPath();
+        desktop.trash(path) catch |err| {
+            std.log.err("could not move {s} to the Trash: {s}", .{ path, @errorName(err) });
+            return;
+        };
+        self.closeTabsShowing(path);
+        self.files.refresh(self.now);
+        self.invalidate();
+    }
+
+    /// Closes the viewers of a deleted file (or of the files of a deleted
+    /// folder), except those holding unsaved changes.
+    fn closeTabsShowing(self: *App, path: []const u8) void {
+        for (self.tabs.groups.items) |*g| {
+            var again = true;
+            while (again) {
+                again = false;
+                const list = g.layout.panes();
+                panes: for (list.slice()) |p| {
+                    for (p.tabs.items, 0..) |t, i| {
+                        const cur = t.vtable.path(t.ptr);
+                        if (cur.len == 0 or !paths.isUnder(path, cur)) continue;
+                        var why_buf: [160]u8 = undefined;
+                        if (t.vtable.closeWarning(t.ptr, &why_buf) != null) continue;
+                        self.tabs.closeIn(g, p, i);
+                        again = true;
+                        break :panes;
+                    }
+                }
+            }
+        }
+        self.keepShowingSomething();
+    }
+
+    // ── files panel: drag & drop ────────────────────────────────────────
+    /// The path being dragged from the files panel, if any.
+    fn draggedFile(self: *App) ?[]const u8 {
+        const d = self.panes.drag orelse return null;
+        if (d.kind != .file or self.file_drag.items.len == 0) return null;
+        return self.file_drag.items;
+    }
+
+    /// A press on a files-panel row travelled: the path goes along with
+    /// the pointer as a ghost, and the tree, the sidebar and the panes say
+    /// where it would land.
+    fn startFileDrag(self: *App, path: []const u8) void {
+        self.file_drag.clearRetainingCapacity();
+        self.file_drag.appendSlice(self.gpa, path) catch return;
+        self.panes.drag = tabbar_mod.fileDrag(&self.ui, sys.basename(path));
+    }
+
+    /// The dragged path was let go on a folder of the tree: it moves there.
+    fn moveDroppedInto(self: *App, dir: []const u8) void {
+        const src = self.file_drag.items;
+        if (src.len == 0) return;
+        const dest = paths.join(self.gpa, dir, sys.basename(src)) catch return;
+        defer self.gpa.free(dest);
+        self.renamePath(src, dest) catch |err| {
+            std.log.err("could not move {s} into {s}: {s}", .{ src, dir, @errorName(err) });
+            return;
+        };
+        self.files.refresh(self.now);
+        self.files.reveal(dest);
+        self.invalidate();
+    }
+
+    /// The dragged path was let go on the sidebar: a file is pinned to the
+    /// project it landed on (else the selected one, else the one whose
+    /// folder holds it), a folder joins it as a group of shells.
+    fn pinDropped(self: *App, drop: sidebar_mod.FileDrop) void {
+        const path = self.file_drag.items;
+        if (path.len == 0) return;
+        const p: ?*projects_mod.Project = if (drop.gid) |gid|
+            (if (gid == tab_mod.TabManager.default_group) null else (self.projects.find(gid) orelse return))
+        else if (self.selected_project) |sid|
+            self.projects.find(sid)
+        else
+            self.projects.containing(path);
+        if (sys.isDirectory(self.gpa, path)) {
+            _ = self.projects.addShells(p, path) catch return;
+        } else _ = self.projects.addFile(p, path) catch return;
+        self.showPinned(p);
+    }
+
+    /// The dragged path was let go over a strip or a pane: a file opens in
+    /// its viewer there, a folder as a shell in it — before a tab, at the
+    /// end of a pane's tabs, or in a new pane on the side it was dropped.
+    fn openDroppedAt(self: *App, target: tabbar_mod.DropTarget) void {
+        const path = self.file_drag.items;
+        if (path.len == 0) return;
+        const is_dir = sys.isDirectory(self.gpa, path);
+        switch (target) {
+            .strip => |s| {
+                _ = self.tabs.focusPane(s.pane);
+                if (self.openDropped(path, is_dir)) |uid| _ = self.tabs.moveTab(uid, s.pane, s.index);
+            },
+            .zone => |z| if (z.side) |side| {
+                // A viewer already open moves over; anything else opens in the new pane.
+                if (!is_dir) if (self.uidShowing(path)) |uid| {
+                    if (!self.tabs.moveTabToNewPane(uid, z.pane, side)) _ = self.tabs.focus(uid);
+                    self.invalidate();
+                    return;
+                };
+                _ = self.tabs.focusPane(z.pane);
+                const p = self.tabs.splitPane(side) catch |err| {
+                    std.log.err("could not split the pane: {s}", .{@errorName(err)});
+                    return;
+                };
+                _ = self.openDropped(path, is_dir);
+                self.tabs.dropIfEmpty(p.id);
+            } else {
+                _ = self.tabs.focusPane(z.pane);
+                if (self.openDropped(path, is_dir)) |uid| {
+                    const to = self.tabs.paneById(z.pane) orelse return;
+                    _ = self.tabs.moveTab(uid, z.pane, to.tabs.items.len);
+                }
+            },
+        }
+        self.invalidate();
+    }
+
+    /// Opens a dropped path in the focused pane: a folder as a shell in
+    /// it, a file in its viewer (or brings its tab forward). The tab's uid.
+    fn openDropped(self: *App, path: []const u8, is_dir: bool) ?u32 {
+        if (is_dir) {
+            const idx = self.tabs.openWith("terminal", .{ .cwd = path }) catch |err| {
+                std.log.err("could not open terminal tab: {s}", .{@errorName(err)});
+                return null;
+            };
+            return self.tabs.items()[idx].uid;
+        }
+        self.openFile(path);
+        return self.uidShowing(path);
+    }
+
+    /// The tab of the group on show that shows `path`, if one does.
+    fn uidShowing(self: *App, path: []const u8) ?u32 {
+        for (self.tabs.group().layout.owned.items) |p| {
+            for (p.tabs.items) |t| {
+                if (std.mem.eql(u8, t.vtable.path(t.ptr), path)) return t.uid;
+            }
+        }
+        return null;
     }
 
     /// Brings a tab of any pane or group forward and asks to close it.
@@ -765,11 +1248,25 @@ pub const App = struct {
         self.invalidate();
     }
 
+    /// A Search match: opens (or focuses) the file and selects the match.
+    fn openFileAt(self: *App, o: files_mod.OpenAt) void {
+        self.openFile(o.path);
+        const t = self.tabs.current() orelse return;
+        if (!std.mem.eql(u8, t.vtable.path(t.ptr), o.path)) return;
+        t.vtable.selectSpan(t.ptr, o.line, o.col, o.len);
+    }
+
     /// The files panel's "+": pins the file as a resource of the project
     /// its folder belongs to, else of the default project.
     fn pinFile(self: *App, path: []const u8) void {
         const p = self.projects.containing(path);
         _ = self.projects.addFile(p, path) catch return;
+        self.showPinned(p);
+    }
+
+    /// After pinning: the project unfolds (and is the selected one) so the
+    /// new resource is in view.
+    fn showPinned(self: *App, p: ?*projects_mod.Project) void {
         if (p) |proj| {
             proj.open = true;
             self.selected_project = proj.id;

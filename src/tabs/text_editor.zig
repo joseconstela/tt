@@ -13,6 +13,7 @@ const ui_mod = @import("../ui/ui.zig");
 const theme = @import("../ui/theme.zig");
 const sidebar = @import("../ui/sidebar.zig");
 const gfx_text = @import("../gfx/text.zig");
+const Position = @import("tab.zig").Position;
 const lexer = @import("../syntax/lexer.zig");
 const Document = @import("../input/document.zig").Document;
 const EditCommand = @import("../events.zig").EditCommand;
@@ -37,6 +38,9 @@ pub const TextEditor = struct {
     rows_visible: usize = 20,
     /// Bring the caret into view on the next draw (set by keyboard actions).
     follow: bool = false,
+    /// With `follow`: put the caret's line in the middle of the view
+    /// (a go-to-line jump) rather than just inside it.
+    center: bool = false,
     blink_t0: f64 = 0,
     blink_on: bool = true,
     seen_version: u64 = 0,
@@ -81,6 +85,39 @@ pub const TextEditor = struct {
         while (pos > 0 and pos < text.len and (text[pos] & 0xC0) == 0x80) pos -= 1;
         self.doc.editor.setCursor(pos, false);
         self.follow = true;
+    }
+
+    /// Selects `len` bytes at a 0-based line and byte column (clamped to
+    /// the line) and scrolls there on the next draw.
+    pub fn selectSpan(self: *TextEditor, line: u32, col: u32, len: u32) void {
+        const n = self.doc.lineCount();
+        if (n == 0) return;
+        const li: usize = @min(line, n - 1);
+        const ls = self.doc.lineStartOf(li);
+        const le = self.doc.lineEndOf(li);
+        const start = @min(ls + col, le);
+        const end = @min(start + len, le);
+        self.doc.editor.setCursor(start, false);
+        if (end > start) self.doc.editor.setCursor(end, true);
+        self.follow = true;
+    }
+
+    /// Where the caret is, 1-based, as "go to line" counts (columns in
+    /// display cells, tabs expanded).
+    pub fn position(self: *const TextEditor) Position {
+        const line = self.doc.lineOf(self.doc.editor.cursor);
+        return .{ .line = line + 1, .col = self.colAt(line, self.doc.editor.cursor) + 1, .lines = self.doc.lineCount() };
+    }
+
+    /// Puts the caret on a 1-based line and column (0 = the line's start),
+    /// both clamped to the text, and centres the line on the next draw.
+    pub fn goTo(self: *TextEditor, line: usize, col: usize) void {
+        const n = self.doc.lineCount();
+        const li = @min(@max(line, 1), n) - 1;
+        const off = self.offsetAtCol(li, if (col == 0) 0 else col - 1);
+        self.doc.editor.setCursor(off, false);
+        self.follow = true;
+        self.center = true;
     }
 
     // ── input ───────────────────────────────────────────────────────────
@@ -339,8 +376,13 @@ pub const TextEditor = struct {
             self.follow = false;
             self.noteWidth(doc.lineText(caret_line));
             const top = pad_top + @as(f32, @floatFromInt(caret_line)) * line_h;
-            if (top - line_h < self.scroll) self.scroll = @max(0, top - line_h);
-            if (top + 2 * line_h > self.scroll + body.h) self.scroll = top + 2 * line_h - body.h;
+            if (self.center) {
+                self.center = false;
+                self.scroll = @max(0, top - (body.h - line_h) / 2);
+            } else {
+                if (top - line_h < self.scroll) self.scroll = @max(0, top - line_h);
+                if (top + 2 * line_h > self.scroll + body.h) self.scroll = top + 2 * line_h - body.h;
+            }
             const cx = @as(f32, @floatFromInt(self.colAt(caret_line, e.cursor))) * cell;
             if (cx < self.scroll_x + cell) self.scroll_x = @max(0, cx - 4 * cell);
             if (cx > self.scroll_x + visible_w - cell) self.scroll_x = cx - visible_w + 6 * cell;
@@ -358,7 +400,7 @@ pub const TextEditor = struct {
         // Current line, quietly.
         if (focused and e.selection() == null) {
             const ly = y0 + @as(f32, @floatFromInt(caret_line)) * line_h;
-            if (ly + line_h > body.y and ly < body.bottom()) dl.rect(.{ .x = body.x + 1, .y = ly, .w = body.w - 2, .h = line_h }, theme.line_highlight);
+            if (ly + line_h > body.y and ly < body.bottom()) dl.rect(.{ .x = body.x, .y = ly, .w = body.w, .h = line_h }, theme.line_highlight);
         }
 
         // Gutter.

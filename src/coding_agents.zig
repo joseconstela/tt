@@ -7,7 +7,7 @@
 const std = @import("std");
 const sys = @import("sys.zig");
 
-/// A coding agent conch knows how to launch.
+/// A coding agent tt knows how to launch.
 pub const Known = struct {
     /// Stable id, what the config stores (`features.fix_agent`).
     id: []const u8,
@@ -223,7 +223,7 @@ test "launchCommand: the template's {prompt} takes the quoted prompt" {
 test "scanDirs: finds executables by name, first folder wins, skips non-executables and folders" {
     const gpa = std.testing.allocator;
     const tmp = sys.getenv("TMPDIR") orelse "/tmp";
-    const root = try std.fmt.allocPrint(gpa, "{s}/conch-coding-agents-{d}", .{ std.mem.trimEnd(u8, tmp, "/"), std.c.getpid() });
+    const root = try std.fmt.allocPrint(gpa, "{s}/tt-coding-agents-{d}", .{ std.mem.trimEnd(u8, tmp, "/"), std.c.getpid() });
     defer gpa.free(root);
     const a = try std.fmt.allocPrint(gpa, "{s}/a", .{root});
     defer gpa.free(a);

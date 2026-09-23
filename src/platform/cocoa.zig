@@ -11,6 +11,7 @@ const ui_mod = @import("../ui/ui.zig");
 const sys = @import("../sys.zig");
 const tab_mod = @import("../tabs/tab.zig");
 const WebTab = @import("../tabs/web_tab.zig").WebTab;
+const TerminalTab = @import("../tabs/terminal_tab.zig").TerminalTab;
 
 const id = objc.id;
 const SEL = objc.SEL;
@@ -58,8 +59,8 @@ var g: Globals = .{};
 pub fn run(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
     g.gpa = gpa;
     g.opts = opts;
-    g.debug_events = sys.getenv("CONCH_DEBUG_EVENTS") != null;
-    g.selftest = sys.getenv("CONCH_SELFTEST") != null;
+    g.debug_events = sys.getenv("TT_DEBUG_EVENTS") != null;
+    g.selftest = sys.getenv("TT_SELFTEST") != null;
 
     const pool = objc.AutoreleasePool.push();
     defer pool.pop();
@@ -74,7 +75,7 @@ pub fn run(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
 
 // ── application delegate ─────────────────────────────────────────────────
 fn registerDelegateClass() objc.Class {
-    const b = objc.ClassBuilder.begin("ConchAppDelegate", "NSObject");
+    const b = objc.ClassBuilder.begin("TTAppDelegate", "NSObject");
     b.method("applicationDidFinishLaunching:", didFinishLaunching, "v@:@");
     b.method("applicationShouldTerminateAfterLastWindowClosed:", shouldTerminateAfterLastWindow, "B@:@");
     b.method("applicationShouldTerminate:", shouldTerminate, "Q@:@");
@@ -142,7 +143,7 @@ fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
     const window = msg(id, objc.alloc("NSWindow"), "initWithContentRect:styleMask:backing:defer:", .{ frame, style, @as(NSUInteger, 2), false });
     g.window = window;
     msg(void, window, "setReleasedWhenClosed:", .{false});
-    msg(void, window, "setTitle:", .{objc.nsString("conch")});
+    msg(void, window, "setTitle:", .{objc.nsString("tt")});
     msg(void, window, "setTitlebarAppearsTransparent:", .{true});
     msg(void, window, "setTitleVisibility:", .{@as(NSInteger, 1)}); // hidden
     msg(void, window, "setTabbingMode:", .{@as(NSInteger, 2)}); // we have our own tabs
@@ -151,7 +152,7 @@ fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
 
     // An empty unified toolbar makes the titlebar 52pt tall — the height of the
     // design's header row — and centres the traffic lights in it.
-    const toolbar = msg(id, objc.alloc("NSToolbar"), "initWithIdentifier:", .{objc.nsString("conch.toolbar")});
+    const toolbar = msg(id, objc.alloc("NSToolbar"), "initWithIdentifier:", .{objc.nsString("tt.toolbar")});
     msg(void, toolbar, "setShowsBaselineSeparator:", .{false});
     msg(void, window, "setToolbar:", .{toolbar});
     msg(void, window, "setToolbarStyle:", .{@as(NSInteger, 3)}); // unified
@@ -163,7 +164,7 @@ fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
     const layer = msg(id, view, "layer", .{});
 
     g.app = app_mod.App.create(g.gpa, g.opts, layer, setClipboard) catch |err| {
-        std.debug.print("conch: failed to start: {s}\n", .{@errorName(err)});
+        std.debug.print("tt: failed to start: {s}\n", .{@errorName(err)});
         msg(void, g.nsapp, "terminate:", .{@as(id, null)});
         return;
     };
@@ -182,7 +183,7 @@ fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
     msg(void, window, "setContentView:", .{view});
     _ = msg(bool, window, "makeFirstResponder:", .{view});
     msg(void, window, "center", .{});
-    _ = msg(bool, window, "setFrameAutosaveName:", .{objc.nsString("conch.main")});
+    _ = msg(bool, window, "setFrameAutosaveName:", .{objc.nsString("tt.main")});
     msg(void, window, "makeKeyAndOrderFront:", .{@as(id, null)});
     msg(void, g.nsapp, "activateIgnoringOtherApps:", .{true});
     updateGeometry();
@@ -226,19 +227,22 @@ fn addMenu(bar: id, title: []const u8) id {
 fn buildMenu() void {
     const bar = objc.new("NSMenu");
 
-    const app_menu = addMenu(bar, "conch");
-    _ = addItem(app_menu, "About conch", "orderFrontStandardAboutPanel:", "", null);
+    const app_menu = addMenu(bar, "tt");
+    _ = addItem(app_menu, "About tt", "orderFrontStandardAboutPanel:", "", null);
     addSeparator(app_menu);
     _ = addItem(app_menu, "Settings…", "openSettings:", ",", null);
     addSeparator(app_menu);
-    _ = addItem(app_menu, "Hide conch", "hide:", "h", null);
+    _ = addItem(app_menu, "Hide tt", "hide:", "h", null);
     _ = addItem(app_menu, "Hide Others", "hideOtherApplications:", "h", mod_cmd | mod_alt);
     _ = addItem(app_menu, "Show All", "unhideAllApplications:", "", null);
     addSeparator(app_menu);
-    _ = addItem(app_menu, "Quit conch", "terminate:", "q", null);
+    _ = addItem(app_menu, "Quit tt", "terminate:", "q", null);
 
     const file_menu = addMenu(bar, "File");
     _ = addItem(file_menu, "Save", "saveDocument:", "s", null);
+    addSeparator(file_menu);
+    _ = addItem(file_menu, "Go to File…", "quickOpen:", "p", null);
+    _ = addItem(file_menu, "Go to Line…", "goToLine:", "", null);
 
     const shell = addMenu(bar, "Shell");
     _ = addItem(shell, "New Tab", "newEmptyTab:", "n", null);
@@ -264,6 +268,7 @@ fn buildMenu() void {
     _ = addItem(view_menu, "Markdown: Preview / Source", "toggleView:", "e", null);
     _ = addItem(view_menu, "Toggle Sidebar", "toggleSidebar:", "b", null);
     _ = addItem(view_menu, "Toggle Files Panel", "toggleFiles:", "e", mod_cmd | mod_shift);
+    _ = addItem(view_menu, "Find in Files…", "findInFiles:", "f", mod_cmd | mod_shift);
     addSeparator(view_menu);
     _ = addItem(view_menu, "Split Right", "splitRight:", "d", null);
     _ = addItem(view_menu, "Split Down", "splitDown:", "d", mod_cmd | mod_shift);
@@ -292,7 +297,7 @@ fn buildMenu() void {
 
 // ── the view ─────────────────────────────────────────────────────────────
 fn registerViewClass() objc.Class {
-    const b = objc.ClassBuilder.begin("ConchView", "NSView");
+    const b = objc.ClassBuilder.begin("TTView", "NSView");
     b.protocol("NSTextInputClient");
 
     b.method("makeBackingLayer", makeBackingLayer, "@@:");
@@ -326,11 +331,14 @@ fn registerViewClass() objc.Class {
     b.method("goForward:", actionGoForward, "v@:@");
     b.method("addProjectFolder:", actionAddProjectFolder, "v@:@");
     b.method("toggleFiles:", actionToggleFiles, "v@:@");
+    b.method("findInFiles:", actionFindInFiles, "v@:@");
     b.method("closeTab:", actionCloseTab, "v@:@");
     b.method("nextTab:", actionNextTab, "v@:@");
     b.method("prevTab:", actionPrevTab, "v@:@");
     b.method("toggleSidebar:", actionToggleSidebar, "v@:@");
     b.method("commandPalette:", actionCommandPalette, "v@:@");
+    b.method("quickOpen:", actionQuickOpen, "v@:@");
+    b.method("goToLine:", actionGoToLine, "v@:@");
     b.method("openSettings:", actionOpenSettings, "v@:@");
     b.method("clearBlocks:", actionClear, "v@:@");
     b.method("saveDocument:", actionSave, "v@:@");
@@ -458,13 +466,25 @@ fn tick(_: id, _: SEL, _: id) callconv(.c) void {
         pickProjectFolder();
     }
     if (!app.update(now)) return;
-    // nextDrawable blocks when the window is not on screen; skip drawing then.
-    const occlusion = msg(NSUInteger, g.window, "occlusionState", .{});
-    if (occlusion & (1 << 1) == 0) return;
+    // nextDrawable blocks when the window is not on screen; skip drawing
+    // then. The self test still lays the frame out so the hosted views get
+    // placed: its checks must not depend on what happens to cover the screen.
+    if (!windowOnScreen()) {
+        if (g.selftest) {
+            app.buildFrame();
+            hostSync();
+        }
+        return;
+    }
     app.buildFrame();
     hostSync();
     app.present();
     syncCursor();
+}
+
+fn windowOnScreen() bool {
+    const occlusion = msg(NSUInteger, g.window, "occlusionState", .{});
+    return occlusion & (1 << 1) != 0;
 }
 
 // ── native views hosted over the Metal layer (website tabs) ──────────────
@@ -472,14 +492,37 @@ fn tick(_: id, _: SEL, _: id) callconv(.c) void {
 // the frame the views placed are shown where they were put, the rest are
 // hidden — all of them while the palette or a box covers the window, since
 // a native view would sit on top of the dimming and the panel.
-const Hosted = struct { view: id, frame: CGRect = .{}, placed: bool = false, shown: bool = false };
+//
+// Each view sits in a box of its own, a plain NSView, and the box is what
+// the tab's rect places: whatever the view's framework docks beside it lays
+// itself out in the view's *superview* — WebKit's Web Inspector ("Inspect
+// Element") adds its own view there and gives the page the superview's
+// full width, which was the whole window. In the box the two share the
+// page's rect, and the view follows the box (autoresizing) so that layout
+// survives the window resizing.
+const Hosted = struct { view: id, box: id, frame: CGRect = .{}, placed: bool = false, shown: bool = false };
 var hosted: std.ArrayList(Hosted) = .empty;
+
+/// NSViewWidthSizable | NSViewHeightSizable.
+const follows_box: NSUInteger = 2 | 16;
 
 fn hostAttach(view: *anyopaque) void {
     const v: id = view;
-    msg(void, v, "setHidden:", .{true});
-    msg(void, g.view, "addSubview:", .{v});
-    hosted.append(g.gpa, .{ .view = v }) catch {};
+    const box = msg(id, objc.alloc("NSView"), "initWithFrame:", .{msg(CGRect, v, "frame", .{})});
+    msg(void, box, "setHidden:", .{true});
+    msg(void, v, "setFrame:", .{msg(CGRect, box, "bounds", .{})});
+    msg(void, v, "setAutoresizingMask:", .{follows_box});
+    msg(void, box, "addSubview:", .{v});
+    msg(void, g.view, "addSubview:", .{box});
+    hosted.append(g.gpa, .{ .view = v, .box = box }) catch {};
+}
+
+/// The box around a hosted view (the view itself when it has none).
+fn hostBox(view: id) id {
+    for (hosted.items) |h| {
+        if (h.view == view) return h.box;
+    }
+    return view;
 }
 
 fn hostPlace(view: *anyopaque, rect: ui_mod.Rect) void {
@@ -493,10 +536,13 @@ fn hostPlace(view: *anyopaque, rect: ui_mod.Rect) void {
 
 fn hostDetach(view: *anyopaque) void {
     const v: id = view;
-    msg(void, v, "removeFromSuperview", .{});
     var i: usize = 0;
     while (i < hosted.items.len) {
         if (hosted.items[i].view == v) {
+            const box = hosted.items[i].box;
+            msg(void, v, "removeFromSuperview", .{});
+            msg(void, box, "removeFromSuperview", .{});
+            objc.release(box);
             _ = hosted.orderedRemove(i);
         } else i += 1;
     }
@@ -509,7 +555,8 @@ fn hostHasFocus(view: *anyopaque) bool {
     const fr = msg(id, g.window, "firstResponder", .{});
     if (fr == null) return false;
     if (!msg(bool, fr, "isKindOfClass:", .{objc.class("NSView")})) return false;
-    return msg(bool, fr, "isDescendantOf:", .{v});
+    // The box, so what is docked beside the view (the inspector) counts.
+    return msg(bool, fr, "isDescendantOf:", .{hostBox(v)});
 }
 
 /// True while the keyboard is in one of the hosted views.
@@ -552,12 +599,12 @@ fn hostSync() void {
     var changed = false;
     for (hosted.items) |*h| {
         const show = h.placed and !covered;
-        if (show and !rectEql(msg(CGRect, h.view, "frame", .{}), h.frame)) {
-            msg(void, h.view, "setFrame:", .{h.frame});
+        if (show and !rectEql(msg(CGRect, h.box, "frame", .{}), h.frame)) {
+            msg(void, h.box, "setFrame:", .{h.frame});
             changed = true;
         }
         if (show != h.shown) {
-            msg(void, h.view, "setHidden:", .{!show});
+            msg(void, h.box, "setHidden:", .{!show});
             h.shown = show;
             changed = true;
         }
@@ -845,6 +892,9 @@ fn actionAddProjectFolder(_: id, _: SEL, _: id) callconv(.c) void {
 fn actionToggleFiles(_: id, _: SEL, _: id) callconv(.c) void {
     if (g.app) |app| app.perform(.toggle_files);
 }
+fn actionFindInFiles(_: id, _: SEL, _: id) callconv(.c) void {
+    if (g.app) |app| app.perform(.find_in_files);
+}
 
 /// Native folder picker → a new project.
 fn pickProjectFolder() void {
@@ -877,6 +927,12 @@ fn actionToggleSidebar(_: id, _: SEL, _: id) callconv(.c) void {
 }
 fn actionCommandPalette(_: id, _: SEL, _: id) callconv(.c) void {
     if (g.app) |app| app.perform(.command_palette);
+}
+fn actionQuickOpen(_: id, _: SEL, _: id) callconv(.c) void {
+    if (g.app) |app| app.perform(.quick_open);
+}
+fn actionGoToLine(_: id, _: SEL, _: id) callconv(.c) void {
+    if (g.app) |app| app.perform(.go_to_line);
 }
 fn actionOpenSettings(_: id, _: SEL, _: id) callconv(.c) void {
     if (g.app) |app| app.perform(.open_settings);
@@ -931,7 +987,7 @@ fn actionPaste(_: id, _: SEL, _: id) callconv(.c) void {
     if (str != null) app.onPaste(objc.utf8(str));
 }
 
-// ── self test (CONCH_SELFTEST=1) ─────────────────────────────────────────
+// ── self test (TT_SELFTEST=1) ─────────────────────────────────────────
 // Posts real NSEvents through the window so the AppKit plumbing (hit testing
 // under the transparent titlebar, first responder, key routing) is exercised.
 var selftest_t0: f64 = 0;
@@ -1011,24 +1067,24 @@ fn selftestStep(now: f64) void {
             }
             g.selftest_step += 1;
         }
-    } else if (sys.getenv("CONCH_SELFTEST_URL")) |url| {
+    } else if (sys.getenv("TT_SELFTEST_URL")) |url| {
         selftestWeb(t, url);
-    } else if (sys.getenv("CONCH_SELFTEST_FULLSCREEN") != null) {
+    } else if (sys.getenv("TT_SELFTEST_FULLSCREEN") != null) {
         selftestFullScreen(t);
     } else if (t >= 5.5) {
         std.debug.print("selftest: sidebar collapsed={} tabs={d} palette_opened={} palette_open={} inset_left={d:.0} focused={}\n", .{
             app.sidebar.collapsed, app.tabs.count(), g.selftest_palette_seen, app.palette.open, app.chrome.inset_left, app.chrome.window_focused,
         });
-        if (sys.getenv("CONCH_SELFTEST_SNAP")) |path| app.snapshot(path) catch {};
-        if (sys.getenv("CONCH_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
+        if (sys.getenv("TT_SELFTEST_SNAP")) |path| app.snapshot(path) catch {};
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
         selftestReportButtons();
         msg(void, g.nsapp, "terminate:", .{@as(id, null)});
     }
 }
 
-/// CONCH_SELFTEST_URL=https://…: after the regular steps, a website tab on
+/// TT_SELFTEST_URL=https://…: after the regular steps, a website tab on
 /// that address; the page gets a few seconds, the palette is opened over it
-/// (the hosted view must hide under the scrim; CONCH_SELFTEST_WINDOW_PNG
+/// (the hosted view must hide under the scrim; TT_SELFTEST_WINDOW_PNG
 /// gets a "-palette" capture) and closed again, then the window is captured
 /// with the page and the hosted view's state is printed.
 var selftest_web_step: u8 = 0;
@@ -1038,7 +1094,7 @@ fn selftestWeb(t: f64, url: []const u8) void {
     if (selftest_web_step == 0) {
         selftest_web_step = 1;
         if (std.mem.eql(u8, url, "restored")) {
-            // The tab the workspace brought back (CONCH_WORKSPACE names the
+            // The tab the workspace brought back (TT_WORKSPACE names the
             // file): find it in the pane on show, say what it holds, show it.
             var found = false;
             for (app.tabs.items(), 0..) |tab, i| {
@@ -1056,6 +1112,36 @@ fn selftestWeb(t: f64, url: []const u8) void {
             };
         }
         app.invalidate();
+    } else if (selftest_web_step == 1 and t >= 8.5 and sys.getenv("TT_SELFTEST_WEBMENU") != null) {
+        // The page's context menu, without the menu (which is modal): the
+        // entries the app adds for the selection and the link the page
+        // reported, the first one picked as a user would. While the page
+        // is on show — hiding the web view (the palette step) empties the
+        // selection, as it would for a user.
+        selftest_web_step = 4;
+        selftestWebMenu(app);
+    } else if (selftest_web_step == 4 and t >= 9.5) {
+        selftest_web_step = 5;
+        const cur = app.tabs.current();
+        const kind = if (cur) |c| c.kind else "(none)";
+        const input = if (cur) |c| (if (TerminalTab.fromTab(c)) |term| term.editor.bytes() else "") else "";
+        std.debug.print("selftest: after the menu: current tab kind='{s}' input='{s}' tabs={d}\n", .{ kind, input, app.tabs.items().len });
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
+        msg(void, g.nsapp, "terminate:", .{@as(id, null)});
+    } else if (selftest_web_step == 1 and t >= 8.5 and sys.getenv("TT_SELFTEST_INSPECTOR") != null) {
+        // The Web Inspector docked to the page, as "Inspect Element" does
+        // it, must stay inside the page's rect: the box the host keeps the
+        // web view in, not the window.
+        selftest_web_step = 6;
+        selftestInspector(app, .open);
+    } else if (selftest_web_step == 6 and t >= 10) {
+        selftest_web_step = 7;
+        selftestInspector(app, .dock);
+    } else if (selftest_web_step == 7 and t >= 12.5) {
+        selftest_web_step = 8;
+        selftestInspector(app, .report);
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
+        msg(void, g.nsapp, "terminate:", .{@as(id, null)});
     } else if (selftest_web_step == 1 and t >= 8.5) {
         selftest_web_step = 2;
         const fr = msg(id, g.window, "firstResponder", .{});
@@ -1069,9 +1155,9 @@ fn selftestWeb(t: f64, url: []const u8) void {
         const fr = msg(id, g.window, "firstResponder", .{});
         const fr_class = if (fr != null) objc.utf8(msg(id, msg(id, fr, "class", .{}), "description", .{})) else "(none)";
         for (hosted.items) |h| {
-            std.debug.print("selftest: palette_open={} palette_seen={} hosted view hidden={} first_responder={s}\n", .{ app.palette.open, g.selftest_palette_seen, msg(bool, h.view, "isHidden", .{}), fr_class });
+            std.debug.print("selftest: palette_open={} palette_seen={} hosted view hidden={} first_responder={s}\n", .{ app.palette.open, g.selftest_palette_seen, msg(bool, h.box, "isHidden", .{}), fr_class });
         }
-        if (sys.getenv("CONCH_SELFTEST_WINDOW_PNG")) |path| {
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| {
             var buf: [1024]u8 = undefined;
             const stem = if (std.mem.endsWith(u8, path, ".png")) path[0 .. path.len - 4] else path;
             if (std.fmt.bufPrint(&buf, "{s}-palette.png", .{stem})) |p| captureOwnWindow(p, 1 << 3) else |_| {}
@@ -1082,15 +1168,105 @@ fn selftestWeb(t: f64, url: []const u8) void {
         const title = if (app.tabs.current()) |c| c.title(&buf) else "(none)";
         std.debug.print("selftest: web title='{s}' hosted={d}\n", .{ title, hosted.items.len });
         for (hosted.items) |h| {
-            const f = msg(CGRect, h.view, "frame", .{});
-            const hidden = msg(bool, h.view, "isHidden", .{});
+            const f = msg(CGRect, h.box, "frame", .{});
+            const hidden = msg(bool, h.box, "isHidden", .{});
             std.debug.print("selftest: hosted view shown={} hidden={} frame=({d:.0},{d:.0} {d:.0}x{d:.0}) loading={}\n", .{
                 h.shown, hidden, f.origin.x, f.origin.y, f.size.width, f.size.height, msg(bool, h.view, "isLoading", .{}),
             });
         }
-        if (sys.getenv("CONCH_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
         msg(void, g.nsapp, "terminate:", .{@as(id, null)});
     }
+}
+
+/// TT_SELFTEST_WEBMENU=1 (with TT_SELFTEST_URL): what the website tab's
+/// context menu would offer for the selection and link the page reported
+/// (web_menu.zig), obtained by calling the view's menu hook on an empty
+/// menu — the real menu is modal and would stall this timer. The first
+/// entry is then picked the way a click would (its action on its target),
+/// and the bridge's other direction is tried: `eval` posts back on the
+/// selection channel, which shows under TT_DEBUG_EVENTS. Replaces the
+/// palette steps; the report a second later says which tab is in front
+/// and what its input box holds.
+fn selftestWebMenu(app: *app_mod.App) void {
+    const cur = app.tabs.current() orelse return;
+    const w = WebTab.fromTab(cur) orelse {
+        std.debug.print("selftest: the current tab is not a website tab\n", .{});
+        return;
+    };
+    const view = w.view orelse return;
+    std.debug.print("selftest: web selection='{s}' link='{s}'\n", .{ w.selection.items, w.link_url.items });
+    const menu = objc.autorelease(msg(id, objc.alloc("NSMenu"), "initWithTitle:", .{objc.nsString("")}));
+    msg(void, view, "willOpenMenu:withEvent:", .{ menu, @as(id, null) });
+    const n = msg(NSInteger, menu, "numberOfItems", .{});
+    var i: NSInteger = 0;
+    while (i < n) : (i += 1) {
+        const item = msg(id, menu, "itemAtIndex:", .{i});
+        const sep = msg(bool, item, "isSeparatorItem", .{});
+        std.debug.print("selftest: menu[{d}] '{s}' tag={d}{s}\n", .{ i, objc.utf8(msg(id, item, "title", .{})), msg(NSInteger, item, "tag", .{}), if (sep) " (separator)" else "" });
+    }
+    if (n > 0) msg(void, view, "ttMenuAction:", .{msg(id, menu, "itemAtIndex:", .{@as(NSInteger, 0)})});
+    w.eval("__tt.post('selection', { why: 'eval', text: 'posted from eval', link: '' })");
+}
+
+/// TT_SELFTEST_INSPECTOR=1 (with TT_SELFTEST_URL): the Web Inspector on
+/// the page, opened through WebKit's private `_inspector` handle since the
+/// context menu that offers "Inspect Element" is modal — `open` shows it,
+/// `dock` attaches it below the page once its frontend is up, and `report`
+/// lists what is in the hosted view's box: the page and the inspector, both
+/// inside the box's bounds, the page shorter than the box. The frames are
+/// in the box's own (bottom-left) coordinates. (`_WKInspector` has no
+/// `isAttached`: whether it is docked shows in the box's subviews.)
+const InspectorStep = enum { open, dock, report };
+
+fn selftestInspector(app: *app_mod.App, step: InspectorStep) void {
+    const cur = app.tabs.current() orelse return;
+    const w = WebTab.fromTab(cur) orelse {
+        std.debug.print("selftest: the current tab is not a website tab\n", .{});
+        return;
+    };
+    const view = w.view orelse return;
+    if (!msg(bool, view, "respondsToSelector:", .{objc.sel("_inspector")})) {
+        std.debug.print("selftest: this WebKit has no _inspector\n", .{});
+        return;
+    }
+    const inspector = msg(id, view, "_inspector", .{});
+    if (inspector == null) {
+        std.debug.print("selftest: _inspector is nil\n", .{});
+        return;
+    }
+    switch (step) {
+        .open => msg(void, inspector, "show", .{}),
+        .dock => msg(void, inspector, "attach", .{}),
+        .report => {},
+    }
+    std.debug.print("selftest: inspector {s}: connected={} visible={}\n", .{
+        @tagName(step), msg(bool, inspector, "isConnected", .{}), msg(bool, inspector, "isVisible", .{}),
+    });
+    if (step != .report) return;
+    const box = hostBox(view);
+    const bounds = msg(CGRect, box, "bounds", .{});
+    const box_frame = msg(CGRect, box, "frame", .{});
+    std.debug.print("selftest: box frame=({d:.0},{d:.0} {d:.0}x{d:.0}) superview={s} window_on_screen={}\n", .{
+        box_frame.origin.x, box_frame.origin.y, box_frame.size.width, box_frame.size.height,
+        objc.utf8(msg(id, msg(id, msg(id, box, "superview", .{}), "class", .{}), "description", .{})), windowOnScreen(),
+    });
+    const subviews = msg(id, box, "subviews", .{});
+    const n = msg(NSUInteger, subviews, "count", .{});
+    var i: NSUInteger = 0;
+    while (i < n) : (i += 1) {
+        const sub = msg(id, subviews, "objectAtIndex:", .{i});
+        const f = msg(CGRect, sub, "frame", .{});
+        const inside = f.origin.x >= 0 and f.origin.y >= 0 and f.origin.x + f.size.width <= bounds.size.width + 0.5 and f.origin.y + f.size.height <= bounds.size.height + 0.5;
+        std.debug.print("selftest: box[{d}] {s} frame=({d:.0},{d:.0} {d:.0}x{d:.0}) inside={}{s}\n", .{
+            i, objc.utf8(msg(id, msg(id, sub, "class", .{}), "description", .{})),
+            f.origin.x, f.origin.y, f.size.width, f.size.height, inside, if (sub == view) " (the page)" else "",
+        });
+    }
+    // Nothing of the inspector's may have landed in the window's own view.
+    const top = msg(id, g.view, "subviews", .{});
+    const m = msg(NSUInteger, top, "count", .{});
+    std.debug.print("selftest: window view subviews={d} (boxes={d})\n", .{ m, hosted.items.len });
 }
 
 fn selftestReportButtons() void {
@@ -1103,7 +1279,7 @@ fn selftestReportButtons() void {
     }
 }
 
-/// CONCH_SELFTEST_FULLSCREEN=1: after the regular steps, a round trip through
+/// TT_SELFTEST_FULLSCREEN=1: after the regular steps, a round trip through
 /// full screen. While there, every window of the process is listed (the
 /// toolbar must not show up as its own window over the tab strip) and the
 /// view is captured at screen size.
@@ -1124,10 +1300,10 @@ fn selftestFullScreen(t: f64) void {
         0, 2 => msg(void, g.window, "toggleFullScreen:", .{@as(id, null)}),
         1 => {
             selftestReportWindows();
-            if (sys.getenv("CONCH_SELFTEST_SNAP")) |path| app.snapshot(path) catch {};
+            if (sys.getenv("TT_SELFTEST_SNAP")) |path| app.snapshot(path) catch {};
             // Anything AppKit layers above the view (a toolbar window) must
             // show in the picture, so windows above ours are included.
-            if (sys.getenv("CONCH_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, (1 << 3) | (1 << 1));
+            if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, (1 << 3) | (1 << 1));
         },
         else => {
             selftestReportWindows();

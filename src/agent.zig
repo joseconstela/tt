@@ -924,8 +924,8 @@ var delegate_class: objc.Class = null;
 
 fn delegateClass() objc.Class {
     if (delegate_class == null) {
-        const cls = objc.objc_allocateClassPair(objc.class("NSObject"), "ConchAgentDelegate", @sizeOf(?*Request));
-        if (cls == null) std.debug.panic("failed to allocate objc class ConchAgentDelegate", .{});
+        const cls = objc.objc_allocateClassPair(objc.class("NSObject"), "TTAgentDelegate", @sizeOf(?*Request));
+        if (cls == null) std.debug.panic("failed to allocate objc class TTAgentDelegate", .{});
         const proto = objc.objc_getProtocol("NSURLSessionDataDelegate");
         if (proto != null) _ = objc.class_addProtocol(cls, proto);
         _ = objc.class_addMethod(cls, objc.sel("URLSession:dataTask:didReceiveData:"), @ptrCast(&didReceiveData), "v@:@@@");

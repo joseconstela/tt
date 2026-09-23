@@ -43,6 +43,9 @@ pub const Context = struct {
     tabs: *tab_mod.TabManager,
     /// Project whose folder contains the current shell's directory.
     current_project: ?u32 = null,
+    /// A file from the files panel is being dragged: the rows take it
+    /// (it is pinned to the project it lands on, see `Result.drop_file`).
+    dragging_file: bool = false,
 
     /// The Settings tab, when it is the one in front.
     fn settings(self: Context) ?*settings_mod.SettingsTab {
@@ -55,6 +58,11 @@ pub const MenuTarget = enum { project, default_project, resource };
 
 /// A secondary click on a row: which one and where its menu should open.
 pub const MenuRequest = struct { target: MenuTarget, id: u32, x: f32, y: f32 };
+
+/// Where a dragged file was let go: on a project's row or one of its
+/// resources' (`gid`, 0 for the default project), or on the sidebar with
+/// no row under the pointer (null: the app picks the selected project).
+pub const FileDrop = struct { gid: ?u32 };
 
 /// Everything the user asked for this frame; the app carries it out.
 pub const Result = struct {
@@ -69,6 +77,8 @@ pub const Result = struct {
     open_resource: ?u32 = null,
     /// Right-click on a row: the app opens its context menu.
     menu: ?MenuRequest = null,
+    /// A file dragged from the files panel was let go here.
+    drop_file: ?FileDrop = null,
     /// A project folded or unfolded (worth persisting).
     changed: bool = false,
 };
@@ -112,6 +122,12 @@ pub const Sidebar = struct {
         if (d.hover or d.dragging) ui.cursor = .resize_lr;
 
         if (self.collapsed) self.drawRail(ui, height, ctx) else self.drawFull(ui, height, chrome, ctx, &res);
+        // A file let go over the sidebar but not over a row still lands
+        // (on the selected project); the rail takes it the same way.
+        if (ctx.dragging_file and ui.released and res.drop_file == null) {
+            const mine: Rect = .{ .x = 0, .y = theme.header_h, .w = self.currentWidth(), .h = height - theme.header_h };
+            if (ui.mouseIn(mine)) res.drop_file = .{ .gid = null };
+        }
 
         if (d.hover or d.dragging) {
             const w = self.currentWidth();
@@ -131,7 +147,7 @@ pub const Sidebar = struct {
 
         // Header: brand + collapse button.
         const brand_x = @max(18, chrome.inset_left + 14);
-        _ = dl.textCentered(theme.font_brand, brand_x, theme.header_h / 2, "conch", theme.accent);
+        _ = dl.textCentered(theme.font_brand, brand_x, theme.header_h / 2, "tt", theme.accent);
         const toggle_r: Rect = .{ .x = w - 10 - 36, .y = 8, .w = 36, .h = 36 };
         const tb = ui.button(Ui.id("sidebar.toggle", 0), toggle_r);
         ui.feedback(toggle_r, 8, tb);
@@ -163,7 +179,7 @@ pub const Sidebar = struct {
         const default_group = tab_mod.TabManager.default_group;
         cy = groupRow(ui, cy, w, ctx, res, .{ .gid = default_group, .name = "Default project", .icon = ctx.projects.default_icon, .open = &self.default_open, .target = .default_project, .id = 0 });
         if (self.default_open) {
-            for (ctx.projects.default_resources.items) |*r| cy = resourceRow(ui, cy, w, r, ctx, res);
+            for (ctx.projects.default_resources.items) |*r| cy = resourceRow(ui, cy, w, r, default_group, ctx, res);
         }
         if (ctx.projects.items.items.len == 0) {
             _ = dl.textEllipsis(theme.font_hint, 18, cy + 12, "No projects yet.", w - 36, theme.text_3);
@@ -173,7 +189,7 @@ pub const Sidebar = struct {
         for (ctx.projects.items.items) |*p| {
             cy = groupRow(ui, cy, w, ctx, res, .{ .gid = p.id, .name = p.name, .icon = p.icon, .open = &p.open, .current = ctx.current_project == p.id, .target = .project, .id = p.id });
             if (p.open) {
-                for (p.resources.items) |*r| cy = resourceRow(ui, cy, w, r, ctx, res);
+                for (p.resources.items) |*r| cy = resourceRow(ui, cy, w, r, p.id, ctx, res);
             }
         }
         self.content_h = (cy - top) + 20;
@@ -224,6 +240,7 @@ pub const Sidebar = struct {
         if (ui.rightClicked(r)) res.menu = .{ .target = spec.target, .id = spec.id, .x = ui.mx, .y = ui.my };
         const shown = ctx.tabs.groupId() == spec.gid;
         if (shown) dl.rrect(r, 8, theme.accent.alpha(0.14)) else ui.feedback(r, 8, st);
+        if (dropTarget(ui, ctx, r)) res.drop_file = .{ .gid = spec.gid };
         if (spec.current) dl.rrect(.{ .x = r.x + 2, .y = r.centerY() - 8, .w = 3, .h = 16 }, 1.5, theme.accent);
         _ = dl.textCentered(theme.font_section, r.x + 10, r.centerY(), if (spec.open.*) "▾" else "▸", if (cs.hover) theme.text else theme.text_3);
         const color = if (shown or spec.current or hovered) theme.text else theme.text_2;
@@ -243,6 +260,15 @@ pub const Sidebar = struct {
         return y + 32 + 2;
     }
 
+    /// While a file is being dragged, the row under the pointer shows it
+    /// would take it; true on the frame the file is let go over it.
+    fn dropTarget(ui: *Ui, ctx: Context, r: Rect) bool {
+        if (!ctx.dragging_file or !ui.mouseIn(r)) return false;
+        ui.dl.rrect(r, 8, theme.accent.alpha(0.12));
+        ui.dl.border(r, 8, 1, theme.accent.alpha(0.7));
+        return ui.released;
+    }
+
     /// A project's or resource's own icon at `x` (14pt, centred on `cy`),
     /// when it has one; returns where the label starts.
     fn drawRowIcon(dl: *DrawList, icon: ?[]const u8, x: f32, cy: f32, color: Color) f32 {
@@ -254,7 +280,7 @@ pub const Sidebar = struct {
     /// A resource under its project: a group of shells or a file, with its
     /// own set of tabs. Selected while those are in the strip; a click
     /// shows them, a right-click asks for its menu (rename, icon, remove).
-    fn resourceRow(ui: *Ui, y: f32, w: f32, r: *Resource, ctx: Context, res: *Result) f32 {
+    fn resourceRow(ui: *Ui, y: f32, w: f32, r: *Resource, owner: u32, ctx: Context, res: *Result) f32 {
         const dl = ui.dl;
         const row: Rect = .{ .x = 8, .y = y, .w = w - 16, .h = 30 };
         // No buttons: a new tab comes from the strip (or ⌘T) while the
@@ -263,6 +289,8 @@ pub const Sidebar = struct {
         if (ui.rightClicked(row)) res.menu = .{ .target = .resource, .id = r.id, .x = ui.mx, .y = ui.my };
         const selected = ctx.tabs.groupId() == r.id;
         if (selected) dl.rrect(row, 8, theme.accent.alpha(0.14)) else ui.feedback(row, 8, st);
+        // A file dropped on a resource joins the resource's project.
+        if (dropTarget(ui, ctx, row)) res.drop_file = .{ .gid = owner };
 
         // The user's icon, else the kind's.
         const ix = row.x + 30;
