@@ -33,6 +33,30 @@ pub const tool_name = "propose_command";
 const tool_description = "Puts one shell command into the user's input box, ready to run. The user reads it and presses Enter themselves, so it never executes on its own and you never see its output in this turn. Call it whenever a command would do what the user wants; one call per command, the most useful first.";
 const tool_arg_description = "The zsh command line exactly as it should be run, on one line where possible, with no trailing newline.";
 
+/// What the one tool proposes: the wording changes with where the agent is
+/// asked from, the name and the argument stay `propose_command` /
+/// `command`, so the reply parsing below serves both.
+pub const ToolKind = enum {
+    /// A shell command for a terminal tab's input box.
+    shell_command,
+    /// A Python cell for a notebook tab, inserted for the user to run.
+    notebook_cell,
+
+    pub fn description(self: ToolKind) []const u8 {
+        return switch (self) {
+            .shell_command => tool_description,
+            .notebook_cell => "Adds one code cell to the user's notebook, ready to run in its Jupyter kernel. The user reads it and runs it themselves, so it never executes on its own and you never see its output in this turn. Call it whenever code would do what the user wants; one call per cell, the most useful first.",
+        };
+    }
+
+    pub fn argDescription(self: ToolKind) []const u8 {
+        return switch (self) {
+            .shell_command => tool_arg_description,
+            .notebook_cell => "The source of the cell exactly as it should run in the kernel: Python by default, or a line magic / %%sh cell when that is what is wanted. Several lines are fine.",
+        };
+    }
+};
+
 /// The wire format a provider speaks.
 pub const Format = enum {
     anthropic,
@@ -76,6 +100,8 @@ pub const PrepareError = error{ NoModel, NoBaseUrl, NoApiKey, OutOfMemory };
 pub const Options = struct {
     /// Offer the `propose_command` tool.
     tools: bool = false,
+    /// What it proposes (see `ToolKind`).
+    tool: ToolKind = .shell_command,
 };
 
 /// The request that asks `agent` to answer `messages` (oldest first, the
@@ -91,7 +117,7 @@ pub fn prepare(gpa: std.mem.Allocator, agent: *const config.Agent, system: []con
 
     var self: Prepared = .{ .url = try endpoint(gpa, agent), .body = "", .format = format };
     errdefer self.deinit(gpa);
-    self.body = try body(gpa, format, agent.model, system, messages, opts.tools);
+    self.body = try body(gpa, format, agent.model, system, messages, opts.tools, opts.tool);
 
     try self.header(gpa, "Content-Type", "application/json");
     switch (format) {
@@ -132,16 +158,16 @@ fn endpoint(gpa: std.mem.Allocator, agent: *const config.Agent) PrepareError![]u
     };
 }
 
-fn body(gpa: std.mem.Allocator, format: Format, model: []const u8, system: []const u8, messages: []const Message, tools: bool) error{OutOfMemory}![]u8 {
+fn body(gpa: std.mem.Allocator, format: Format, model: []const u8, system: []const u8, messages: []const Message, tools: bool, tool: ToolKind) error{OutOfMemory}![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     var js: std.json.Stringify = .{ .writer = &aw.writer };
-    writeBody(&js, format, model, system, messages, tools) catch return error.OutOfMemory;
+    writeBody(&js, format, model, system, messages, tools, tool) catch return error.OutOfMemory;
     return aw.toOwnedSlice();
 }
 
 /// The tool's parameters as a JSON schema object.
-fn writeToolSchema(js: *std.json.Stringify) !void {
+fn writeToolSchema(js: *std.json.Stringify, tool: ToolKind) !void {
     try js.beginObject();
     try js.objectField("type");
     try js.write("object");
@@ -152,7 +178,7 @@ fn writeToolSchema(js: *std.json.Stringify) !void {
     try js.objectField("type");
     try js.write("string");
     try js.objectField("description");
-    try js.write(tool_arg_description);
+    try js.write(tool.argDescription());
     try js.endObject();
     try js.endObject();
     try js.objectField("required");
@@ -162,7 +188,7 @@ fn writeToolSchema(js: *std.json.Stringify) !void {
     try js.endObject();
 }
 
-fn writeBody(js: *std.json.Stringify, format: Format, model: []const u8, system: []const u8, messages: []const Message, tools: bool) !void {
+fn writeBody(js: *std.json.Stringify, format: Format, model: []const u8, system: []const u8, messages: []const Message, tools: bool, tool: ToolKind) !void {
     try js.beginObject();
     switch (format) {
         .anthropic => {
@@ -194,9 +220,9 @@ fn writeBody(js: *std.json.Stringify, format: Format, model: []const u8, system:
                 try js.objectField("name");
                 try js.write(tool_name);
                 try js.objectField("description");
-                try js.write(tool_description);
+                try js.write(tool.description());
                 try js.objectField("input_schema");
-                try writeToolSchema(js);
+                try writeToolSchema(js, tool);
                 try js.endObject();
                 try js.endArray();
             }
@@ -236,9 +262,9 @@ fn writeBody(js: *std.json.Stringify, format: Format, model: []const u8, system:
                 try js.objectField("name");
                 try js.write(tool_name);
                 try js.objectField("description");
-                try js.write(tool_description);
+                try js.write(tool.description());
                 try js.objectField("parameters");
-                try writeToolSchema(js);
+                try writeToolSchema(js, tool);
                 try js.endObject();
                 try js.endObject();
                 try js.endArray();
@@ -283,9 +309,9 @@ fn writeBody(js: *std.json.Stringify, format: Format, model: []const u8, system:
                 try js.objectField("name");
                 try js.write(tool_name);
                 try js.objectField("description");
-                try js.write(tool_description);
+                try js.write(tool.description());
                 try js.objectField("parameters");
-                try writeToolSchema(js);
+                try writeToolSchema(js, tool);
                 try js.endObject();
                 try js.endArray();
                 try js.endObject();

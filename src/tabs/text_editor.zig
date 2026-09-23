@@ -23,14 +23,20 @@ const Rect = ui_mod.Rect;
 
 pub const line_h = theme.output_line_h;
 const tab_width: usize = 4;
-const pad_top: f32 = 10;
-const pad_bottom: f32 = 24;
+const default_pad_top: f32 = 10;
+const default_pad_bottom: f32 = 24;
 
 pub const TextEditor = struct {
     gpa: std.mem.Allocator,
     doc: Document,
     /// Navigation and copying only.
     read_only: bool = false,
+    /// Room above the first and below the last line. A file editor keeps
+    /// the defaults; a notebook cell, sized to its text, wants less.
+    pad_top: f32 = default_pad_top,
+    pad_bottom: f32 = default_pad_bottom,
+    /// The line-number gutter; off for a cell that shows a few lines.
+    gutter: bool = true,
     scroll: f32 = 0,
     scroll_x: f32 = 0,
     content_h: f32 = 0,
@@ -118,6 +124,12 @@ pub const TextEditor = struct {
         self.doc.editor.setCursor(off, false);
         self.follow = true;
         self.center = true;
+    }
+
+    /// Height of the whole text with the padding: what a body must be for
+    /// nothing to scroll (a notebook cell grows to this).
+    pub fn height(self: *const TextEditor) f32 {
+        return @as(f32, @floatFromInt(@max(1, self.doc.lineCount()))) * line_h + self.pad_top + self.pad_bottom;
     }
 
     // ── input ───────────────────────────────────────────────────────────
@@ -310,13 +322,13 @@ pub const TextEditor = struct {
 
         const digits: f32 = @floatFromInt(@max(3, std.fmt.count("{d}", .{n})));
         const px = body.x + theme.block_pad_x;
-        const gutter_w = digits * cell + 14;
-        const text_x0 = px + gutter_w + 10;
+        const gutter_w: f32 = if (self.gutter) digits * cell + 14 else 0;
+        const text_x0 = px + gutter_w + (if (self.gutter) @as(f32, 10) else 0);
         const text_area: Rect = .{ .x = text_x0 - 4, .y = body.y, .w = @max(0, body.right() - theme.block_pad_x - (text_x0 - 4)), .h = body.h };
         const visible_w = @max(cell * 4, text_area.w - 12);
 
-        self.content_h = @as(f32, @floatFromInt(n)) * line_h + pad_top + pad_bottom;
-        self.rows_visible = @intFromFloat(@max(1, @floor((body.h - pad_top) / line_h)));
+        self.content_h = @as(f32, @floatFromInt(n)) * line_h + self.pad_top + self.pad_bottom;
+        self.rows_visible = @intFromFloat(@max(1, @floor((body.h - self.pad_top) / line_h)));
         const max_scroll = @max(0, self.content_h - body.h);
 
         // Wheel.
@@ -350,7 +362,7 @@ pub const TextEditor = struct {
             }
         }
         if (d.started or d.dragging) {
-            const rel_y = @max(0, ui.my - body.y - pad_top + self.scroll);
+            const rel_y = @max(0, ui.my - body.y - self.pad_top + self.scroll);
             const line: usize = @min(n - 1, @as(usize, @intFromFloat(@floor(rel_y / line_h))));
             const rel_x = @max(0, ui.mx - text_x0 + self.scroll_x);
             const col: usize = @intFromFloat(@floor(rel_x / cell + 0.5));
@@ -375,7 +387,7 @@ pub const TextEditor = struct {
         if (self.follow) {
             self.follow = false;
             self.noteWidth(doc.lineText(caret_line));
-            const top = pad_top + @as(f32, @floatFromInt(caret_line)) * line_h;
+            const top = self.pad_top + @as(f32, @floatFromInt(caret_line)) * line_h;
             if (self.center) {
                 self.center = false;
                 self.scroll = @max(0, top - (body.h - line_h) / 2);
@@ -393,8 +405,8 @@ pub const TextEditor = struct {
         dl.pushClip(body);
         defer dl.popClip();
 
-        const first: usize = @intFromFloat(@floor(@max(0, self.scroll - pad_top) / line_h));
-        const y0 = body.y + pad_top - self.scroll;
+        const first: usize = @intFromFloat(@floor(@max(0, self.scroll - self.pad_top) / line_h));
+        const y0 = body.y + self.pad_top - self.scroll;
         const x_start = text_x0 - self.scroll_x;
 
         // Current line, quietly.
@@ -404,7 +416,7 @@ pub const TextEditor = struct {
         }
 
         // Gutter.
-        {
+        if (self.gutter) {
             var i = first;
             while (i < n) : (i += 1) {
                 const y = y0 + @as(f32, @floatFromInt(i)) * line_h;

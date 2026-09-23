@@ -22,8 +22,8 @@
 
 tt treats every command as a **block**: the command, its output, how long it took and whether it
 failed, in one card you can collapse, copy or run again. Around the shell sit the things you reach
-for while you work: the files of the project, a real text editor, Markdown notes, images and PDFs,
-a browser tab, git. All of it in one window that comes back exactly as you left it when you relaunch.
+for while you work: the files of the project, a real text editor, Markdown notes, Jupyter notebooks,
+images and PDFs, a browser tab, git. All of it in one window that comes back exactly as you left it when you relaunch.
 
 It is a single native binary. No Electron, no Swift, no Objective-C sources: AppKit, Metal,
 CoreText and WebKit are driven straight from Zig through the Objective-C runtime.
@@ -57,6 +57,14 @@ CoreText and WebKit are driven straight from Zig through the Objective-C runtime
   inline HTML and entities rendered), images with EXIF rotation and 1:1 zoom, and PDFs rendered
   page by page. Viewers pick the file by its bytes first
   and its extension second, so a renamed PNG still opens as a picture.
+- **Notebooks.** A `.ipynb` opens as a column of cells run by a real Jupyter kernel: the Python of
+  the nearest `.venv`, else one that has `ipykernel`. Outputs are drawn natively (coloured text,
+  tracebacks, PNG figures, DataFrames as tables), `input()` works, and a `%%sh` cell is a shell
+  block. New cells are typed into the input row at the bottom (py / sh / md / ask) and ⇧↵ runs
+  them; the *ask* kind puts the notebook in front of your agent, which answers under the question
+  and can draft a cell for you to run. A Variables panel lists the kernel's names, types and
+  memory. The bar at the left edge of a cell's input or outputs folds it, as in Jupyter Lab, and
+  the fold is saved the way Jupyter saves it. Files are nbformat 4, written as Jupyter writes them.
 - **Websites.** A tab with an address bar and the system WebKit behind it (⌘⇧N), *Inspect
   Element*, and a context menu that sends the selected text to the shell.
 - **Full-screen programs.** vim, htop, less, fzf, ssh, REPLs and Claude Code take over the whole
@@ -112,7 +120,8 @@ first fetch errors out, run `zig build` again.
 | ⌘⇧F | Find in files |
 | ⌘B · ⌘⇧E | Toggle sidebar · files panel |
 | ⌘⇧O | Add a folder as a project |
-| ⌘E | Markdown: preview ⇄ source |
+| ⌘E | Markdown: preview ⇄ source · Notebook: variables & kernel panel |
+| ⇧↵ | Notebook: run the cell and move on · input row: run the text as a new cell |
 | ⌘S | Save |
 | ⌃L | Clear blocks |
 | ⌘L · ⌘R · ⌘← ⌘→ | Website tab: open location · reload · back, forward |
@@ -126,9 +135,9 @@ tt keeps its state in three plain files in your home directory, and nowhere else
 
 | File | Holds |
 | --- | --- |
-| `~/.tt/config.yml` | Mode, accent, a mode per display, the model APIs you added (name, provider, model, key, base URL) and which features use them |
+| `~/.tt/config.yml` | Mode, accent, a mode per display, the model APIs you added (name, provider, model, key, base URL), which features use them, notebook options |
 | `~/.tt_projects` | Your projects, their pinned files and shell groups |
-| `~/.tt_workspace` | Open tabs, pane layout, each shell's directory and its blocks |
+| `~/.tt_workspace` | Open tabs, pane layout, each shell's directory and its blocks, each notebook's outputs |
 
 The config file is readable YAML meant to be edited by hand. It also holds your API keys in the
 clear, so treat it like any other credentials file.
@@ -137,9 +146,14 @@ This is everything that talks to the network:
 
 - **AI agents you set up.** Anthropic, OpenAI, Google, Mistral, Ollama on localhost, or any
   OpenAI-compatible endpoint. tt contacts them only when you ask: a plain-English line in the
-  input box, or *Explain* on a failed block. What it sends is your question plus the tab's
-  transcript (recent commands, the last lines of their output, exit codes). A fresh install has
-  no agent and makes no requests.
+  input box, *Explain* on a failed block, or an *ask* cell in a notebook. What it sends is your
+  question plus the tab's transcript (recent commands, the last lines of their output, exit
+  codes; for a notebook its cells, the last lines of their outputs and, unless you switch it off,
+  the names and types of the kernel's variables, never their values). A fresh install has no agent
+  and makes no requests.
+- **Notebook kernels.** A `.ipynb` runs in a Jupyter kernel started on this Mac with the
+  notebook's own Python. The Jupyter protocol between tt and that kernel runs over sockets bound
+  to 127.0.0.1, as it does under Jupyter Lab; nothing leaves the machine.
 - **Website tabs.** The pages you open, through the system WebKit, as Safari would load them.
 - **Coding agents.** *Fix with agent* launches a tool that is already installed on your Mac inside
   your shell. What that tool does online is between you and it.
@@ -166,6 +180,13 @@ embedded in the binary.
 mode, the session hands the tab to libghostty-vt behind a small seam (`src/term/screen.zig`) and
 takes it back when the program exits; the final screen becomes the block's output.
 
+**Notebooks through Jupyter.** A notebook tab does not speak ZeroMQ itself: it starts
+`assets/notebook/tt_jupyter.py` with the notebook's Python, and that script starts the kernel with
+jupyter_client, the library Jupyter Lab and VS Code use, and relays the messages as one JSON line
+each over pipes. tt keeps the frontend: cells are its own editor and Markdown view, outputs go
+through the block buffer, pictures through the image path. Every kernel installed for that Python
+works, and the file stays plain nbformat 4.
+
 **Tabs are a vtable.** A tab kind is a struct with a label, `create`, `deinit` and `draw`, turned
 into pointer + vtable at comptime (the shape of `std.mem.Allocator`) and registered with the tab
 manager. Viewers add one function that says whether they want a file.
@@ -179,7 +200,8 @@ src/
   platform/cocoa.zig   NSApplication, window, Metal layer, menus, IME, hosted WebKit views
   gfx/                 renderer, shaders, text atlas, icons, images, textures
   ui/                  theme, sidebar, tab strips, panes, palette, files / search / git panels
-  tabs/                the tab kinds: terminal, text editor, Markdown, image, PDF, website, settings
+  tabs/                the tab kinds: terminal, text editor, Markdown, notebook, image, PDF, website, settings
+  notebook/            nbformat reader/writer and the Jupyter kernel behind a notebook tab
   term/                pty, VT parser, block buffer, session, the libghostty-vt seam, shell integration
   input/               editor model, history, path suggestions
   syntax/              per-line lexers for 27 languages and Markdown
@@ -189,6 +211,7 @@ src/
 assets/
   fonts/               Spline Sans + Spline Sans Mono (SIL Open Font License)
   shell/tt.zsh         the block-mark hooks
+  notebook/tt_jupyter.py  the Jupyter bridge: starts a kernel with jupyter_client, JSON lines over pipes
 ```
 
 ## Extending
@@ -197,17 +220,19 @@ assets/
 hook (`title`, `status`, `tick`, `onText`, `copy`, `paste`, `save`…) has a default:
 
 ```zig
-pub const NotebookTab = struct {
-    pub const kind_label = "Notebook";
-    pub fn create(env: *tab.Env, args: tab.OpenArgs) anyerror!tab.Tab { ... return tab.Tab.from(NotebookTab, self); }
-    pub fn deinit(self: *NotebookTab) void { ... }
-    pub fn draw(self: *NotebookTab, ui: *Ui, rect: Rect, focused: bool) void { ... }
+pub const SqliteTab = struct {
+    pub const kind_label = "SQLite";
+    pub fn create(env: *tab.Env, args: tab.OpenArgs) anyerror!tab.Tab { ... return tab.Tab.from(SqliteTab, self); }
+    pub fn deinit(self: *SqliteTab) void { ... }
+    pub fn draw(self: *SqliteTab, ui: *Ui, rect: Rect, focused: bool) void { ... }
 };
 
 // app.zig
-self.tabs.register(.{ .name = "notebook", .label = "Notebook", .create = NotebookTab.create });
-_ = try self.tabs.openWith("notebook", .{ .path = "/some/file.ipynb" });
+self.tabs.register(.{ .name = "sqlite", .label = "SQLite", .create = SqliteTab.create });
+_ = try self.tabs.openWith("sqlite", .{ .path = "/some/file.db" });
 ```
+
+The notebook tab (`src/tabs/notebook_tab.zig`) is exactly this shape, with a kernel process behind it.
 
 **A viewer for another file format** is a tab kind with one more function, `accepts(path, head)`,
 judged on the file's path and first kilobyte. Kinds are asked in registration order and the first
@@ -215,11 +240,11 @@ taker wins, so register it before the plain text editor, which accepts everythin
 
 ```zig
 pub fn accepts(path: []const u8, head: []const u8) bool {
-    return filetype.hasExtension(path, &.{"ipynb"}) and std.mem.startsWith(u8, head, "{");
+    return std.mem.startsWith(u8, head, "SQLite format 3\x00") or filetype.hasExtension(path, &.{ "db", "sqlite" });
 }
 
 // app.zig, before the "file" kind
-self.tabs.register(.{ .name = "notebook", .label = "Notebook", .create = NotebookTab.create, .accepts = NotebookTab.accepts });
+self.tabs.register(.{ .name = "sqlite", .label = "SQLite", .create = SqliteTab.create, .accepts = SqliteTab.accepts });
 ```
 
 `src/tabs/viewer.zig` has the chrome viewers share, and `src/filetype.zig` the magic numbers, so a
@@ -234,7 +259,9 @@ zig build test                        # unit tests
 ```
 
 The script language (type, click, drag, open, split, snap…) is documented at the top of
-`src/script.zig`. The screenshot at the top of this page was rendered that way.
+`src/script.zig`. The screenshot at the top of this page was rendered that way. A notebook opened
+from a script runs for real too, given a Python with `ipykernel`; `TT_DEBUG_EVENTS=1` prints what
+the kernel sends.
 
 ## Status
 

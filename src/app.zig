@@ -19,6 +19,7 @@ const tab_mod = @import("tabs/tab.zig");
 const TerminalTab = @import("tabs/terminal_tab.zig").TerminalTab;
 const FileTab = @import("tabs/file_tab.zig").FileTab;
 const MarkdownTab = @import("tabs/markdown_tab.zig").MarkdownTab;
+const NotebookTab = @import("tabs/notebook_tab.zig").NotebookTab;
 const ImageTab = @import("tabs/image_tab.zig").ImageTab;
 const PdfTab = @import("tabs/pdf_tab.zig").PdfTab;
 const SettingsTab = @import("tabs/settings_tab.zig").SettingsTab;
@@ -193,6 +194,7 @@ pub const App = struct {
         self.tabs.register(.{ .name = "image", .label = "Image", .create = ImageTab.create, .accepts = ImageTab.accepts });
         self.tabs.register(.{ .name = "pdf", .label = "PDF", .create = PdfTab.create, .accepts = PdfTab.accepts });
         self.tabs.register(.{ .name = "markdown", .label = "Markdown", .create = MarkdownTab.create, .accepts = MarkdownTab.accepts });
+        self.tabs.register(.{ .name = "notebook", .label = "Notebook", .create = NotebookTab.create, .accepts = NotebookTab.accepts });
         self.tabs.register(.{ .name = "file", .label = "File", .create = FileTab.create, .accepts = FileTab.accepts });
         self.tabs.register(.{ .name = "settings", .label = "Settings", .create = SettingsTab.create, .singleton = true, .renamable = false });
         self.tabs.register(.{ .name = "web", .label = "Website", .create = WebTab.create });

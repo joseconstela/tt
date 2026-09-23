@@ -131,6 +131,7 @@ pub extern "c" fn CGImageDestinationFinalize(dest: CGImageDestinationRef) bool;
 
 pub const CGImageSourceRef = ?*anyopaque;
 pub extern "c" fn CGImageSourceCreateWithURL(url: CFURLRef, options: CFDictionaryRef) CGImageSourceRef;
+pub extern "c" fn CGImageSourceCreateWithData(data: CFDataRef, options: CFDictionaryRef) CGImageSourceRef;
 pub extern "c" fn CGImageSourceGetCount(src: CGImageSourceRef) usize;
 pub extern "c" fn CGImageSourceCopyPropertiesAtIndex(src: CGImageSourceRef, index: usize, options: CFDictionaryRef) CFDictionaryRef;
 pub extern "c" fn CGImageSourceCreateThumbnailAtIndex(src: CGImageSourceRef, index: usize, options: CFDictionaryRef) CGImageRef;

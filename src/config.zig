@@ -25,6 +25,9 @@
 //!     explain_prompt: "…"
 //!     fix_agent: auto                     # auto | off | a coding agent id (claude, codex …)
 //!     fix_prompt: "…"
+//!   notebooks:
+//!     strip_outputs: false                # save .ipynb files without their outputs
+//!     share_schema: true                  # agents asked from a notebook get variable names + types
 //!
 //! In the code an "agent" is one of the APIs (a model at a provider); the
 //! coding agents installed on the Mac live in `coding_agents.zig`.
@@ -189,6 +192,16 @@ pub const Features = struct {
     }
 };
 
+/// Notebook tabs (see tabs/notebook_tab.zig).
+pub const Notebooks = struct {
+    /// Save .ipynb files without their outputs (the outputs stay on
+    /// screen and in the workspace file).
+    strip_outputs: bool = false,
+    /// Tell the agent the names and types of the kernel's variables when
+    /// it is asked from a notebook. Values never leave the kernel.
+    share_schema: bool = true,
+};
+
 /// A display the window should change its mode on: the theme follows the
 /// screen the window sits on, so an e-ink panel can have e-ink and the
 /// laptop's own display stay dark. Matched by the display's name (what
@@ -215,6 +228,7 @@ pub const Config = struct {
     screens: std.ArrayList(Screen) = .empty,
     agents: std.ArrayList(Agent) = .empty,
     features: Features = .{},
+    notebooks: Notebooks = .{},
     /// Bumped on every change, so views can notice edits made elsewhere.
     version: u64 = 0,
     /// A change waiting to be written (see `touch` / `saveIfDue`).
@@ -498,6 +512,9 @@ pub const Config = struct {
         try writeField(gpa, out, "explain_prompt", self.features.explain_prompt);
         try writeField(gpa, out, "fix_agent", if (self.features.fixAuto()) "auto" else self.features.fix_agent);
         try writeField(gpa, out, "fix_prompt", self.features.fix_prompt);
+        try out.appendSlice(gpa, "notebooks:\n");
+        try out.print(gpa, "  strip_outputs: {s}\n", .{if (self.notebooks.strip_outputs) "true" else "false"});
+        try out.print(gpa, "  share_schema: {s}\n", .{if (self.notebooks.share_schema) "true" else "false"});
     }
 
     fn writeField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
@@ -550,7 +567,7 @@ pub const Config = struct {
         return true;
     }
 
-    const Section = enum { none, ui, agents, apis, features, screens };
+    const Section = enum { none, ui, agents, apis, features, screens, notebooks };
 
     /// Reads the subset `write` produces (plus hand edits of the same
     /// shape). Anything it does not understand is skipped.
@@ -608,6 +625,14 @@ pub const Config = struct {
                         // `auto` (and a blank) both mean "whichever is installed".
                         const text = if (s == &f.fix_agent and std.ascii.eqlIgnoreCase(v, "auto")) "" else v;
                         self.setString(s, text);
+                    }
+                },
+                .notebooks => {
+                    const kv = splitKey(body) orelse continue;
+                    if (std.mem.eql(u8, kv.key, "strip_outputs")) {
+                        self.notebooks.strip_outputs = isTrue(kv.value);
+                    } else if (std.mem.eql(u8, kv.key, "share_schema")) {
+                        self.notebooks.share_schema = isTrue(kv.value);
                     }
                 },
                 .agents => unreachable,
@@ -1020,4 +1045,21 @@ test "screens: hand-written entries without a name or listed twice are dropped" 
     try std.testing.expectEqual(Mode.eink, c.modeOn("Paper"));
     try std.testing.expectEqual(Mode.system, c.modeOn("Desk"));
     try std.testing.expectEqual(Mode.light, c.modeOn("Other"));
+}
+
+test "notebooks: the two switches round trip and default to outputs kept, schema shared" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try std.testing.expect(!a.notebooks.strip_outputs and a.notebooks.share_schema);
+    a.notebooks.strip_outputs = true;
+    a.notebooks.share_schema = false;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try a.write(&text);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "notebooks:\n  strip_outputs: true\n  share_schema: false\n") != null);
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(text.items);
+    try std.testing.expect(b.notebooks.strip_outputs and !b.notebooks.share_schema);
 }

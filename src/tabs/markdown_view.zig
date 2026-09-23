@@ -45,9 +45,9 @@ const hr_h: f32 = 22;
 const fence_edge_h: f32 = 8;
 /// A line that renders to nothing (a lone HTML tag, a comment) keeps a sliver.
 const html_edge_h: f32 = 6;
-const pad_top: f32 = 16;
-const pad_bottom: f32 = 48;
-const side_pad: f32 = theme.block_pad_x + 6;
+const default_pad_top: f32 = 16;
+const default_pad_bottom: f32 = 48;
+const default_side_pad: f32 = theme.block_pad_x + 6;
 const quote_indent: f32 = 18;
 const list_text_indent: f32 = 22;
 const indent_px: f32 = 7;
@@ -185,6 +185,11 @@ pub const MarkdownView = struct {
     follow: bool = false,
     caret: Rect = .{},
     salt: usize,
+    /// Room around the prose: a Markdown file keeps the defaults, a
+    /// notebook cell (sized to its text) wants less.
+    pad_top: f32 = default_pad_top,
+    pad_bottom: f32 = default_pad_bottom,
+    side_pad: f32 = default_side_pad,
     /// The app's text engine, kept from the last draw so keyboard-driven
     /// layout (↑/↓ across wrapped rows) can measure text.
     text: ?*gfx_text.TextEngine = null,
@@ -761,6 +766,26 @@ pub const MarkdownView = struct {
     }
 
     // ── drawing ─────────────────────────────────────────────────────────
+    /// The height `draw` needs for the whole document at `width` (the
+    /// body's width), the caret's line revealed when `focused`: what a
+    /// notebook cell grows to. Keeps the height cache in step, so calling
+    /// it before `draw` costs nothing extra.
+    pub fn measure(self: *MarkdownView, text: *gfx_text.TextEngine, ed: *TextEditor, width: f32, focused: bool) f32 {
+        const doc = &ed.doc;
+        const content_w = @max(60, width - 2 * self.side_pad);
+        if (self.width != content_w) {
+            self.width = content_w;
+            self.heights.clearRetainingCapacity();
+        }
+        self.syncHeights(doc);
+        const reveal: ?usize = if (focused) doc.lineOf(doc.editor.cursor) else null;
+        var total: f32 = self.pad_top;
+        var i: usize = 0;
+        const n = doc.lineCount();
+        while (i < n) : (i += 1) total += self.lineHeight(text, doc, i, reveal);
+        return total + self.pad_bottom;
+    }
+
     pub fn draw(self: *MarkdownView, ui: *Ui, ed: *TextEditor, body: Rect, focused: bool) void {
         const dl = ui.dl;
         const scale = dl.scale;
@@ -770,8 +795,8 @@ pub const MarkdownView = struct {
         const e = &doc.editor;
         const n = doc.lineCount();
 
-        const cx0 = body.x + side_pad;
-        const content_w = @max(60, body.w - 2 * side_pad);
+        const cx0 = body.x + self.side_pad;
+        const content_w = @max(60, body.w - 2 * self.side_pad);
         if (self.width != content_w) {
             self.width = content_w;
             self.heights.clearRetainingCapacity();
@@ -784,8 +809,8 @@ pub const MarkdownView = struct {
         const reveal_before: ?usize = if (focused) line_before else null;
 
         // Heights: total, plus where the caret line sits.
-        var total: f32 = pad_top;
-        var caret_top: f32 = pad_top;
+        var total: f32 = self.pad_top;
+        var caret_top: f32 = self.pad_top;
         var caret_h: f32 = prose_h;
         {
             var i: usize = 0;
@@ -798,7 +823,7 @@ pub const MarkdownView = struct {
                 total += h;
             }
         }
-        self.content_h = total + pad_bottom;
+        self.content_h = total + self.pad_bottom;
         const max_scroll = @max(0, self.content_h - body.h);
 
         self.scroll -= ui.takeScroll(body);
@@ -852,7 +877,7 @@ pub const MarkdownView = struct {
         };
         const sel = e.selection();
 
-        var y = body.y + pad_top - self.scroll;
+        var y = body.y + self.pad_top - self.scroll;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const h = self.lineHeight(text, doc, i, reveal);
@@ -968,7 +993,7 @@ pub const MarkdownView = struct {
 
     fn hitTest(self: *MarkdownView, text: *gfx_text.TextEngine, doc: *const Document, body: Rect, cx0: f32, reveal: ?usize, mx: f32, my: f32) Hit {
         const n = doc.lineCount();
-        var y = body.y + pad_top - self.scroll;
+        var y = body.y + self.pad_top - self.scroll;
         var i: usize = 0;
         var h: f32 = 0;
         while (i < n) : (i += 1) {

@@ -87,6 +87,23 @@ pub fn decodeImage(gpa: std.mem.Allocator, path: []const u8, max_px: u32) !Image
     const src = apple.CGImageSourceCreateWithURL(url, null);
     if (src == null) return error.NotAnImage;
     defer apple.CFRelease(src);
+    return decodeSource(gpa, src, max_px);
+}
+
+/// `decodeImage` for an image held in memory (a notebook's PNG output).
+/// `bytes` must stay alive until this returns.
+pub fn decodeBytes(gpa: std.mem.Allocator, bytes: []const u8, max_px: u32) !Image {
+    if (bytes.len == 0) return error.NotAnImage;
+    const data = apple.CFDataCreateWithBytesNoCopy(null, bytes.ptr, @intCast(bytes.len), apple.kCFAllocatorNull);
+    if (data == null) return error.NotAnImage;
+    defer apple.CFRelease(data);
+    const src = apple.CGImageSourceCreateWithData(data, null);
+    if (src == null) return error.NotAnImage;
+    defer apple.CFRelease(src);
+    return decodeSource(gpa, src, max_px);
+}
+
+fn decodeSource(gpa: std.mem.Allocator, src: apple.CGImageSourceRef, max_px: u32) !Image {
     const frames = apple.CGImageSourceGetCount(src);
     if (frames == 0) return error.NotAnImage;
 

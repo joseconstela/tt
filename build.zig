@@ -56,6 +56,8 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("font_mono", .{ .root_source_file = b.path("assets/fonts/SplineSansMono.ttf") });
     mod.addAnonymousImport("shaders_metal", .{ .root_source_file = b.path("src/gfx/shaders.metal") });
     mod.addAnonymousImport("zsh_integration", .{ .root_source_file = b.path("assets/shell/tt.zsh") });
+    // The Jupyter bridge that notebook tabs start with the notebook's Python.
+    mod.addAnonymousImport("jupyter_bridge", .{ .root_source_file = b.path("assets/notebook/tt_jupyter.py") });
 
     // Full-screen programs (vim, htop, Claude Code …) run on libghostty-vt,
     // Ghostty's terminal emulation core, pinned to a commit in build.zig.zon.
@@ -93,6 +95,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     if (ghostty) |dep| test_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+    test_mod.addAnonymousImport("jupyter_bridge", .{ .root_source_file = b.path("assets/notebook/tt_jupyter.py") });
+    // The notebook tab's tests reach the texture code, which talks to Metal through the runtime.
+    test_mod.linkSystemLibrary("objc", .{});
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

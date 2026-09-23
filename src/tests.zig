@@ -30,4 +30,7 @@ test {
     _ = @import("coding_agents.zig");
     _ = @import("paths.zig");
     _ = @import("search.zig");
+    _ = @import("notebook/ipynb.zig");
+    _ = @import("notebook/bridge.zig");
+    _ = @import("tabs/notebook_tab.zig");
 }
