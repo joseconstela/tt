@@ -10,8 +10,9 @@
 //! Pressing a tab and moving it starts a *drag*: the pane view draws
 //! the ghost, and the strip or pane under the mouse says where the tab would
 //! land (`Drag.target`). `left_inset` keeps the first tab clear of the
-//! traffic lights when the sidebar is collapsed; empty space in the band
-//! drags the window (see the platform layer).
+//! traffic lights and the sidebar's toggle (in the band while the sidebar
+//! is collapsed); empty space in the band drags the window (see the
+//! platform layer).
 const std = @import("std");
 const ui_mod = @import("ui.zig");
 const theme = @import("theme.zig");

@@ -132,6 +132,9 @@ pub const App = struct {
     file_drag: std.ArrayList(u8) = .empty,
     /// When macOS's appearance was last read (mode "system" polls it).
     appearance_checked: f64 = 0,
+    /// The mode the theme was last put in; a change (the general setting,
+    /// the window moving to a display with its own) applies at once.
+    applied_mode: ?config.Mode = null,
 
     pub fn create(gpa: std.mem.Allocator, opts: LaunchOptions, layer: objc.id, setClipboard: *const fn ([]const u8) void) !*App {
         const self = try gpa.create(App);
@@ -140,7 +143,7 @@ pub const App = struct {
         // The settings first: the theme has to be right before anything draws.
         config.init(gpa);
         appearance.applyAccent(config.get().accent);
-        theme.setScheme(appearance.resolve(config.get().mode));
+        theme.setScheme(appearance.resolve(appearance.effectiveMode()));
 
         var cwd_buf: [4096]u8 = undefined;
         const cwd_ok = std.c.getcwd(&cwd_buf, cwd_buf.len) != null;
@@ -207,6 +210,7 @@ pub const App = struct {
         self.env.requests.deinit(self.gpa);
         config.get().save();
         config.deinit();
+        appearance.deinit(self.gpa);
         self.palette.deinit();
         self.overlay.deinit();
         self.projects.deinit();
@@ -268,11 +272,15 @@ pub const App = struct {
         if (self.overlay.tick(now)) self.invalidate();
         if (self.files.tick(now)) self.invalidate();
         if (self.palette.tick(now)) self.invalidate();
-        // Mode "system": follow macOS when it switches between light and dark.
+        // The theme follows the mode set for the display the window is on,
+        // else the general one; "system" also follows macOS when it
+        // switches between light and dark (polled, it is a defaults read).
         const cfg = config.get();
-        if (cfg.mode == .system and now - self.appearance_checked >= 2) {
+        const mode = appearance.effectiveMode();
+        if (mode != self.applied_mode or now - self.appearance_checked >= 2) {
+            self.applied_mode = mode;
             self.appearance_checked = now;
-            if (appearance.apply(.system)) self.invalidate();
+            if (appearance.apply(mode)) self.invalidate();
         }
         cfg.saveIfDue(now);
         self.workspace.saveIfChanged(&self.tabs, &self.projects, now);
@@ -312,13 +320,12 @@ pub const App = struct {
         if (palette_open or self.overlay.isOpen()) ui.mouse_inside = false;
 
         // Main column: the tab strips live in the titlebar band (right of the
-        // sidebar header, spanning the files panel too), the panes under it.
+        // sidebar header — or, with the sidebar collapsed, of its toggle in
+        // the band — spanning the files panel too), the panes under it.
         // The panels' resize grips are drawn on top of it.
         const side_w = self.sidebar.currentWidth();
         const files_w = self.files.currentWidth();
-        const main_x: f32 = if (self.sidebar.collapsed) 0 else side_w;
-        const lights_inset = if (self.sidebar.collapsed) self.chrome.inset_left + 8 else 0;
-        const bar: draw.Rect = .{ .x = main_x, .y = 0, .w = self.width - main_x, .h = theme.header_h };
+        const bar: draw.Rect = .{ .x = side_w, .y = 0, .w = self.width - side_w, .h = theme.header_h };
         const content: draw.Rect = .{ .x = side_w, .y = theme.header_h, .w = self.width - side_w - files_w, .h = self.height - theme.header_h };
         const files_rect: draw.Rect = .{ .x = self.width - files_w, .y = theme.header_h, .w = files_w, .h = self.height - theme.header_h };
 
@@ -344,7 +351,7 @@ pub const App = struct {
 
         // The panes: each one's strip, its active tab, the dividers, and a
         // tab being dragged. Moves are applied to the tab manager inside.
-        const pv = self.panes.draw(ui, &self.tabs, bar, content, lights_inset, self.files.visible, self.chrome.window_focused);
+        const pv = self.panes.draw(ui, &self.tabs, bar, content, side.band_inset, self.files.visible, self.chrome.window_focused);
         if (pv.menu) |m| self.openTabMenu(m);
         if (pv.new_tab) |pane| {
             _ = self.tabs.focusPane(pane);

@@ -8,6 +8,9 @@
 //!   ui:
 //!     mode: system          # dark | light | system | eink
 //!     accent: amber         # amber | peach | lime | rose | "#RRGGBB"
+//!   screens:                # the mode to use while the window is on a display
+//!     - name: DASUNG Paperlike   # the display's name in System Settings
+//!       mode: eink               # dark | light | system | eink
 //!   apis:                   # (older files say `agents:`; both are read)
 //!     - name: Claude
 //!       provider: anthropic # anthropic | openai | google | mistral | ollama | custom
@@ -186,12 +189,30 @@ pub const Features = struct {
     }
 };
 
+/// A display the window should change its mode on: the theme follows the
+/// screen the window sits on, so an e-ink panel can have e-ink and the
+/// laptop's own display stay dark. Matched by the display's name (what
+/// System Settings › Displays calls it). Only tt's window changes; macOS's
+/// own appearance is never touched.
+pub const Screen = struct {
+    name: []u8 = "",
+    mode: Mode = .system,
+
+    fn deinit(self: *Screen, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        self.* = .{};
+    }
+};
+
 pub const Config = struct {
     gpa: std.mem.Allocator,
     /// `~/.tt/config.yml` (null when there is no home directory).
     path: ?[]u8 = null,
     mode: Mode = .system,
     accent: Accent = .{ .named = 0 },
+    /// Displays with a mode of their own; the window follows whichever
+    /// one it is on, and `mode` applies on any other.
+    screens: std.ArrayList(Screen) = .empty,
     agents: std.ArrayList(Agent) = .empty,
     features: Features = .{},
     /// Bumped on every change, so views can notice edits made elsewhere.
@@ -208,6 +229,8 @@ pub const Config = struct {
     pub fn deinit(self: *Config) void {
         for (self.agents.items) |*a| a.deinit(self.gpa);
         self.agents.deinit(self.gpa);
+        for (self.screens.items) |*sc| sc.deinit(self.gpa);
+        self.screens.deinit(self.gpa);
         if (self.features.command_fallback_agent) |s| self.gpa.free(s);
         self.gpa.free(self.features.command_fallback_prompt);
         if (self.features.explain_agent) |s| self.gpa.free(s);
@@ -335,6 +358,48 @@ pub const Config = struct {
         self.changed();
     }
 
+    // ── screens ─────────────────────────────────────────────────────────
+    /// The mode set for the display called `name`, if any.
+    pub fn screenMode(self: *const Config, name: []const u8) ?Mode {
+        for (self.screens.items) |sc| {
+            if (std.mem.eql(u8, sc.name, name)) return sc.mode;
+        }
+        return null;
+    }
+
+    /// The mode the window should be in while on the display called
+    /// `name` (null = no display known, e.g. headless): the display's own
+    /// setting, else the general one.
+    pub fn modeOn(self: *const Config, name: ?[]const u8) Mode {
+        const n = name orelse return self.mode;
+        return self.screenMode(n) orelse self.mode;
+    }
+
+    /// Gives the display called `name` a mode of its own, or takes it away
+    /// (null: the display follows the general mode again).
+    pub fn setScreenMode(self: *Config, name: []const u8, mode: ?Mode) void {
+        for (self.screens.items, 0..) |*sc, i| {
+            if (!std.mem.eql(u8, sc.name, name)) continue;
+            const m = mode orelse {
+                sc.deinit(self.gpa);
+                _ = self.screens.orderedRemove(i);
+                self.changed();
+                return;
+            };
+            if (sc.mode == m) return;
+            sc.mode = m;
+            self.changed();
+            return;
+        }
+        const m = mode orelse return;
+        const copy = self.gpa.dupe(u8, name) catch return;
+        self.screens.append(self.gpa, .{ .name = copy, .mode = m }) catch {
+            self.gpa.free(copy);
+            return;
+        };
+        self.changed();
+    }
+
     // ── persistence ─────────────────────────────────────────────────────
     /// Marks the config changed; the write happens on the next `saveIfDue`
     /// after a quiet moment, or on `save`.
@@ -399,6 +464,14 @@ pub const Config = struct {
         switch (self.accent) {
             .named => |i| try out.print(gpa, "  accent: {s}   # amber | peach | lime | rose | \"#RRGGBB\"\n", .{accent_names[@min(i, accent_names.len - 1)]}),
             .custom => |rgb| try out.print(gpa, "  accent: \"#{X:0>6}\"   # amber | peach | lime | rose | \"#RRGGBB\"\n", .{rgb}),
+        }
+        if (self.screens.items.len > 0) {
+            try out.appendSlice(gpa, "screens:   # the mode to use while the window is on a display\n");
+            for (self.screens.items) |sc| {
+                try out.appendSlice(gpa, "  - name: ");
+                try writeScalar(gpa, out, sc.name);
+                try out.print(gpa, "\n    mode: {s}\n", .{@tagName(sc.mode)});
+            }
         }
         if (self.agents.items.len == 0) {
             try out.appendSlice(gpa, "apis: []\n");
@@ -477,7 +550,7 @@ pub const Config = struct {
         return true;
     }
 
-    const Section = enum { none, ui, agents, apis, features };
+    const Section = enum { none, ui, agents, apis, features, screens };
 
     /// Reads the subset `write` produces (plus hand edits of the same
     /// shape). Anything it does not understand is skipped.
@@ -538,6 +611,22 @@ pub const Config = struct {
                     }
                 },
                 .agents => unreachable,
+                .screens => {
+                    if (new_item) {
+                        try self.screens.append(self.gpa, .{});
+                        if (body.len == 0) continue;
+                    }
+                    if (self.screens.items.len == 0) continue;
+                    const sc = &self.screens.items[self.screens.items.len - 1];
+                    const kv = splitKey(body) orelse continue;
+                    if (std.mem.eql(u8, kv.key, "name")) {
+                        const v = try unquote(self.gpa, kv.value);
+                        defer self.gpa.free(v);
+                        self.setString(&sc.name, v);
+                    } else if (std.mem.eql(u8, kv.key, "mode")) {
+                        if (Mode.parse(kv.value)) |m| sc.mode = m;
+                    }
+                },
                 .apis => {
                     if (new_item) {
                         try self.agents.append(self.gpa, .{ .uid = self.takeUid() });
@@ -560,6 +649,20 @@ pub const Config = struct {
                     }
                 },
             }
+        }
+        // A screen entry without a name matches nothing; a name listed
+        // twice keeps its first entry.
+        var k: usize = 0;
+        while (k < self.screens.items.len) {
+            const sc = &self.screens.items[k];
+            var dup = false;
+            for (self.screens.items[0..k]) |earlier| {
+                if (std.mem.eql(u8, earlier.name, sc.name)) dup = true;
+            }
+            if (sc.name.len == 0 or dup) {
+                sc.deinit(self.gpa);
+                _ = self.screens.orderedRemove(k);
+            } else k += 1;
         }
         // Agents without a name are useless; drop them. Exactly one default.
         var i: usize = 0;
@@ -852,4 +955,69 @@ test "provider switch keeps edited fields, replaces defaults" {
     try std.testing.expectEqualStrings("https://api.mistral.ai/v1", a.base_url);
     c.removeAgent(a.uid);
     try std.testing.expectEqual(@as(usize, 0), c.agents.items.len);
+}
+
+test "screens: a mode per display round-trips, resolves and can be taken away" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    a.mode = .dark;
+    a.setScreenMode("DASUNG Paperlike", .eink);
+    a.setScreenMode("Built-in Retina Display: 2", .light);
+    a.setScreenMode("Built-in Retina Display: 2", .light); // no change
+    try std.testing.expectEqual(@as(usize, 2), a.screens.items.len);
+    try std.testing.expectEqual(Mode.eink, a.modeOn("DASUNG Paperlike"));
+    try std.testing.expectEqual(Mode.light, a.modeOn("Built-in Retina Display: 2"));
+    try std.testing.expectEqual(Mode.dark, a.modeOn("LG UltraFine"));
+    try std.testing.expectEqual(Mode.dark, a.modeOn(null));
+    try std.testing.expect(a.screenMode("LG UltraFine") == null);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try a.write(&out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "screens:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "  - name: DASUNG Paperlike\n    mode: eink\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "  - name: \"Built-in Retina Display: 2\"\n    mode: light\n") != null);
+
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(out.items);
+    try std.testing.expectEqual(@as(usize, 2), b.screens.items.len);
+    try std.testing.expectEqual(Mode.eink, b.modeOn("DASUNG Paperlike"));
+    try std.testing.expectEqual(Mode.light, b.modeOn("Built-in Retina Display: 2"));
+
+    // Back to the general mode: the entry goes away and nothing is written.
+    b.setScreenMode("DASUNG Paperlike", null);
+    b.setScreenMode("never listed", null);
+    try std.testing.expectEqual(@as(usize, 1), b.screens.items.len);
+    try std.testing.expectEqual(Mode.dark, b.modeOn("DASUNG Paperlike"));
+    b.setScreenMode("Built-in Retina Display: 2", null);
+    out.clearRetainingCapacity();
+    try b.write(&out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "screens:") == null);
+}
+
+test "screens: hand-written entries without a name or listed twice are dropped" {
+    const gpa = std.testing.allocator;
+    var c = Config.init(gpa);
+    defer c.deinit();
+    try c.parse(
+        \\ui:
+        \\  mode: light
+        \\screens:
+        \\  - name: Paper
+        \\    mode: eink
+        \\  - mode: dark        # no name: matches nothing
+        \\  - name: Paper       # again: the first one counts
+        \\    mode: dark
+        \\  -
+        \\    name: Desk
+        \\    mode: system
+        \\apis: []
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 2), c.screens.items.len);
+    try std.testing.expectEqual(Mode.eink, c.modeOn("Paper"));
+    try std.testing.expectEqual(Mode.system, c.modeOn("Desk"));
+    try std.testing.expectEqual(Mode.light, c.modeOn("Other"));
 }

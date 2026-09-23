@@ -115,7 +115,7 @@ pub const Document = struct {
     pub fn setLanguage(self: *Document, lang: Language) void {
         if (self.lang == lang) return;
         self.lang = lang;
-        self.relexFrom(0, self.lineCount());
+        _ = self.relexFrom(0, self.lineCount());
     }
 
     fn topSerial(self: *const Document) u64 {
@@ -204,15 +204,17 @@ pub const Document = struct {
         try self.states.resize(self.gpa, self.line_starts.items.len);
         @memset(self.states.items, 0);
         self.states.items[0] = lexer.initialState(self.lang);
-        self.relexFrom(0, self.lineCount());
+        _ = self.relexFrom(0, self.lineCount());
     }
 
     /// Recomputes start states from line `from`; lines before `must_end`
     /// are recomputed unconditionally, after that only until the new state
     /// matches the stored one (from then on nothing downstream can change).
-    fn relexFrom(self: *Document, from: usize, must_end: usize) void {
+    /// Returns one past the last line whose start state was written, so a
+    /// change record can cover every line whose rendering may have changed.
+    fn relexFrom(self: *Document, from: usize, must_end: usize) usize {
         const n = self.lineCount();
-        if (from >= n) return;
+        if (from >= n) return from;
         var st = self.states.items[from];
         var i = from;
         while (true) : (i += 1) {
@@ -221,6 +223,7 @@ pub const Document = struct {
             if (i + 1 >= must_end and self.states.items[i + 1] == st) break;
             self.states.items[i + 1] = st;
         }
+        return @max(must_end, i + 1);
     }
 
     /// Fixes the line index after bytes [from, to) became `ins_len` bytes.
@@ -247,8 +250,11 @@ pub const Document = struct {
         try self.states.replaceRange(self.gpa, a, b - a, &.{});
         var k: usize = 0;
         while (k < fresh.items.len) : (k += 1) try self.states.insert(self.gpa, a + k, 0);
-        self.relexFrom(li, a + fresh.items.len);
-        self.changes[self.change_serial % self.changes.len] = .{ .first = @intCast(li), .old_count = @intCast(1 + (b - a)), .new_count = @intCast(1 + fresh.items.len) };
+        // Lines past the edit whose start state changed (a fence or table
+        // opened above them) are in the record too, mapped onto themselves.
+        const relexed = self.relexFrom(li, a + fresh.items.len);
+        const extra: u32 = @intCast(relexed - (a + fresh.items.len));
+        self.changes[self.change_serial % self.changes.len] = .{ .first = @intCast(li), .old_count = @intCast(1 + (b - a) + extra), .new_count = @intCast(1 + fresh.items.len + extra) };
         self.change_serial += 1;
     }
 

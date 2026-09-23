@@ -1761,9 +1761,46 @@ pub const TerminalTab = struct {
     // ── input box ───────────────────────────────────────────────────────
     const InputLayout = struct { rows: usize, cols: usize, prompt_w: f32 };
 
+    /// The prompt at the left of the input box, like the robbyrussell zsh
+    /// theme: the folder the shell is in (grey), `git:(branch)` when it is
+    /// in a repository (blue, the branch red) and the `$` (yellow; `›` in
+    /// teal while a program has the input). The pieces come from the shell
+    /// hook (`Session.cwd` / `Session.branch`), so they follow every `cd`
+    /// and checkout.
+    const PromptLayout = struct {
+        folder: []const u8,
+        branch: []const u8,
+        /// Room the branch may take; a longer name gets an ellipsis so the
+        /// line stays for the command.
+        branch_max_w: f32,
+        /// Width of the whole prompt with its trailing space: where the
+        /// typed text starts.
+        w: f32,
+    };
+
+    fn promptLayout(self: *TerminalTab, ui: *Ui, box_w: f32) PromptLayout {
+        const cell = ui.text.cellAdvance(theme.font_input);
+        const dir = self.session.cwd.items;
+        const folder: []const u8 = if (dir.len == 0) "" else if (std.mem.eql(u8, dir, sys.home())) "~" else sys.basename(dir);
+        const branch = self.session.branch.items;
+        var w: f32 = 0;
+        if (folder.len > 0) w += ui.text.measure(theme.font_input, folder) + cell;
+        var branch_max_w: f32 = 0;
+        if (branch.len > 0) {
+            const git_w = ui.text.measure(theme.font_input, "git:(") + ui.text.measure(theme.font_input, ")");
+            // The prompt keeps to the left ~40% of the box (never fewer
+            // than 4 cells of branch), the rest is for the command.
+            const budget = @max(cell * 12, (box_w - 2 * theme.block_pad_x) * 0.4);
+            branch_max_w = @max(cell * 4, budget - w - git_w - 3 * cell);
+            w += git_w + fitWidth(ui, theme.font_input, branch, branch_max_w) + cell;
+        }
+        w += cell * 2; // "$ "
+        return .{ .folder = folder, .branch = branch, .branch_max_w = branch_max_w, .w = w };
+    }
+
     fn inputLayout(self: *TerminalTab, ui: *Ui, box_w: f32) InputLayout {
         const cell = ui.text.cellAdvance(theme.font_input);
-        const prompt_w = cell * 2;
+        const prompt_w = self.promptLayout(ui, box_w).w;
         const avail = box_w - 2 * theme.block_pad_x - prompt_w;
         const cols: usize = @intFromFloat(@max(8, @floor(avail / cell)));
         var rows: usize = 1;
@@ -1829,7 +1866,19 @@ pub const TerminalTab = struct {
         self.text_cols = lay.cols;
         self.cell_w = cell;
 
-        _ = dl.textCentered(theme.font_input, px, text_y + input_row_h / 2, if (busy) "›" else "$", if (busy) theme.teal else theme.accent);
+        // Prompt: `folder git:(branch) $`.
+        {
+            const p = self.promptLayout(ui, r.w);
+            const pcy = text_y + input_row_h / 2;
+            var x = px;
+            if (p.folder.len > 0) x += dl.textCentered(theme.font_input, x, pcy, p.folder, theme.text_2) + cell;
+            if (p.branch.len > 0) {
+                x += dl.textCentered(theme.font_input, x, pcy, "git:(", theme.ansi[4]);
+                x += dl.textEllipsis(theme.font_input, x, pcy, p.branch, p.branch_max_w, theme.ansi[1]);
+                x += dl.textCentered(theme.font_input, x, pcy, ")", theme.ansi[4]) + cell;
+            }
+            _ = dl.textCentered(theme.font_input, x, pcy, if (busy) "›" else "$", if (busy) theme.teal else theme.ansi[3]);
+        }
 
         // Mouse: place caret / drag-select.
         const text_rect: Rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = 16 + @as(f32, @floatFromInt(lay.rows)) * input_row_h + 8 };
@@ -1978,6 +2027,29 @@ fn hitTest(b: *Block, l: TerminalTab.BlockLayout, x: f32, rows_y: f32, cols: u32
     const c = @round((mx - x) / cell_w);
     const span: f32 = @floatFromInt(seg_end - seg_start);
     return .{ .line = lo, .cell = seg_start + @as(usize, @intFromFloat(std.math.clamp(c, 0, span))) };
+}
+
+/// Width `DrawList.textEllipsis` will use for `str` within `max_w`: the
+/// whole string when it fits, else the longest prefix plus the ellipsis.
+fn fitWidth(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32) f32 {
+    if (max_w <= 0) return 0;
+    const full = ui.text.measure(font, str);
+    if (full <= max_w) return full;
+    const ell_w = ui.text.measure(font, "…");
+    var it = gfx_text.Utf8Iter{ .bytes = str };
+    var w: f32 = 0;
+    var end: usize = 0;
+    while (it.next()) |cp| {
+        const adv = ui.text.advance(font, cp);
+        if (w + adv + ell_w > max_w) break;
+        w += adv;
+        end = it.index;
+    }
+    while (end > 0 and str[end - 1] == ' ') {
+        end -= 1;
+        w -= ui.text.advance(font, ' ');
+    }
+    return w + ell_w;
 }
 
 /// The hint at the right of the input box: where a line the shell does

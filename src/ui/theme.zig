@@ -334,7 +334,6 @@ pub const palette_top: f32 = 112;
 pub const sidebar_default_w: f32 = 300;
 pub const sidebar_min_w: f32 = 208;
 pub const sidebar_max_w: f32 = 520;
-pub const sidebar_rail_w: f32 = 60;
 pub const files_default_w: f32 = 260;
 pub const files_min_w: f32 = 180;
 pub const files_max_w: f32 = 520;

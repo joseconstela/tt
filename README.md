@@ -53,8 +53,9 @@ CoreText and WebKit are driven straight from Zig through the Objective-C runtime
 - **Split panes.** Drag a tab to a pane's edge to split it (or ⌘D / ⌘⇧D), between strips to move
   it, or drop a file from the panel straight into a pane. The same model as VS Code's editor groups.
 - **Files open in place.** A real text editor (undo, IME, auto-indent, syntax colours for
-  27 languages), an Obsidian-style Markdown editor whose preview stays editable, images with EXIF
-  rotation and 1:1 zoom, and PDFs rendered page by page. Viewers pick the file by its bytes first
+  27 languages), an Obsidian-style Markdown editor whose preview stays editable (tables in cells,
+  inline HTML and entities rendered), images with EXIF rotation and 1:1 zoom, and PDFs rendered
+  page by page. Viewers pick the file by its bytes first
   and its extension second, so a renamed PNG still opens as a picture.
 - **Websites.** A tab with an address bar and the system WebKit behind it (⌘⇧N), *Inspect
   Element*, and a context menu that sends the selected text to the shell.
@@ -71,7 +72,9 @@ CoreText and WebKit are driven straight from Zig through the Objective-C runtime
 - **Everything survives a relaunch.** Tabs, panes and their sizes, focus, each shell's directory
   and its blocks come back where they were.
 - **Dark, Light, System and E-ink.** Four modes and an accent of your choice. E-ink is pure black on
-  white with no colour and no blinking, for e-paper displays.
+  white with no colour and no blinking, for e-paper displays. Each display can have a mode of its
+  own (*Settings › Mode › Per screen*): the window switches when you move it there, and only tt
+  changes, never macOS.
 
 ## Getting started
 
@@ -123,7 +126,7 @@ tt keeps its state in three plain files in your home directory, and nowhere else
 
 | File | Holds |
 | --- | --- |
-| `~/.tt/config.yml` | Mode, accent, the model APIs you added (name, provider, model, key, base URL) and which features use them |
+| `~/.tt/config.yml` | Mode, accent, a mode per display, the model APIs you added (name, provider, model, key, base URL) and which features use them |
 | `~/.tt_projects` | Your projects, their pinned files and shell groups |
 | `~/.tt_workspace` | Open tabs, pane layout, each shell's directory and its blocks |
 

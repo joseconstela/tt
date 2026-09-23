@@ -281,7 +281,10 @@ pub const SettingsTab = struct {
         }
     }
 
-    /// Dark, light, or macOS's choice.
+    /// The modes a chip row offers, in order.
+    const mode_choices = [_]config.Mode{ .dark, .light, .system, .eink };
+
+    /// Dark, light, or macOS's choice — and, under it, a mode per display.
     fn drawMode(ui: *Ui, x: f32, y: f32, col_w: f32) f32 {
         const dl = ui.dl;
         const cfg = config.get();
@@ -290,29 +293,121 @@ pub const SettingsTab = struct {
         _ = dl.textCentered(theme.font_ui_medium, card.x + 18, card.y + 28, "Appearance", theme.text);
         _ = dl.textCentered(theme.font_hint, card.x + 18, card.y + 52, "Dark, light, e-ink, or whatever macOS is using.", theme.text_3);
 
-        const modes = [_]config.Mode{ .dark, .light, .system, .eink };
         var w: f32 = 0;
-        for (modes) |m| w += field.chipWidth(ui, m.label()) + 6;
+        for (mode_choices) |m| w += field.chipWidth(ui, m.label()) + 6;
         var cx = card.right() - 18 - w + 6;
-        for (modes, 0..) |m, i| {
+        for (mode_choices, 0..) |m, i| {
             const cw = field.chipWidth(ui, m.label());
             if (field.chip(ui, Ui.id("settings.mode", i), .{ .x = cx, .y = card.centerY() - 13, .w = cw, .h = 26 }, m.label(), cfg.mode == m)) {
                 cfg.setMode(m);
-                _ = appearance.apply(m);
+                _ = appearance.sync();
                 cfg.save();
             }
             cx += cw + 6;
         }
 
-        var note_buf: [96]u8 = undefined;
-        const note: []const u8 = switch (cfg.mode) {
+        var note_buf: [160]u8 = undefined;
+        const here = appearance.currentScreen();
+        const own: ?config.Mode = if (here) |h| cfg.screenMode(h) else null;
+        const note: []const u8 = if (own) |m|
+            std.fmt.bufPrint(&note_buf, "Not in use right now: this window is on {s}, which is set to {s} below.", .{ here.?, m.label() }) catch ""
+        else switch (cfg.mode) {
             .system => std.fmt.bufPrint(&note_buf, "Following macOS, which is {s} right now.", .{if (theme.scheme == .dark) "dark" else "light"}) catch "",
             .dark => "Always dark, whatever macOS is set to.",
             .light => "Always light, whatever macOS is set to.",
             .eink => "Ink on paper, for e-ink panels: black and white, no blinking, no hover, no shadows.",
         };
         _ = dl.textCentered(theme.font_hint, card.x + 18, card.bottom() + 20, note, theme.text_3);
-        return card.bottom() + 30;
+        return drawScreens(ui, x, card.bottom() + 44, col_w);
+    }
+
+    /// One row per display: the mode the window takes while it is on that
+    /// display, or "As above" for the general one. Displays that were set
+    /// up but are not connected right now can be forgotten.
+    fn drawScreens(ui: *Ui, x: f32, y: f32, col_w: f32) f32 {
+        const dl = ui.dl;
+        const cfg = config.get();
+        const connected = appearance.screenNames();
+        const here = appearance.currentScreen();
+
+        // Remembered displays that are not connected, after the connected ones.
+        var absent_buf: [32][]const u8 = undefined;
+        var absent: usize = 0;
+        for (cfg.screens.items) |sc| {
+            var listed = false;
+            for (connected) |name| {
+                if (std.mem.eql(u8, name, sc.name)) listed = true;
+            }
+            if (!listed and absent < absent_buf.len) {
+                absent_buf[absent] = sc.name;
+                absent += 1;
+            }
+        }
+        const rows = connected.len + absent;
+        const row_h: f32 = 38;
+        const head_h: f32 = 72;
+        const card: Rect = .{ .x = x, .y = y, .w = col_w, .h = head_h + @as(f32, @floatFromInt(@max(rows, 1))) * row_h + 12 };
+        dl.shape(card, theme.block_radius, theme.bg_block, theme.block_border, theme.line);
+        _ = dl.textCentered(theme.font_ui_medium, card.x + 18, card.y + 28, "Per screen", theme.text);
+        _ = dl.textCentered(theme.font_hint, card.x + 18, card.y + 52, "A display can have a mode of its own: the window switches when it moves there. Only tt changes, never macOS.", theme.text_3);
+
+        var ry = card.y + head_h;
+        if (rows == 0) {
+            _ = dl.textCentered(theme.font_hint, card.x + 18, ry + row_h / 2, "No display is known yet.", theme.text_3);
+            ry += row_h;
+        }
+        for (connected, 0..) |name, i| {
+            const cy = ry + row_h / 2;
+            const on_it = here != null and std.mem.eql(u8, here.?, name);
+            // The name, tagged when the window is on it.
+            const name_w = ui.text.measure(theme.font_ui, name);
+            _ = dl.textCentered(theme.font_ui, card.x + 18, cy, name, theme.text);
+            if (on_it) {
+                const tag = "window is here";
+                const tw = ui.text.measure(theme.font_chip, tag);
+                const pill: Rect = .{ .x = card.x + 18 + name_w + 10, .y = cy - 9, .w = tw + 14, .h = 18 };
+                dl.rrect(pill, 9, theme.accent.alpha(0.16));
+                _ = dl.textCentered(theme.font_chip, pill.x + 7, cy, tag, theme.text);
+            }
+            // As above | Dark | Light | System | E-ink, right-aligned.
+            const own = cfg.screenMode(name);
+            var w: f32 = field.chipWidth(ui, "As above") + 6;
+            for (mode_choices) |m| w += field.chipWidth(ui, m.label()) + 6;
+            var cx = card.right() - 18 - w + 6;
+            const aw = field.chipWidth(ui, "As above");
+            if (field.chip(ui, Ui.id("settings.screen", i * 8), .{ .x = cx, .y = cy - 13, .w = aw, .h = 26 }, "As above", own == null)) {
+                cfg.setScreenMode(name, null);
+                _ = appearance.sync();
+                cfg.save();
+            }
+            cx += aw + 6;
+            for (mode_choices, 1..) |m, k| {
+                const cw = field.chipWidth(ui, m.label());
+                if (field.chip(ui, Ui.id("settings.screen", i * 8 + k), .{ .x = cx, .y = cy - 13, .w = cw, .h = 26 }, m.label(), own == m)) {
+                    cfg.setScreenMode(name, m);
+                    _ = appearance.sync();
+                    cfg.save();
+                }
+                cx += cw + 6;
+            }
+            ry += row_h;
+        }
+        for (absent_buf[0..absent], 0..) |name, i| {
+            const cy = ry + row_h / 2;
+            _ = dl.textCentered(theme.font_ui, card.x + 18, cy, name, theme.text_2);
+            var buf: [64]u8 = undefined;
+            const what = std.fmt.bufPrint(&buf, "Not connected · {s}", .{(cfg.screenMode(name) orelse cfg.mode).label()}) catch "Not connected";
+            const fw = ui.text.measure(theme.font_hint, "Forget") + 20;
+            const forget: Rect = .{ .x = card.right() - 18 - fw, .y = cy - 12, .w = fw, .h = 24 };
+            const ww = ui.text.measure(theme.font_hint, what);
+            _ = dl.textCentered(theme.font_hint, forget.x - 12 - ww, cy, what, theme.text_3);
+            if (field.textButton(ui, Ui.id("settings.screen.forget", i), forget, "Forget", theme.text_2)) {
+                cfg.setScreenMode(name, null);
+                cfg.save();
+            }
+            ry += row_h;
+        }
+        return card.bottom();
     }
 
     /// The accent colour options declared by the design.

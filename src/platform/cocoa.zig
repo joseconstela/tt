@@ -7,6 +7,7 @@ const apple = @import("../apple.zig");
 const app_mod = @import("../app.zig");
 const events = @import("../events.zig");
 const theme = @import("../ui/theme.zig");
+const appearance = @import("../appearance.zig");
 const ui_mod = @import("../ui/ui.zig");
 const sys = @import("../sys.zig");
 const tab_mod = @import("../tabs/tab.zig");
@@ -86,7 +87,43 @@ fn registerDelegateClass() objc.Class {
     b.method("windowDidEnterFullScreen:", windowChromeChanged, "v@:@");
     b.method("windowDidExitFullScreen:", windowDidExitFullScreen, "v@:@");
     b.method("windowDidResize:", windowChromeChanged, "v@:@");
+    // The window moved to another display, or displays were plugged in /
+    // out: the theme may have to change with it (Settings › Mode › Per screen).
+    b.method("windowDidChangeScreen:", screensChanged, "v@:@");
+    b.method("applicationDidChangeScreenParameters:", screensChanged, "v@:@");
     return b.register();
+}
+
+fn screensChanged(_: id, _: SEL, _: id) callconv(.c) void {
+    syncScreens();
+}
+
+/// Tells the app which displays are connected and which one the window is
+/// on, by the names System Settings shows. The app's next update applies
+/// the mode set for that display.
+fn syncScreens() void {
+    const app = g.app orelse return;
+    if (g.window == null) return;
+    const list = msg(id, objc.class("NSScreen"), "screens", .{});
+    const n: usize = @intCast(msg(NSUInteger, list, "count", .{}));
+    const on = msg(id, g.window, "screen", .{});
+    var names_buf: [16][]const u8 = undefined;
+    var names: []const []const u8 = names_buf[0..0];
+    var current: ?usize = null;
+    var i: usize = 0;
+    while (i < n and i < names_buf.len) : (i += 1) {
+        const screen = msg(id, list, "objectAtIndex:", .{@as(NSUInteger, i)});
+        names_buf[i] = objc.utf8(msg(id, screen, "localizedName", .{}));
+        if (on != null and msg(bool, screen, "isEqual:", .{on})) current = i;
+        names = names_buf[0 .. i + 1];
+    }
+    appearance.setScreens(g.gpa, names, current);
+    if (g.debug_events or g.selftest) {
+        std.debug.print("screens:", .{});
+        for (appearance.screenNames(), 0..) |name, k| std.debug.print(" [{s}]{s}", .{ name, if (current == k) "*" else "" });
+        std.debug.print(" → mode {s}\n", .{@tagName(appearance.effectiveMode())});
+    }
+    app.invalidate();
 }
 
 fn shouldTerminateAfterLastWindow(_: id, _: SEL, _: id) callconv(.c) bool {
@@ -187,6 +224,7 @@ fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
     msg(void, window, "makeKeyAndOrderFront:", .{@as(id, null)});
     msg(void, g.nsapp, "activateIgnoringOtherApps:", .{true});
     updateGeometry();
+    syncScreens();
 
     const timer = msg(id, objc.class("NSTimer"), "timerWithTimeInterval:target:selector:userInfo:repeats:", .{
         @as(f64, 1.0 / 120.0), view, objc.sel("tick:"), @as(id, null), true,
@@ -441,8 +479,8 @@ fn syncWindowAppearance() void {
         .dark => "NSAppearanceNameDarkAqua",
         .light, .eink => "NSAppearanceNameAqua",
     };
-    const appearance = msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)});
-    msg(void, g.window, "setAppearance:", .{appearance});
+    const ns_appearance = msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)});
+    msg(void, g.window, "setAppearance:", .{ns_appearance});
     const bg = msg(id, objc.class("NSColor"), "colorWithSRGBRed:green:blue:alpha:", .{
         @as(f64, theme.bg.r), @as(f64, theme.bg.g), @as(f64, theme.bg.b), @as(f64, 1),
     });
@@ -1041,13 +1079,14 @@ fn selftestStep(now: f64) void {
     const t = now - selftest_t0;
     if (app.palette.open) g.selftest_palette_seen = true;
     const Step = struct { at: f64, x: f64 = 0, y: f64 = 0, keys: []const u8 = "", cmd_key: u8 = 0, what: []const u8 };
-    // Collapse button and the "+" of the tab strip (both in the titlebar
-    // band), ⌘K as a real key equivalent through the menu, then key events
+    // Collapse button, the toggle that reopens the sidebar (in the band
+    // right of the traffic lights: 79 + 8, 36 wide) and the "+" of the tab
+    // strip, ⌘K as a real key equivalent through the menu, then key events
     // through interpretKeyEvents / NSTextInputClient (Escape closes the
     // palette via cancelOperation:).
     const steps = [_]Step{
         .{ .at = 1.5, .x = 272, .y = 26, .what = "collapse sidebar (titlebar band)" },
-        .{ .at = 2.0, .x = 30, .y = 82, .what = "expand sidebar (rail)" },
+        .{ .at = 2.0, .x = 105, .y = 26, .what = "expand sidebar (toggle in the titlebar band)" },
         .{ .at = 2.5, .x = 416, .y = 26, .what = "new tab (+ in the tab strip, titlebar band)" },
         .{ .at = 3.0, .cmd_key = 'k', .what = "open palette (⌘K menu key equivalent)" },
         .{ .at = 3.4, .keys = "\x1b", .what = "Escape closes the palette" },

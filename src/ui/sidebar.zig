@@ -7,7 +7,9 @@
 //! to no folder. Projects and resources can carry an icon of the user's
 //! choosing (a symbol or a coloured dot, `icon_spec.zig`). The chrome is
 //! live: rows select, projects fold, the edge drags to resize and the whole
-//! thing collapses to an icon rail. Rows carry no buttons apart from a
+//! thing collapses away: nothing of it is left on screen but its toggle,
+//! which moves into the titlebar band next to the traffic lights (the tab
+//! strip starts after it, `Result.band_inset`). Rows carry no buttons apart from a
 //! project's "new tab" terminal on hover: new shell groups, removing,
 //! renaming and the icon live in the context menu a right-click asks for
 //! (`Result.menu`; the app opens it, see `overlay.zig`). While the Settings
@@ -81,6 +83,9 @@ pub const Result = struct {
     drop_file: ?FileDrop = null,
     /// A project folded or unfolded (worth persisting).
     changed: bool = false,
+    /// While collapsed: where the sidebar's toggle in the titlebar band
+    /// ends, so the first tab strip starts after it (0 when expanded).
+    band_inset: f32 = 0,
 };
 
 pub const Sidebar = struct {
@@ -93,7 +98,7 @@ pub const Sidebar = struct {
     drag_dx: f32 = 0,
 
     pub fn currentWidth(self: *const Sidebar) f32 {
-        return if (self.collapsed) theme.sidebar_rail_w else self.width;
+        return if (self.collapsed) 0 else self.width;
     }
 
     pub fn toggle(self: *Sidebar) void {
@@ -103,25 +108,33 @@ pub const Sidebar = struct {
     pub fn draw(self: *Sidebar, ui: *Ui, height: f32, chrome: Chrome, ctx: Context) Result {
         var res: Result = .{};
         // The splitter is handled first so it wins over the rows beneath it.
-        const edge = self.currentWidth();
-        const grip: Rect = .{ .x = edge - 4, .y = theme.header_h, .w = 8, .h = height - theme.header_h };
-        const d = ui.drag(Ui.id("sidebar.split", 0), grip);
-        if (d.started) self.drag_dx = edge - ui.mx;
-        if (d.double_clicked) {
-            self.collapsed = false;
-            self.width = theme.sidebar_default_w;
-        } else if (d.dragging) {
-            const want = ui.mx + self.drag_dx;
-            if (want < 132) {
-                self.collapsed = true;
-            } else {
+        // Collapsed there is no edge to grab (the toggle in the band reopens
+        // it), except that the drag which collapsed it goes on, so it can be
+        // pulled open again without letting go.
+        const grip_id = Ui.id("sidebar.split", 0);
+        var grip_hot = false;
+        if (!self.collapsed or ui.active == grip_id) {
+            const edge = self.currentWidth();
+            const grip: Rect = .{ .x = edge - 4, .y = theme.header_h, .w = 8, .h = height - theme.header_h };
+            const d = ui.drag(grip_id, grip);
+            if (d.started) self.drag_dx = edge - ui.mx;
+            if (d.double_clicked) {
                 self.collapsed = false;
-                self.width = std.math.clamp(want, theme.sidebar_min_w, theme.sidebar_max_w);
+                self.width = theme.sidebar_default_w;
+            } else if (d.dragging) {
+                const want = ui.mx + self.drag_dx;
+                if (want < 132) {
+                    self.collapsed = true;
+                } else {
+                    self.collapsed = false;
+                    self.width = std.math.clamp(want, theme.sidebar_min_w, theme.sidebar_max_w);
+                }
             }
+            if (d.hover or d.dragging) ui.cursor = .resize_lr;
+            grip_hot = d.hover or d.dragging;
         }
-        if (d.hover or d.dragging) ui.cursor = .resize_lr;
 
-        if (self.collapsed) self.drawRail(ui, height, ctx) else self.drawFull(ui, height, chrome, ctx, &res);
+        if (self.collapsed) self.drawCollapsed(ui, chrome, &res) else self.drawFull(ui, height, chrome, ctx, &res);
         // A file let go over the sidebar but not over a row still lands
         // (on the selected project); the rail takes it the same way.
         if (ctx.dragging_file and ui.released and res.drop_file == null) {
@@ -129,9 +142,9 @@ pub const Sidebar = struct {
             if (ui.mouseIn(mine)) res.drop_file = .{ .gid = null };
         }
 
-        if (d.hover or d.dragging) {
+        if (grip_hot and !self.collapsed) {
             const w = self.currentWidth();
-            ui.dl.rect(.{ .x = w - 2, .y = theme.header_h, .w = 2, .h = height - theme.header_h }, theme.accent.alpha(if (d.dragging) 0.9 else 0.55));
+            ui.dl.rect(.{ .x = w - 2, .y = theme.header_h, .w = 2, .h = height - theme.header_h }, theme.accent.alpha(if (ui.active == grip_id) 0.9 else 0.55));
         }
         return res;
     }
@@ -378,62 +391,19 @@ pub const Sidebar = struct {
         }
     }
 
-    // ── collapsed rail ──────────────────────────────────────────────────
-    fn drawRail(self: *Sidebar, ui: *Ui, height: f32, ctx: Context) void {
+    // ── collapsed ───────────────────────────────────────────────────────
+    /// Nothing of the sidebar is on screen but its toggle, which sits in
+    /// the titlebar band right of the traffic lights; the first tab strip
+    /// starts after it (`Result.band_inset`). "+" is only in the header.
+    fn drawCollapsed(self: *Sidebar, ui: *Ui, chrome: Chrome, res: *Result) void {
         const dl = ui.dl;
-        const w = theme.sidebar_rail_w;
-        dl.rect(.{ .x = 0, .y = theme.header_h, .w = w, .h = height - theme.header_h }, theme.bg_side);
-        dl.rect(.{ .x = w - 1, .y = theme.header_h, .w = 1, .h = height - theme.header_h }, theme.line);
-
-        if (ctx.settings()) |s| return self.drawSettingsRail(ui, s);
-
-        // Just the expand button and the projects folder: both open the sidebar.
-        const Entry = struct { icon: icons.Icon, divider_before: bool = false };
-        const entries = [_]Entry{
-            .{ .icon = .sidebar },
-            .{ .icon = .folder, .divider_before = true },
-        };
-        var y: f32 = theme.header_h + 8;
-        for (entries, 0..) |e, i| {
-            if (e.divider_before) {
-                dl.rect(.{ .x = (w - 28) / 2, .y = y + 6, .w = 28, .h = 1 }, theme.line);
-                y += 13 + 4;
-            }
-            const r: Rect = .{ .x = (w - 44) / 2, .y = y, .w = 44, .h = 44 };
-            const st = ui.button(Ui.id("sidebar.rail", i), r);
-            ui.feedback(r, 8, st);
-            dl.icon(e.icon, r.x + 13, r.y + 13, 18, theme.text_2);
-            if (st.clicked) self.collapsed = false;
-            y += 44 + 4;
-        }
-    }
-
-    /// The menu folded to icons: the expand button, then one icon per page.
-    fn drawSettingsRail(self: *Sidebar, ui: *Ui, s: *settings_mod.SettingsTab) void {
-        const dl = ui.dl;
-        const w = theme.sidebar_rail_w;
-        var y: f32 = theme.header_h + 8;
-        {
-            const r: Rect = .{ .x = (w - 44) / 2, .y = y, .w = 44, .h = 44 };
-            const st = ui.button(Ui.id("sidebar.rail", 0), r);
-            ui.feedback(r, 8, st);
-            dl.icon(.sidebar, r.x + 13, r.y + 13, 18, theme.text_2);
-            if (st.clicked) self.collapsed = false;
-            y += 44 + 4;
-        }
-        dl.rect(.{ .x = (w - 28) / 2, .y = y + 6, .w = 28, .h = 1 }, theme.line);
-        y += 13 + 4;
-        for (settings_mod.sections) |sec| {
-            for (sec.pages) |page| {
-                const r: Rect = .{ .x = (w - 44) / 2, .y = y, .w = 44, .h = 44 };
-                const st = ui.button(Ui.id("sidebar.settings.rail", @intFromEnum(page)), r);
-                const selected = s.page == page;
-                if (selected) dl.rrect(r, 8, theme.accent.alpha(0.14)) else ui.feedback(r, 8, st);
-                dl.icon(page.icon(), r.x + 13, r.y + 13, 18, if (selected) theme.text else theme.text_2);
-                if (st.clicked) s.page = page;
-                y += 44 + 4;
-            }
-        }
+        const x: f32 = @max(12, chrome.inset_left + 8);
+        const toggle_r: Rect = .{ .x = x, .y = 8, .w = 36, .h = 36 };
+        const tb = ui.button(Ui.id("sidebar.toggle", 0), toggle_r);
+        ui.feedback(toggle_r, 8, tb);
+        dl.icon(.sidebar, toggle_r.x + 9, toggle_r.y + 9, 18, theme.text_2);
+        if (tb.clicked) self.collapsed = false;
+        res.band_inset = toggle_r.right() + 8;
     }
 };
 

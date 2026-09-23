@@ -37,7 +37,9 @@ pub const PaneView = struct {
     /// The tab being dragged by its title, if any.
     drag: ?tabbar.Drag = null,
 
-    pub fn draw(self: *PaneView, ui: *Ui, tabs: *tab_mod.TabManager, band: Rect, content: Rect, lights_inset: f32, files_visible: bool, window_focused: bool) Result {
+    /// `band_inset`: where the first strip may start (past the traffic
+    /// lights and the sidebar's toggle while the sidebar is collapsed).
+    pub fn draw(self: *PaneView, ui: *Ui, tabs: *tab_mod.TabManager, band: Rect, content: Rect, band_inset: f32, files_visible: bool, window_focused: bool) Result {
         const dl = ui.dl;
         var res: Result = .{};
         const cluster = tabbar.drawCluster(ui, band, files_visible);
@@ -99,7 +101,7 @@ pub const PaneView = struct {
             const body = parts[i].body;
             const focused = p.id == focused_id;
             const sr = tabbar.drawStrip(ui, strip, p, .{
-                .left_inset = if (parts[i].first) @max(16, lights_inset) else 12,
+                .left_inset = if (parts[i].first) @max(16, band_inset) else 12,
                 .focused = focused,
                 .show_info = focused,
             }, &self.drag);

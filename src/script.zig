@@ -18,10 +18,13 @@
 //!   project /path          add a folder as a project
 //!   open /path/file        open a file in a viewer tab
 //!   web https://…          open a website tab (no web view headless: the chrome only)
+//!   screen Paper | Desk    the connected displays, by name; the window is on the
+//!                          first one (Settings › Mode › Per screen). No name = none known
 //!   paste some text
 //!   snap /path/out.png
 const std = @import("std");
 const app_mod = @import("app.zig");
+const appearance = @import("appearance.zig");
 const apple = @import("apple.zig");
 const sys = @import("sys.zig");
 const EditCommand = @import("events.zig").EditCommand;
@@ -165,6 +168,18 @@ pub fn runHeadless(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
             _ = app.tabs.openWith("web", .{ .url = if (rest.len > 0) rest else null }) catch |err| {
                 std.debug.print("script: could not open a website tab: {s}\n", .{@errorName(err)});
             };
+        } else if (std.mem.eql(u8, cmd, "screen")) {
+            var names_buf: [16][]const u8 = undefined;
+            var n: usize = 0;
+            var parts = std.mem.splitSequence(u8, rest, "|");
+            while (parts.next()) |part| {
+                const name = std.mem.trim(u8, part, " \t");
+                if (name.len == 0 or n == names_buf.len) continue;
+                names_buf[n] = name;
+                n += 1;
+            }
+            appearance.setScreens(gpa, names_buf[0..n], if (n > 0) 0 else null);
+            app.invalidate();
         } else if (std.mem.eql(u8, cmd, "snap")) {
             pump(app, 40);
             app.snapshot(rest) catch |err| std.debug.print("snap failed: {s}\n", .{@errorName(err)});
