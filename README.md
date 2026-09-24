@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/screenshot.png" alt="tt: a project in the sidebar, a shell with three command blocks (one failed, with Fix with agent, Explain and Run again buttons), a Zig file open in a split pane, and the files panel showing git status" width="920">
+  <img src="docs/screenshot-workspace.jpg" alt="tt in use: a Jupyter notebook with a Plotly latency heatmap and a Python cell, a README open as Markdown source below it, a terminal where a plain-English request was answered by the agent with ls -la, and the files panel showing git status" width="920">
 </p>
 
 <h1 align="center">tt</h1>
@@ -29,10 +29,6 @@ It is a single native binary. No Electron, no Swift, no Objective-C sources: App
 CoreText and WebKit are driven straight from Zig through the Objective-C runtime.
 
 ## Features
-
-<p align="center">
-  <img src="docs/screenshot-workspace.jpg" alt="tt in use: a Jupyter notebook with a Plotly latency heatmap and a Python cell, a README open as Markdown source below it, a terminal where a plain-English request was answered by the agent with ls -la, and the files panel showing git status" width="920">
-</p>
 
 - **Local only (except for external AI agents).** Your shell, your files, your projects and your
   settings never leave this Mac. There is no account, no sync, no telemetry, no update check. The
@@ -280,9 +276,8 @@ zig build test                        # unit tests
 ```
 
 The script language (type, click, drag, open, split, snap…) is documented at the top of
-`src/script.zig`. The screenshot at the top of this page was rendered that way. A notebook opened
-from a script runs for real too, given a Python with `ipykernel`; `TT_DEBUG_EVENTS=1` prints what
-the kernel sends.
+`src/script.zig`. A notebook opened from a script runs for real too, given a Python with
+`ipykernel`; `TT_DEBUG_EVENTS=1` prints what the kernel sends.
 
 ## Status
 
