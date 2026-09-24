@@ -291,3 +291,249 @@ pub fn chip(ui: *Ui, id: u64, r: Rect, label: []const u8, selected: bool) bool {
 pub fn chipWidth(ui: *Ui, label: []const u8) f32 {
     return ui.text.measure(theme.font_chip, label) + 24;
 }
+
+// ── dropdown ────────────────────────────────────────────────────────────
+/// What a dropdown row shows before its label.
+pub const Swatch = union(enum) {
+    none,
+    /// A colour dot (the accent options).
+    dot: Color,
+    /// A theme in miniature: its background with four of its colours.
+    theme: struct { bg: Color, dots: [4]Color },
+    /// Two backgrounds side by side (following macOS: dark or light).
+    split: struct { left: Color, right: Color },
+};
+
+/// One row of a dropdown.
+pub const Choice = struct {
+    label: []const u8,
+    swatch: Swatch = .none,
+    /// A thin line above the row (a group of its own starts here).
+    sep_before: bool = false,
+};
+
+/// The dropdowns of one page. At most one menu is open. The page draws
+/// each dropdown's button where it goes (`dropdown`), and the open menu
+/// after everything else (`drawMenu`) so it lies on top; while one is
+/// open the page draws with the mouse off (`modal`), so nothing under the
+/// menu reacts. A pick made in the menu reaches the button's call on the
+/// next frame (it asks for one).
+pub const Dropdown = struct {
+    pub const max_choices = 48;
+    /// The open menu's dropdown, 0 = none.
+    open: u64 = 0,
+    anchor: Rect = .{},
+    choices: [max_choices]Choice = undefined,
+    count: usize = 0,
+    selected: ?usize = null,
+    /// The keyboard's row (↑/↓, ↵ picks it).
+    highlighted: ?usize = null,
+    scroll: f32 = 0,
+    /// Scroll the current choice into view on the next draw (just opened).
+    reveal: bool = false,
+    /// A choice made in the menu, waiting for its dropdown's call.
+    picked_id: u64 = 0,
+    picked: usize = 0,
+    last_mx: f32 = -1,
+    last_my: f32 = -1,
+
+    pub fn isOpen(self: *const Dropdown) bool {
+        return self.open != 0;
+    }
+
+    pub fn close(self: *Dropdown) void {
+        self.open = 0;
+    }
+
+    /// Keys while a menu is open: ↑/↓ move, ↵ picks, Esc closes. True
+    /// when the key was the menu's.
+    pub fn onEdit(self: *Dropdown, cmd: EditCommand) bool {
+        if (!self.isOpen()) return false;
+        switch (cmd) {
+            .cancel => self.close(),
+            .move_up => {
+                const cur = self.highlighted orelse self.selected orelse 0;
+                self.highlighted = if (cur == 0) self.count - 1 else cur - 1;
+            },
+            .move_down => {
+                const cur = self.highlighted orelse self.selected orelse self.count - 1;
+                self.highlighted = if (cur + 1 >= self.count) 0 else cur + 1;
+            },
+            .insert_newline => if (self.highlighted) |i| self.pick(i) else self.close(),
+            else => return false,
+        }
+        return true;
+    }
+
+    fn pick(self: *Dropdown, i: usize) void {
+        self.picked_id = self.open;
+        self.picked = i;
+        self.close();
+    }
+
+    /// Row height, the menu's inner padding and the gap between rows.
+    const row_h: f32 = 32;
+    const pad: f32 = 6;
+    const sep_h: f32 = 9;
+
+    /// The open menu, under its button (above it when there is no room
+    /// below), inside `bounds`. Call after the page is drawn, with the
+    /// mouse back on.
+    pub fn drawMenu(self: *Dropdown, ui: *Ui, bounds: Rect) void {
+        if (!self.isOpen()) return;
+        const dl = ui.dl;
+        const choices = self.choices[0..self.count];
+        var widest: f32 = 0;
+        var content_h: f32 = 0;
+        for (choices, 0..) |c, i| {
+            widest = @max(widest, ui.text.measure(theme.font_ui, c.label) + swatchWidth(c.swatch));
+            content_h += row_h + (if (c.sep_before and i > 0) sep_h else 0);
+        }
+        const w = @max(self.anchor.w, @min(widest + 30 + 20 + 2 * pad, bounds.w - 16));
+        const room_below = bounds.bottom() - 8 - (self.anchor.bottom() + 4);
+        const room_above = self.anchor.y - 4 - (bounds.y + 8);
+        const below = room_below >= @min(content_h + 2 * pad, 240) or room_below >= room_above;
+        const inner_h = @max(row_h, @min(content_h, (if (below) room_below else room_above) - 2 * pad));
+        const h = inner_h + 2 * pad;
+        const panel: Rect = .{
+            .x = std.math.clamp(self.anchor.right() - w, bounds.x + 8, @max(bounds.x + 8, bounds.right() - 8 - w)),
+            .y = if (below) self.anchor.bottom() + 4 else self.anchor.y - 4 - h,
+            .w = w,
+            .h = h,
+        };
+        ui.interactive.append(ui.gpa, panel) catch {};
+        if (ui.pressed and !panel.contains(ui.mx, ui.my)) {
+            // Its own button's press closes it too (and does not reopen it:
+            // the page drew with the mouse off).
+            self.close();
+            return;
+        }
+        theme.dropShadow(dl, panel, 8, 3, 5, 8, 0.08);
+        dl.shape(panel, 8, theme.bg_panel, 1, theme.line_strong);
+        const max_scroll = @max(0, content_h - inner_h);
+        self.scroll = std.math.clamp(self.scroll - ui.takeScroll(panel), 0, max_scroll);
+        // A long list opens with the current choice in the middle.
+        if (self.reveal) {
+            self.reveal = false;
+            if (self.selected) |sel| if (sel < choices.len) {
+                var top: f32 = 0;
+                for (choices[0..sel], 0..) |c, i| top += row_h + (if (c.sep_before and i > 0) sep_h else 0);
+                if (choices[sel].sep_before and sel > 0) top += sep_h;
+                self.scroll = std.math.clamp(top + row_h / 2 - inner_h / 2, 0, max_scroll);
+            };
+        }
+        // The keyboard's row stays in view.
+        if (self.highlighted) |hl| if (!ui.mouseIn(panel)) {
+            var top: f32 = 0;
+            for (choices[0..hl], 0..) |c, i| top += row_h + (if (c.sep_before and i > 0) sep_h else 0);
+            if (choices[hl].sep_before and hl > 0) top += sep_h;
+            if (top < self.scroll) self.scroll = top;
+            if (top + row_h > self.scroll + inner_h) self.scroll = top + row_h - inner_h;
+        };
+        const inner: Rect = .{ .x = panel.x, .y = panel.y + pad, .w = panel.w, .h = inner_h };
+        dl.pushClip(inner);
+        defer dl.popClip();
+        // The mouse takes over the highlight only when it moves.
+        const moved = ui.mx != self.last_mx or ui.my != self.last_my;
+        self.last_mx = ui.mx;
+        self.last_my = ui.my;
+        var y = inner.y - self.scroll;
+        for (choices, 0..) |c, i| {
+            if (c.sep_before and i > 0) {
+                dl.rect(.{ .x = panel.x + pad + 4, .y = y + sep_h / 2, .w = panel.w - 2 * pad - 8, .h = 1 }, theme.line);
+                y += sep_h;
+            }
+            const r: Rect = .{ .x = panel.x + pad, .y = y, .w = panel.w - 2 * pad, .h = row_h };
+            y += row_h;
+            if (r.bottom() <= inner.y or r.y >= inner.bottom()) continue;
+            const st = ui.button(Ui.id("field.dropdown.row", i), r);
+            if (st.hover and moved) self.highlighted = i;
+            if (st.held) {
+                dl.rrect(r, 6, theme.pressed);
+            } else if (self.highlighted == i) dl.rrect(r, 6, theme.highlight);
+            if (self.selected == i) dl.icon(.check, r.x + 8, r.centerY() - 7, 14, theme.accent);
+            const sx = r.x + 30;
+            drawSwatch(dl, c.swatch, sx, r.centerY());
+            _ = dl.textEllipsis(theme.font_ui, sx + swatchWidth(c.swatch), r.centerY(), c.label, r.right() - 10 - sx - swatchWidth(c.swatch), theme.text);
+            if (st.clicked) {
+                self.pick(i);
+                ui.wants_frame = true;
+            }
+        }
+        if (max_scroll > 0) {
+            // A thin thumb at the right edge says there is more.
+            const th = @max(24, inner_h * inner_h / content_h);
+            const ty = inner.y + (inner_h - th) * (self.scroll / max_scroll);
+            dl.rrect(.{ .x = panel.right() - 5, .y = ty, .w = 3, .h = th }, 1.5, theme.line_strong);
+        }
+    }
+};
+
+fn swatchWidth(s: Swatch) f32 {
+    return switch (s) {
+        .none => 0,
+        .dot => 22,
+        .theme, .split => 44,
+    };
+}
+
+fn drawSwatch(dl: anytype, s: Swatch, x: f32, cy: f32) void {
+    switch (s) {
+        .none => {},
+        .dot => |c| dl.circle(x + 7, cy, 7, c),
+        .theme => |t| {
+            const r: Rect = .{ .x = x, .y = cy - 9, .w = 34, .h = 18 };
+            dl.shape(r, 4, t.bg, 1, theme.line_strong);
+            for (t.dots, 0..) |c, i| dl.circle(r.x + 7 + @as(f32, @floatFromInt(i)) * 6.7, cy, 2.6, c);
+        },
+        .split => |sp| {
+            const r: Rect = .{ .x = x, .y = cy - 9, .w = 34, .h = 18 };
+            dl.rrect(r, 4, sp.right);
+            dl.rrect(.{ .x = r.x, .y = r.y, .w = r.w / 2 + 4, .h = r.h }, 4, sp.left);
+            dl.rect(.{ .x = r.x + r.w / 2, .y = r.y, .w = 4, .h = r.h }, sp.right);
+            dl.border(r, 4, 1, theme.line_strong);
+        },
+    }
+}
+
+/// A dropdown: a button that shows the current choice and opens the menu
+/// of `choices` (drawn later by `dd.drawMenu`). Returns the index picked,
+/// once, on the frame after the pick.
+pub fn dropdown(ui: *Ui, dd: *Dropdown, id: u64, r: Rect, choices: []const Choice, selected: ?usize) ?usize {
+    const dl = ui.dl;
+    const st = ui.button(id, r);
+    const open = dd.open == id;
+    dl.shape(r, 7, if (st.held) theme.pressed else if (st.hover or open) theme.hover else theme.bg_block, 1, if (open) theme.accent.alpha(0.6) else theme.line_strong);
+    if (selected) |i| if (i < choices.len) {
+        const c = choices[i];
+        drawSwatch(dl, c.swatch, r.x + 10, r.centerY());
+        const tx = r.x + 10 + swatchWidth(c.swatch);
+        _ = dl.textEllipsis(theme.font_ui, tx, r.centerY(), c.label, r.right() - 30 - tx, theme.text);
+    };
+    dl.icon(.chevron_down, r.right() - 24, r.centerY() - 7, 14, if (st.hover or open) theme.text else theme.text_3);
+    if (open) {
+        // Kept current while open: labels and colours follow a scheme change.
+        dd.anchor = r;
+        dd.count = @min(choices.len, Dropdown.max_choices);
+        @memcpy(dd.choices[0..dd.count], choices[0..dd.count]);
+        dd.selected = selected;
+    }
+    if (st.clicked and !open) {
+        dd.open = id;
+        dd.anchor = r;
+        dd.count = @min(choices.len, Dropdown.max_choices);
+        @memcpy(dd.choices[0..dd.count], choices[0..dd.count]);
+        dd.selected = selected;
+        dd.highlighted = null;
+        dd.scroll = 0;
+        dd.reveal = true;
+        dd.last_mx = ui.mx;
+        dd.last_my = ui.my;
+        ui.wants_frame = true;
+    }
+    if (dd.picked_id == id) {
+        dd.picked_id = 0;
+        return dd.picked;
+    }
+    return null;
+}

@@ -98,12 +98,12 @@ pub fn fileDrag(ui: *Ui, name: []const u8) Drag {
     return d;
 }
 
-pub const tab_pad: f32 = 12;
 const tab_gap: f32 = 4;
 const max_title_w: f32 = 220;
 const min_title_w: f32 = 36;
-/// The hover pill behind a tab and the ghost that follows a drag.
-const pill_h: f32 = 34;
+// `theme.tab_pad` pads a title either side; `theme.tab_pill_h` is the
+// hover pill behind a tab and the ghost that follows a drag (both
+// smaller in compact mode).
 /// Moving this far (points) from the press turns a click into a drag.
 const drag_threshold: f32 = 5;
 
@@ -114,10 +114,11 @@ pub fn drawCluster(ui: *Ui, band: Rect, files_visible: bool) Cluster {
     var right = band.right() - 16;
     var res: Cluster = .{ .right = right };
     {
-        const r: Rect = .{ .x = right - 34, .y = band.y + (band.h - 34) / 2, .w = 34, .h = 34 };
+        const b = theme.tab_pill_h;
+        const r: Rect = .{ .x = right - b, .y = band.y + (band.h - b) / 2, .w = b, .h = b };
         const st = ui.button(Ui.id("tabbar.files", 0), r);
-        ui.feedback(r, 8, st);
-        dl.icon(.folder, r.x + 8, r.y + 8, 18, if (files_visible or st.hover) theme.text else theme.text_3);
+        ui.feedback(r, theme.row_radius, st);
+        dl.icon(.folder, r.x + (b - 18) / 2, r.y + (b - 18) / 2, 18, if (files_visible or st.hover) theme.text else theme.text_3);
         if (st.clicked) res.toggle_files = true;
         right = r.x - 12;
     }
@@ -138,7 +139,7 @@ pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag
     const tabs = pane.tabs.items;
     const left = rect.x + opts.left_inset;
     const right = rect.right() - 12;
-    const plus_w: f32 = 17 * 0.6 + 2 * tab_pad;
+    const plus_w: f32 = 17 * 0.6 + 2 * theme.tab_pad;
 
     // Measure titles; shrink evenly if they do not fit.
     var title_bufs: [64][96]u8 = undefined;
@@ -167,7 +168,7 @@ pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag
         for (0..count) |i| widths[i] = @min(widths[i], per);
     }
 
-    const pill_y = rect.y + (rect.h - pill_h) / 2;
+    const pill_y = rect.y + (rect.h - theme.tab_pill_h) / 2;
     var x = left;
     // Where a dragged tab would be inserted: before the first tab whose
     // middle is right of the pointer, else after the last one.
@@ -204,8 +205,8 @@ pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag
         if (st.clicked and drag.* == null) res.activate = i;
 
         const fade: f32 = if (being_dragged) 0.3 else 1;
-        if (st.hover and !active and drag.* == null) dl.rrect(.{ .x = r.x, .y = pill_y, .w = r.w, .h = pill_h }, 8, theme.hover);
-        var tx = r.x + tab_pad;
+        if (st.hover and !active and drag.* == null) dl.rrect(.{ .x = r.x, .y = pill_y, .w = r.w, .h = theme.tab_pill_h }, theme.row_radius, theme.hover);
+        var tx = r.x + theme.tab_pad;
         if (status != .none) {
             const c = switch (status) {
                 .running => theme.teal,
@@ -231,14 +232,14 @@ pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag
     }
     if (insert_at == count) marker_x = if (count == 0) left else x - tab_gap / 2;
     if (drag.*) |*d| {
-        if (ui.mouseIn(rect)) d.target = .{ .strip = .{ .pane = pane.id, .index = insert_at, .x = marker_x, .y = pill_y + 4, .h = pill_h - 8 } };
+        if (ui.mouseIn(rect)) d.target = .{ .strip = .{ .pane = pane.id, .index = insert_at, .x = marker_x, .y = pill_y + 4, .h = theme.tab_pill_h - 8 } };
     }
 
     // "+" new tab.
     {
         const r: Rect = .{ .x = x, .y = rect.y, .w = plus_w, .h = rect.h };
         const st = ui.button(Ui.id("tabbar.new", pane.id), r);
-        if (st.hover) dl.rrect(.{ .x = r.x, .y = pill_y, .w = r.w, .h = pill_h }, 8, theme.hover);
+        if (st.hover) dl.rrect(.{ .x = r.x, .y = pill_y, .w = r.w, .h = theme.tab_pill_h }, theme.row_radius, theme.hover);
         dl.icon(.plus, r.x + (r.w - 15) / 2, r.centerY() - 7.5, 15, if (st.hover) theme.text else theme.text_3);
         if (st.clicked) res.new_tab = true;
         x += plus_w;
@@ -248,7 +249,7 @@ pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag
     {
         const r: Rect = .{ .x = x, .y = rect.y, .w = plus_w, .h = rect.h };
         const st = ui.button(Ui.id("tabbar.web", pane.id), r);
-        if (st.hover) dl.rrect(.{ .x = r.x, .y = pill_y, .w = r.w, .h = pill_h }, 8, theme.hover);
+        if (st.hover) dl.rrect(.{ .x = r.x, .y = pill_y, .w = r.w, .h = theme.tab_pill_h }, theme.row_radius, theme.hover);
         dl.icon(.globe, r.x + (r.w - 15) / 2, r.centerY() - 7.5, 15, if (st.hover) theme.text else theme.text_3);
         if (st.clicked) res.new_web_tab = true;
         x += plus_w;
@@ -282,11 +283,11 @@ pub fn drawDrag(ui: *Ui, d: *const Drag) void {
             dl.border(r, 8, 1, theme.accent.alpha(0.55));
         },
     };
-    const r: Rect = .{ .x = ui.mx - d.grab_dx, .y = ui.my - pill_h / 2, .w = d.w, .h = pill_h };
+    const r: Rect = .{ .x = ui.mx - d.grab_dx, .y = ui.my - theme.tab_pill_h / 2, .w = d.w, .h = theme.tab_pill_h };
     dl.rrect(.{ .x = r.x + 1, .y = r.y + 2, .w = r.w, .h = r.h }, 8, theme.bg.alpha(0.5));
     dl.shape(r, 8, theme.bg_panel, 1, theme.line_strong);
-    var tx = r.x + tab_pad;
-    var title_w = d.w - 2 * tab_pad;
+    var tx = r.x + theme.tab_pad;
+    var title_w = d.w - 2 * theme.tab_pad;
     if (d.has_dot) {
         dl.circle(tx + 3.5, r.centerY(), 3.5, theme.text_3);
         tx += 15;
@@ -296,7 +297,7 @@ pub fn drawDrag(ui: *Ui, d: *const Drag) void {
 }
 
 fn tabWidth(title_w: f32, has_dot: bool) f32 {
-    return tab_pad * 2 + title_w + (if (has_dot) @as(f32, 15) else 0);
+    return theme.tab_pad * 2 + title_w + (if (has_dot) @as(f32, 15) else 0);
 }
 
 fn sum(values: []const f32) f32 {

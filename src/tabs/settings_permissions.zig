@@ -1,4 +1,4 @@
-//! Settings › Permissions: what websites in tabs may use. Two pages —
+//! Settings › Browser: what websites in tabs may use. Two pages —
 //! Camera & microphone, Notifications — each with the same three parts:
 //! what macOS lets tt do (every app needs its own yes from macOS first),
 //! what a website gets when it asks (Ask / Allow / Block, config.browser),
@@ -19,7 +19,7 @@ const Rect = ui_mod.Rect;
 const Color = ui_mod.Color;
 
 const row_h: f32 = 40;
-const card_pad = theme.block_pad_x;
+const card_pad: f32 = 18; // the regular block padding, in compact mode too
 /// Height of a card's title and hint lines.
 const card_head: f32 = 70;
 

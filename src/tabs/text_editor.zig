@@ -18,6 +18,7 @@ const Position = @import("tab.zig").Position;
 const lexer = @import("../syntax/lexer.zig");
 const Document = @import("../input/document.zig").Document;
 const EditCommand = @import("../events.zig").EditCommand;
+const links = @import("../links.zig");
 
 const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
@@ -311,6 +312,33 @@ pub const TextEditor = struct {
         }
     }
 
+    /// The byte (in line `i`) of the character drawn over column `col`;
+    /// null past the line's end.
+    fn byteUnder(self: *const TextEditor, i: usize, col: usize) ?usize {
+        const line = self.doc.lineText(i);
+        var acc: usize = 0;
+        var it = gfx_text.Utf8Iter{ .bytes = line };
+        while (true) {
+            const at = it.index;
+            const cp = it.next() orelse return null;
+            const w = advanceOf(cp, acc);
+            if (col < acc + w) return at;
+            acc += w;
+        }
+    }
+
+    /// The link under a point of the text area: its line and bytes there.
+    fn linkAt(self: *const TextEditor, mx: f32, my: f32, body: Rect, text_x0: f32, cell: f32) ?struct { line: usize, span: links.Span } {
+        const rel_y = my - body.y - self.pad_top + self.scroll;
+        const rel_x = mx - text_x0 + self.scroll_x;
+        if (rel_y < 0 or rel_x < 0) return null;
+        const i: usize = @intFromFloat(@floor(rel_y / line_h));
+        if (i >= self.doc.lineCount()) return null;
+        const at = self.byteUnder(i, @intFromFloat(@floor(rel_x / cell))) orelse return null;
+        const span = links.textSpanAt(self.doc.lineText(i), at) orelse return null;
+        return .{ .line = i, .span = span };
+    }
+
     /// The line under a point of the body (clamped to the text).
     fn lineAt(self: *const TextEditor, my: f32, body: Rect) usize {
         const rel_y = @max(0, my - body.y - self.pad_top + self.scroll);
@@ -362,6 +390,11 @@ pub const TextEditor = struct {
         const hbar_pad = text_area.w - visible_w;
         if (sidebar.scrollbarDrag(ui, vbar, .vertical, body, self.scroll, self.content_h)) |s| self.scroll = s;
         if (sidebar.scrollbarDrag(ui, hbar, .horizontal, hbar_area, self.scroll_x, self.contentW(cell) + hbar_pad)) |s| self.scroll_x = s;
+
+        // A link under the pointer: ⌘/⌃-click opens it, before the caret,
+        // a selection or the ⌃-click's menu can take the press.
+        const link = if (ui.mouseIn(text_area)) self.linkAt(ui.mx, ui.my, body, text_x0, cell) else null;
+        if (link) |lk| _ = ui.link(doc.lineText(lk.line)[lk.span.start..lk.span.end]);
 
         // Mouse: caret, word, line, drag selection. A drag past an edge
         // scrolls the view that way, so a selection can grow off screen.
@@ -488,10 +521,13 @@ pub const TextEditor = struct {
                     if (sel) |s| if (ls + at >= s[0] and ls + at < s[1]) {
                         dl.rect(.{ .x = cx, .y = y + 1, .w = cw, .h = line_h - 2 }, theme.selection());
                     };
+                    const on_link = if (link) |lk| lk.line == i and lk.span.contains(at) else false;
                     if (cp != '\t' and cp != ' ') {
                         const scope = self.spans.scopeAt(&cur, at);
-                        _ = dl.glyph(font, cp, @round(cx * scale), baseline_px, theme.scopeColor(scope), clip);
+                        const color = if (on_link and ui.linkModifier()) theme.scopeColor(.link) else theme.scopeColor(scope);
+                        _ = dl.glyph(font, cp, @round(cx * scale), baseline_px, color, clip);
                     }
+                    if (on_link) dl.rect(.{ .x = cx, .y = y + line_h - 4, .w = cw, .h = 1 }, theme.scopeColor(.link));
                 }
                 col += w;
             }

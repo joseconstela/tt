@@ -5,7 +5,7 @@
 <h1 align="center">tt</h1>
 
 <p align="center">
-  A calm, block-based terminal for macOS.<br>
+  A calm, block-based ide/browser/terminal for macOS.<br>
   Written in Zig, drawn with Metal, running your real shell.
 </p>
 
@@ -20,81 +20,29 @@
 
 ---
 
-tt treats every command as a **block**: the command, its output, how long it took and whether it
-failed, in one card you can collapse, copy or run again. Around the shell sit the things you reach
-for while you work: the files of the project, a real text editor, Markdown notes, Jupyter notebooks,
-images and PDFs, a browser tab, git. All of it in one window that comes back exactly as you left it when you relaunch.
-
-It is a single native binary. No Electron, no Swift, no Objective-C sources: AppKit, Metal,
-CoreText and WebKit are driven straight from Zig through the Objective-C runtime.
+No Electron, no Swift, no Objective-C sources: AppKit, Metal,
+CoreText, WebKit, AVFoundation and others are driven straight from Zig through the Objective-C runtime.
 
 ## Features
 
-- **Local only (except for external AI agents).** Your shell, your files, your projects and your
+- **Local only.** (except for external AI agents & Apple's voice recognition if you decide to use it). Your shell, your files, your projects and your
   settings never leave this Mac. There is no account, no sync, no telemetry, no update check. The
   only thing that ever goes out is what you choose to send to an AI agent you configured yourself,
   and with a local model (Ollama) not even that. Nothing is configured out of the box.
   [The full list is below.](#what-stays-local-and-what-does-not)
-- **Blocks instead of a scrollback.** Live status and duration per command, ANSI colours
-  (16 / 256 / true colour), `\r` progress bars and cursor-up redraws, soft wrapping that reflows
-  with the window, long output folded, text selection, *Copy output* and *Run again*. A failed
-  command gets a red outline and its own action row.
-- **Your real shell.** tt runs your zsh with your dotfiles, aliases, functions, `cd` state and
-  environment. Two shell hooks mark where a command starts and ends; nothing else is touched.
-- **An input box, not a prompt.** Caret and selection, your Cocoa key bindings, IME and dead keys,
-  multi-line with ⇧↵, history with ↑/↓ and fish-style ghost suggestions from history and from the
-  filesystem (Tab accepts). While a program runs, the box feeds its stdin.
-- **Projects.** Add a folder to the sidebar and it becomes a project with tabs of its own, plus
-  shell groups and pinned files underneath. Click a project and a shell starts in its folder.
-- **A files panel with three views.** The current directory as a live tree with git status
-  colours and the usual menus (new, rename, delete to Trash, reveal, open with…, drag and drop);
-  find-in-files with match case, whole word, regex and replace; and a git view to stage, commit,
-  discard, fetch, pull, push and switch branches.
-- **Split panes.** Drag a tab to a pane's edge to split it (or ⌘D / ⌘⇧D), between strips to move
-  it, or drop a file from the panel straight into a pane. The same model as VS Code's editor groups.
-- **Files open in place.** A real text editor (undo, IME, auto-indent, syntax colours for
-  27 languages), an Obsidian-style Markdown editor whose preview stays editable (tables in cells,
-  inline HTML and entities rendered), images with EXIF rotation and 1:1 zoom, and PDFs rendered
-  page by page. Viewers pick the file by its bytes first
-  and its extension second, so a renamed PNG still opens as a picture.
-- **Notebooks.** A `.ipynb` opens as a column of cells run by a real Jupyter kernel: the Python of
-  the nearest `.venv`, else one that has `ipykernel`. The kernel picker in the tab's toolbar lists
-  every Python on the Mac, switches the notebook to another one (or another kernelspec) and
-  installs `ipykernel` into those that lack it; Run all, Restart, Interrupt and Clear outputs sit
-  beside it. Outputs are drawn natively (coloured text, tracebacks, PNG figures, DataFrames as
-  tables); interactive Plotly figures, HTML and SVG outputs show in a small web view inside the
-  cell, with Plotly's library bundled so they work offline. `input()` works, and a `%%sh` cell is
-  a shell block. New cells are typed into the input
-  row at the bottom (py / sh / md / ask) and ⇧↵ runs them; the *ask* kind puts the notebook in
-  front of your agent, which answers under the question and can draft a cell for you to run. A
-  failed cell offers *Fix with agent*, *Explain* and *Run again*, as a failed command does. A
-  Variables panel lists the kernel's names, types and memory. The bar at the left edge of a cell's
-  input or outputs folds it, as in Jupyter Lab, and the fold is saved the way Jupyter saves it.
-  Files are nbformat 4, written as Jupyter writes them.
-- **Websites.** A tab with an address bar and the system WebKit behind it (⌘⇧N), *Inspect
-  Element*, and a context menu that sends the selected text to the shell. Web apps work as they do
-  in Safari, video calls included (Teams, Meet …): a site that wants the camera, the microphone or
-  to show notifications asks in a bar under the address bar, and the answer is kept for that site.
-  Notifications land in Notification Center with the site's icon and bring its tab back when
-  clicked; screen sharing goes through macOS's own picker; links that open a new window open a
-  tab. The bell in the address bar, or *Settings › Permissions*, changes or removes what a site was
-  allowed.
+- **Block-based terminal,** yet compatible with AI agents. Built in support for "fix with agent", explain, etc.
+- **An input box, not a prompt.** You can enter both commands or plain text asking for a commant to run.
+- **Projects.** Add a folder to the sidebar and it becomes a project with tabs of its own. Arrange tabs, split and arrange them, pin files, and others.
+- **Native contents.** Obsidian-style as Markdown editor whose preview stays editable (tables in cells,
+  inline HTML and entities rendered), image, PDFs rendered
+  page by page.
+- **Native Notebooks.** Native ZeroMQ python notbook support for `.ipynb` files with kernel selection and built-in AI helpers. All ourput formats supported (native or HTML rendered via WebKit).
+- **Websites.** Fully capable builtin browser, with basic privacy rules, support for webcam, microphone interactions, etc.
 - **Full-screen programs.** vim, htop, less, fzf, ssh, REPLs and Claude Code take over the whole
   tab on Ghostty's terminal core and hand it back when they exit.
-- **Ask an agent (opt-in).** Pick a model under *Settings › AI* and a line the shell does not know
-  (`how big is this folder`) becomes a question, with the tab's recent commands and output as
-  context. The agent can propose a command; it lands in the input box for you to run, never runs
-  on its own. A failed block gets **Explain** and **Fix with agent**, which launches the coding
-  agent installed on your Mac (Claude Code, Codex, Gemini CLI, OpenCode, Copilot CLI, Cursor
-  Agent, Aider or Goose) inside your shell.
-- **⌘K and ⌘P.** A command palette over commands, open tabs, shell history and the accent colour,
-  and a quick-open over every file of the workspace with `name:line:col`.
-- **Everything survives a relaunch.** Tabs, panes and their sizes, focus, each shell's directory
-  and its blocks come back where they were.
-- **Dark, Light, System and E-ink.** Four modes and an accent of your choice. E-ink is pure black on
-  white with no colour and no blinking, for e-paper displays. Each display can have a mode of its
-  own (*Settings › Mode › Per screen*): the window switches when you move it there, and only tt
-  changes, never macOS.
+- **⌘K.** A fully featured command palette over commands, open tabs, shell history, goto file, etc. 
+- **Styles: tt's own, E-ink, and classic terminal themes.** Plus most common themes. Configurable per-monitor.
+- **Physical world interactions.** Blurr the screen when looking away, control with your voice, etc.
 
 ## Getting started
 
@@ -118,67 +66,22 @@ The first build fetches tt's one dependency, [libghostty-vt](https://github.com/
 pinned by commit in `build.zig.zon` (about 130 MB unpacked into the git-ignored `zig-pkg/`). If that
 first fetch errors out, run `zig build` again.
 
-## Keyboard
-
-| Keys | Action |
-| --- | --- |
-| ⌘T · ⌘N · ⌘⇧N | New terminal tab · new empty tab · new website tab |
-| ⌘W | Close tab |
-| ⌘1–9 · ⌘⇧[ ⌘⇧] · ⌃Tab | Switch tabs |
-| ⌘D · ⌘⇧D | Split right · split down |
-| ⌘[ · ⌘] | Focus previous · next pane |
-| ⌘K | Command palette |
-| ⌘P | Go to file |
-| ⌘⇧F | Find in files |
-| ⌘B · ⌘⇧E | Toggle sidebar · files panel |
-| ⌘⇧O | Add a folder as a project |
-| ⌘E | Markdown: preview ⇄ source · Notebook: variables & kernel panel |
-| ⇧↵ | Notebook: run the cell and move on · input row: run the text as a new cell |
-| ⌘S | Save |
-| ⌃L | Clear blocks |
-| ⌘L · ⌘R · ⌘← ⌘→ | Website tab: open location · reload · back, forward |
-| ⌘, | Settings |
-
-Every command is also in the palette, with its shortcut next to it.
-
-## What stays local, and what does not
+## What stays local
 
 tt keeps its state in three plain files in your home directory, and nowhere else:
 
 | File | Holds |
 | --- | --- |
-| `~/.tt/config.yml` | Mode, accent, a mode per display, the model APIs you added (name, provider, model, key, base URL), which features use them, notebook options |
+| `~/.tt/config.yml` | Style, accent, a style per display, the model APIs you added (name, provider, model, key, base URL), which features use them, notebook options |
 | `~/.tt_projects` | Your projects, their pinned files and shell groups |
 | `~/.tt_workspace` | Open tabs, pane layout, each shell's directory and its blocks, each notebook's outputs |
 
 The config file is readable YAML meant to be edited by hand. It also holds your API keys in the
 clear, so treat it like any other credentials file.
 
-This is everything that talks to the network:
-
-- **AI agents you set up.** Anthropic, OpenAI, Google, Mistral, Ollama on localhost, or any
-  OpenAI-compatible endpoint. tt contacts them only when you ask: a plain-English line in the
-  input box, *Explain* on a failed block or cell, or an *ask* cell in a notebook. What it sends is your
-  question plus the tab's transcript (recent commands, the last lines of their output, exit
-  codes; for a notebook its cells, the last lines of their outputs and, unless you switch it off,
-  the names and types of the kernel's variables, never their values). A fresh install has no agent
-  and makes no requests.
-- **Notebook kernels.** A `.ipynb` runs in a Jupyter kernel started on this Mac with the
-  notebook's own Python. The Jupyter protocol between tt and that kernel runs over sockets bound
-  to 127.0.0.1, as it does under Jupyter Lab; nothing leaves the machine.
-- **Website tabs.** The pages you open, through the system WebKit, as Safari would load them. A
-  page gets the camera or the microphone only after you allow it (and macOS asks tt first); its
-  notifications go to Notification Center and nowhere else, with the site's icon fetched from the
-  site itself.
-- **Coding agents.** *Fix with agent* launches a tool that is already installed on your Mac inside
-  your shell. What that tool does online is between you and it.
-- **`pip`.** *Install* in a notebook's kernel picker runs `pip install ipykernel` with the Python
-  you chose, which fetches from PyPI. Nothing is installed unless you press it.
-- **`zig build`** fetches libghostty-vt once.
-
 There is no crash reporter, no usage ping and no "check for updates".
 
-## How it works
+## How it works (the basics)
 
 **Blocks from a real shell.** `assets/shell/tt.zsh` installs a `preexec` and a `precmd` hook that
 print invisible marks (the OSC 133 convention other terminals use): output starts, finished with
@@ -208,65 +111,6 @@ works, and the file stays plain nbformat 4.
 into pointer + vtable at comptime (the shape of `std.mem.Allocator`) and registered with the tab
 manager. Viewers add one function that says whether they want a file.
 
-### Source map
-
-```
-src/
-  main.zig             entry point and CLI flags (--script, --probe)
-  app.zig              platform-neutral core: layout, event routing, frames
-  platform/cocoa.zig   NSApplication, window, Metal layer, menus, IME, hosted WebKit views
-  gfx/                 renderer, shaders, text atlas, icons, images, textures
-  ui/                  theme, sidebar, tab strips, panes, palette, files / search / git panels
-  tabs/                the tab kinds: terminal, text editor, Markdown, notebook, image, PDF, website, settings
-  notebook/            nbformat reader/writer and the Jupyter kernel behind a notebook tab
-  term/                pty, VT parser, block buffer, session, the libghostty-vt seam, shell integration
-  input/               editor model, history, path suggestions
-  syntax/              per-line lexers for 27 languages and Markdown
-  agent.zig            requests to the model APIs, streamed replies, the propose_command tool
-  coding_agents.zig    which coding agents are installed and how to launch them
-  config.zig · projects.zig · workspace.zig   the three files under ~
-assets/
-  fonts/               Spline Sans + Spline Sans Mono (SIL Open Font License)
-  shell/tt.zsh         the block-mark hooks
-  notebook/tt_jupyter.py  the Jupyter bridge: starts a kernel with jupyter_client, JSON lines over pipes
-```
-
-## Extending
-
-**A new kind of tab** is any struct with `kind_label`, `create`, `deinit` and `draw`; every other
-hook (`title`, `status`, `tick`, `onText`, `copy`, `paste`, `save`…) has a default:
-
-```zig
-pub const SqliteTab = struct {
-    pub const kind_label = "SQLite";
-    pub fn create(env: *tab.Env, args: tab.OpenArgs) anyerror!tab.Tab { ... return tab.Tab.from(SqliteTab, self); }
-    pub fn deinit(self: *SqliteTab) void { ... }
-    pub fn draw(self: *SqliteTab, ui: *Ui, rect: Rect, focused: bool) void { ... }
-};
-
-// app.zig
-self.tabs.register(.{ .name = "sqlite", .label = "SQLite", .create = SqliteTab.create });
-_ = try self.tabs.openWith("sqlite", .{ .path = "/some/file.db" });
-```
-
-The notebook tab (`src/tabs/notebook_tab.zig`) is exactly this shape, with a kernel process behind it.
-
-**A viewer for another file format** is a tab kind with one more function, `accepts(path, head)`,
-judged on the file's path and first kilobyte. Kinds are asked in registration order and the first
-taker wins, so register it before the plain text editor, which accepts everything:
-
-```zig
-pub fn accepts(path: []const u8, head: []const u8) bool {
-    return std.mem.startsWith(u8, head, "SQLite format 3\x00") or filetype.hasExtension(path, &.{ "db", "sqlite" });
-}
-
-// app.zig, before the "file" kind
-self.tabs.register(.{ .name = "sqlite", .label = "SQLite", .create = SqliteTab.create, .accepts = SqliteTab.accepts });
-```
-
-`src/tabs/viewer.zig` has the chrome viewers share, and `src/filetype.zig` the magic numbers, so a
-format's signature is written once.
-
 ## Testing
 
 ```sh
@@ -281,10 +125,9 @@ The script language (type, click, drag, open, split, snap…) is documented at t
 
 ## Status
 
-Early and moving fast: version 0.1.0, macOS only. Settings › AI › MCPs is a placeholder for now.
+Early and moving fast.
 
-Built on [libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation and
-[Spline Sans](https://github.com/SorkinType/SplineSans) for type.
+Built on [libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation.
 
 ## License
 

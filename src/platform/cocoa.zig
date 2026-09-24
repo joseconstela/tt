@@ -16,6 +16,8 @@ const TerminalTab = @import("../tabs/terminal_tab.zig").TerminalTab;
 const NotebookTab = @import("../tabs/notebook_tab.zig").NotebookTab;
 const notify = @import("notify.zig");
 const cfg_mod = @import("../config.zig");
+const camera = @import("camera.zig");
+const camera_controller = @import("../physical/camera_controller.zig");
 
 const id = objc.id;
 const SEL = objc.SEL;
@@ -52,6 +54,10 @@ const Globals = struct {
     /// The scheme the window's own appearance (titlebar, native panels)
     /// was last matched to.
     applied_scheme: ?theme.Scheme = null,
+    /// `theme.generation` when the window last followed the tokens.
+    applied_generation: u32 = 0,
+    /// Whether the titlebar was last sized for compact mode.
+    applied_compact: bool = false,
     debug_events: bool = false,
     selftest: bool = false,
     selftest_step: u32 = 0,
@@ -72,6 +78,7 @@ pub fn run(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
     g.nsapp = msg(id, objc.class("NSApplication"), "sharedApplication", .{});
     msg(void, g.nsapp, "setActivationPolicy:", .{@as(NSInteger, 0)});
     g.view_class = registerViewClass();
+    blur_class = registerBlurViewClass();
     const delegate = msg(id, msg(id, registerDelegateClass(), "alloc", .{}), "init", .{});
     msg(void, g.nsapp, "setDelegate:", .{delegate});
     msg(void, g.nsapp, "run", .{});
@@ -131,7 +138,7 @@ fn syncScreens() void {
     if (g.debug_events or g.selftest) {
         std.debug.print("screens:", .{});
         for (appearance.screenNames(), 0..) |name, k| std.debug.print(" [{s}]{s}", .{ name, if (current == k) "*" else "" });
-        std.debug.print(" → mode {s}\n", .{@tagName(appearance.effectiveMode())});
+        std.debug.print(" → mode {s}\n", .{appearance.effectiveMode().configName()});
     }
     app.invalidate();
 }
@@ -198,12 +205,13 @@ fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
     msg(void, window, "setDelegate:", .{self});
 
     // An empty unified toolbar makes the titlebar 52pt tall — the height of the
-    // design's header row — and centres the traffic lights in it.
+    // design's header row — and centres the traffic lights in it; in compact
+    // mode the unified-compact style makes it `theme.header_h` (38pt).
     const toolbar = msg(id, objc.alloc("NSToolbar"), "initWithIdentifier:", .{objc.nsString("tt.toolbar")});
     msg(void, toolbar, "setShowsBaselineSeparator:", .{false});
     msg(void, window, "setToolbar:", .{toolbar});
-    msg(void, window, "setToolbarStyle:", .{@as(NSInteger, 3)}); // unified
     g.toolbar = toolbar;
+    syncToolbarStyle();
 
     const view = msg(id, msg(id, g.view_class, "alloc", .{}), "initWithFrame:", .{frame});
     g.view = view;
@@ -380,6 +388,7 @@ fn registerViewClass() objc.Class {
     b.method("mouseDragged:", mouseMoved, "v@:@");
     b.method("mouseMoved:", mouseMoved, "v@:@");
     b.method("mouseExited:", mouseExited, "v@:@");
+    b.method("flagsChanged:", flagsChanged, "v@:@");
     b.method("rightMouseDown:", rightMouseDown, "v@:@");
     b.method("scrollWheel:", scrollWheel, "v@:@");
     b.method("keyDown:", keyDown, "v@:@");
@@ -501,7 +510,7 @@ fn updateChrome() void {
 }
 
 /// The window's appearance (titlebar, traffic lights, native panels) and
-/// background follow the theme's scheme.
+/// background follow the theme's scheme (and its terminal theme's background).
 fn syncWindowAppearance() void {
     if (g.window == null) return;
     const name = switch (theme.scheme) {
@@ -515,6 +524,19 @@ fn syncWindowAppearance() void {
     });
     msg(void, g.window, "setBackgroundColor:", .{bg});
     g.applied_scheme = theme.scheme;
+    g.applied_generation = theme.generation;
+    if (g.app) |app| app.invalidate();
+}
+
+/// The titlebar's height follows compact mode: unified (52pt) or unified
+/// compact (38pt), the two heights `theme.header_h` takes. The traffic
+/// lights move with it, so their inset is read again.
+fn syncToolbarStyle() void {
+    if (g.window == null) return;
+    const style: NSInteger = if (theme.compact) 4 else 3; // unifiedCompact : unified
+    msg(void, g.window, "setToolbarStyle:", .{style});
+    g.applied_compact = theme.compact;
+    g.chrome_recheck = 60;
     if (g.app) |app| app.invalidate();
 }
 
@@ -526,13 +548,16 @@ fn tick(_: id, _: SEL, _: id) callconv(.c) void {
         updateChrome();
     }
     if (g.selftest) selftestStep(now);
-    if (g.applied_scheme != theme.scheme) syncWindowAppearance();
+    if (g.applied_scheme != theme.scheme or g.applied_generation != theme.generation) syncWindowAppearance();
+    if (g.applied_compact != theme.compact) syncToolbarStyle();
     // Runs between frames: the picker's modal loop keeps ticking this timer.
     if (app.folder_pick_requested) {
         app.folder_pick_requested = false;
         pickProjectFolder();
     }
-    if (!app.update(now)) return;
+    const dirty = app.update(now);
+    syncBlur(now);
+    if (!dirty) return;
     // nextDrawable blocks when the window is not on screen; skip drawing
     // then. The self test still lays the frame out so the hosted views get
     // placed: its checks must not depend on what happens to cover the screen.
@@ -552,6 +577,133 @@ fn tick(_: id, _: SEL, _: id) callconv(.c) void {
 fn windowOnScreen() bool {
     const occlusion = msg(NSUInteger, g.window, "occlusionState", .{});
     return occlusion & (1 << 1) != 0;
+}
+
+// ── the away blur (Settings › Physical interactions) ─────────────────────
+// A blurring view over the whole window — the Metal view and the web
+// views hosted on it — fades in while the camera controller says nobody is
+// looking, and out the moment someone looks again (or types, or clicks).
+// It takes the clicks made on it, so nothing hidden under it is clicked by
+// accident: a click only counts as activity, which clears the blur. Keys
+// still reach the app underneath (and clear it too).
+var blur_class: objc.Class = null;
+var blur_view: id = null;
+var blur_on: bool = false;
+/// When the fade-out is over and the view hides: at alpha 0 it would still
+/// take the clicks.
+var blur_hide_at: f64 = 0;
+
+fn registerBlurViewClass() objc.Class {
+    const b = objc.ClassBuilder.begin("TTBlurView", "NSView");
+    b.method("mouseDown:", blurClicked, "v@:@");
+    b.method("rightMouseDown:", blurClicked, "v@:@");
+    b.method("otherMouseDown:", blurClicked, "v@:@");
+    b.method("scrollWheel:", blurClicked, "v@:@");
+    // The rest of a click stays here too: the app never saw its press.
+    for ([_][:0]const u8{ "mouseUp:", "rightMouseUp:", "otherMouseUp:", "mouseDragged:", "rightMouseDragged:", "otherMouseDragged:" }) |name| {
+        _ = objc.class_addMethod(b.cls, objc.sel_registerName(name.ptr), @ptrCast(&blurSwallow), "v@:@");
+    }
+    b.method("acceptsFirstMouse:", yesWithArg, "B@:@");
+    return b.register();
+}
+
+fn blurClicked(_: id, _: SEL, _: id) callconv(.c) void {
+    camera_controller.get().noteActivity(apple.CACurrentMediaTime());
+}
+
+fn blurSwallow(_: id, _: SEL, _: id) callconv(.c) void {}
+
+/// Shows or hides the blur as the camera controller decided; after each update.
+fn syncBlur(now: f64) void {
+    const want = camera_controller.get().blurred;
+    if (want != blur_on) {
+        blur_on = want;
+        if (blur_view == null) makeBlurView();
+        if (g.debug_events or g.selftest) std.debug.print("blur: {s}\n", .{if (want) "on" else "off"});
+        if (want) {
+            blur_hide_at = 0;
+            raiseBlur();
+            msg(void, blur_view, "setHidden:", .{false});
+            fadeBlur(1, 0.45);
+        } else {
+            fadeBlur(0, 0.18);
+            blur_hide_at = now + 0.25;
+        }
+    }
+    if (blur_on) {
+        // A web view attached since goes on top of it: back under the blur.
+        raiseBlur();
+    } else if (blur_hide_at > 0 and now >= blur_hide_at) {
+        blur_hide_at = 0;
+        msg(void, blur_view, "setHidden:", .{true});
+    }
+}
+
+fn raiseBlur() void {
+    const top = msg(id, msg(id, g.view, "subviews", .{}), "lastObject", .{});
+    // NSWindowAbove, relative to nothing: the front of the subviews.
+    if (top != blur_view) msg(void, g.view, "addSubview:positioned:relativeTo:", .{ blur_view, @as(NSInteger, 1), @as(id, null) });
+}
+
+fn fadeBlur(alpha: f64, seconds: f64) void {
+    const ctx = objc.class("NSAnimationContext");
+    msg(void, ctx, "beginGrouping", .{});
+    msg(void, msg(id, ctx, "currentContext", .{}), "setDuration:", .{seconds});
+    msg(void, msg(id, blur_view, "animator", .{}), "setAlphaValue:", .{alpha});
+    msg(void, ctx, "endGrouping", .{});
+}
+
+fn makeBlurView() void {
+    const bounds = msg(CGRect, g.view, "bounds", .{});
+    const v = msg(id, msg(id, blur_class, "alloc", .{}), "initWithFrame:", .{bounds});
+    msg(void, v, "setWantsLayer:", .{true});
+    // A Gaussian blur of whatever is behind the view: the window's own
+    // content in its own colours, shapes left and words gone. (A visual-
+    // effect material tints it to a flat grey instead.)
+    msg(void, v, "setLayerUsesCoreImageFilters:", .{true});
+    const layer = msg(id, v, "layer", .{});
+    const blur = msg(id, objc.class("CIFilter"), "filterWithName:", .{objc.nsString("CIGaussianBlur")});
+    if (blur != null) {
+        msg(void, blur, "setDefaults", .{});
+        msg(void, blur, "setValue:forKey:", .{ msg(id, objc.class("NSNumber"), "numberWithDouble:", .{@as(f64, 24)}), objc.nsString("inputRadius") });
+        msg(void, layer, "setBackgroundFilters:", .{msg(id, objc.class("NSArray"), "arrayWithObject:", .{blur})});
+    } else {
+        // No Core Image: cover the window instead.
+        const bg = msg(id, objc.class("NSColor"), "windowBackgroundColor", .{});
+        msg(void, layer, "setBackgroundColor:", .{msg(?*anyopaque, bg, "CGColor", .{})});
+    }
+    msg(void, v, "setAutoresizingMask:", .{follows_box});
+    msg(void, v, "setAlphaValue:", .{@as(f64, 0)});
+    msg(void, v, "setHidden:", .{true});
+
+    // An eye with a slash and a line under it, in the middle. The view is
+    // not flipped: y counts up, so the symbol sits above the line.
+    const tint = msg(id, objc.class("NSColor"), "secondaryLabelColor", .{});
+    const flexible_margins: NSUInteger = 1 | 4 | 8 | 32;
+    const mid_x = bounds.size.width / 2;
+    const mid_y = bounds.size.height / 2;
+    const symbol = msg(id, objc.class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ objc.nsString("eye.slash"), objc.nsString("Blurred") });
+    if (symbol != null) {
+        const sym_cfg = msg(id, objc.class("NSImageSymbolConfiguration"), "configurationWithPointSize:weight:", .{ @as(f64, 30), @as(f64, 0) });
+        const img = msg(id, symbol, "imageWithSymbolConfiguration:", .{sym_cfg});
+        const iv = msg(id, objc.class("NSImageView"), "imageViewWithImage:", .{img});
+        msg(void, iv, "setContentTintColor:", .{tint});
+        const size = msg(CGSize, img, "size", .{});
+        msg(void, iv, "setFrame:", .{CGRect.make(mid_x - size.width / 2, mid_y + 10, size.width, size.height)});
+        msg(void, iv, "setAutoresizingMask:", .{flexible_margins});
+        msg(void, v, "addSubview:", .{iv});
+    }
+    const label = msg(id, objc.class("NSTextField"), "labelWithString:", .{objc.nsString("Blurred while you look away")});
+    msg(void, label, "setFont:", .{msg(id, objc.class("NSFont"), "systemFontOfSize:weight:", .{ @as(f64, 15), @as(f64, 0.23) })});
+    msg(void, label, "setTextColor:", .{tint});
+    msg(void, label, "sizeToFit", .{});
+    const ls = msg(CGRect, label, "frame", .{}).size;
+    msg(void, label, "setFrame:", .{CGRect.make(mid_x - ls.width / 2, mid_y - ls.height - 2, ls.width, ls.height)});
+    msg(void, label, "setAutoresizingMask:", .{flexible_margins});
+    msg(void, v, "addSubview:", .{label});
+
+    msg(void, g.view, "addSubview:", .{v});
+    blur_view = v;
 }
 
 // ── native views hosted over the Metal layer (website tabs) ──────────────
@@ -889,8 +1041,16 @@ fn rightMouseDown(_: id, _: SEL, event: id) callconv(.c) void {
 
 fn mouseMoved(_: id, _: SEL, event: id) callconv(.c) void {
     const app = g.app orelse return;
+    // The modifiers too: a key released while a web view had the keyboard
+    // never reached `flagsChanged:`.
+    app.onFlags(eventMods(event));
     const p = eventPoint(event);
     app.onMouseMove(@floatCast(p.x), @floatCast(p.y));
+}
+
+/// A modifier key went down or up (⌘ / ⌃ over a link shows it can be followed).
+fn flagsChanged(_: id, _: SEL, event: id) callconv(.c) void {
+    if (g.app) |app| app.onFlags(eventMods(event));
 }
 
 fn mouseExited(_: id, _: SEL, _: id) callconv(.c) void {
@@ -1249,6 +1409,9 @@ fn selftestStep(now: f64) void {
     // hold up the quit.
     if (sys.getenv("TT_SELFTEST_NOTEBOOK") != null) {
         selftestNotebook(t);
+    } else if (sys.getenv("TT_SELFTEST_BLUR") != null) {
+        // No regular steps either: their clicks and keys count as activity.
+        selftestBlur(t);
     } else if (g.selftest_step < steps.len) {
         const s = steps[g.selftest_step];
         if (t >= s.at) {
@@ -1356,6 +1519,67 @@ fn selftestNotebook(t: f64) void {
 }
 
 /// Captures the window to `path` with `suffix` before its extension.
+/// TT_SELFTEST_BLUR=1 with TT_CAMERA_MOCK=<a picture without a face>,
+/// TT_SELFTEST_BLUR_FACE=<a picture of a face looking at the camera> and a
+/// config.yml with `physical: blur_when_away: true, blur_after: 1`: nobody
+/// in view → the window blurs ("-blurred" capture); the face → it clears
+/// ("-clear"); nobody again → blurred; a click on the blur → clear at once
+/// ("-clicked"). The state is printed at each step. With TT_SELFTEST_URL a
+/// website tab is shown first, to see its web view blur too.
+var selftest_blur_step: u8 = 0;
+var selftest_blur_web = false;
+
+fn selftestBlur(t: f64) void {
+    const ctl = camera_controller.get();
+    // With TT_SELFTEST_URL, a website tab is on show: its web view has to
+    // blur like the rest.
+    if (!selftest_blur_web) {
+        selftest_blur_web = true;
+        if (sys.getenv("TT_SELFTEST_URL")) |url| {
+            if (g.app) |app| _ = app.tabs.openWith("web", .{ .url = url }) catch {};
+        }
+    }
+    const Step = struct { at: f64, what: []const u8 };
+    const steps = [_]Step{
+        .{ .at = 4.0, .what = "nobody in view" },
+        .{ .at = 4.1, .what = "a face looks at the screen" },
+        .{ .at = 6.0, .what = "looking" },
+        .{ .at = 6.1, .what = "nobody again" },
+        .{ .at = 8.5, .what = "nobody, blurred again" },
+        .{ .at = 8.6, .what = "click on the blur" },
+        .{ .at = 9.0, .what = "after the click" },
+    };
+    if (selftest_blur_step >= steps.len) {
+        if (t >= 9.5) msg(void, g.nsapp, "terminate:", .{@as(id, null)});
+        return;
+    }
+    const s = steps[selftest_blur_step];
+    if (t < s.at) return;
+    selftest_blur_step += 1;
+    std.debug.print("selftest: blur leg: {s}: blurred={} gaze={s} stance={s} frames={d} view_alpha={d:.2} hidden={}\n", .{
+        s.what,
+        ctl.blurred,
+        @tagName(ctl.posture.gaze),
+        @tagName(ctl.posture.stance),
+        ctl.obs.seq,
+        if (blur_view != null) msg(f64, blur_view, "alphaValue", .{}) else -1,
+        blur_view == null or msg(bool, blur_view, "isHidden", .{}),
+    });
+    const png = sys.getenv("TT_SELFTEST_WINDOW_PNG");
+    switch (selftest_blur_step) {
+        1 => if (png) |path| selftestCaptureSuffixed(path, "-blurred"),
+        2 => camera.setMock(sys.getenv("TT_SELFTEST_BLUR_FACE") orelse ""),
+        3 => if (png) |path| selftestCaptureSuffixed(path, "-clear"),
+        4 => camera.setMock(sys.getenv("TT_CAMERA_MOCK") orelse ""),
+        6 => {
+            postMouse(1, 700, 450);
+            postMouse(2, 700, 450);
+        },
+        7 => if (png) |path| selftestCaptureSuffixed(path, "-clicked"),
+        else => {},
+    }
+}
+
 fn selftestCaptureSuffixed(path: []const u8, suffix: []const u8) void {
     var buf: [1024]u8 = undefined;
     const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse path.len;

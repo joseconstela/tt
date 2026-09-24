@@ -5,8 +5,11 @@
 //! e-paper panels, which also turns off what those cannot show well (see
 //! `eink_palette`). Metrics and the type ramp never change. The accent is
 //! the one tweakable prop the design exposes; the config remembers it by
-//! name (`accent_names`) or as a custom colour.
+//! name or as a custom colour. Instead of the design's own dark or light
+//! palette a classic terminal theme can be in force (`themes.zig`): its
+//! exact colours replace the design's, its kind is the scheme.
 const draw = @import("../gfx/draw.zig");
+const themes = @import("themes.zig");
 const Color = draw.Color;
 const Font = draw.Font;
 
@@ -47,9 +50,20 @@ pub const Palette = struct {
     soft_shadow: bool,
     /// The accent options of the design, tuned per scheme (same names).
     accents: [4]Color,
+    /// What Settings and the palette call each accent option.
+    accent_labels: [4][]const u8 = design_accent_labels,
     /// 16-colour ANSI palette tuned to sit calmly on the block background.
     ansi: [16]Color,
+    /// The terminal's cursor, and the glyph under a block cursor.
+    cursor: Color,
+    cursor_text: Color,
+    /// Program output in the scheme's default colour (not bold).
+    term_fg: Color,
+    /// A theme's own selection colour (opaque); null = the accent, washed.
+    sel: ?Color = null,
 };
+
+const design_accent_labels = [4][]const u8{ "Amber", "Peach", "Lime", "Rose" };
 
 pub const dark_palette: Palette = .{
     .bg = Color.hex(0x1A1917),
@@ -84,6 +98,9 @@ pub const dark_palette: Palette = .{
         Color.hex(0x958F83), Color.hex(0xFF9F91), Color.hex(0xB4E3A5), Color.hex(0xF5CE7A),
         Color.hex(0xA3CCF5), Color.hex(0xE6BDEE), Color.hex(0x8EE0CC), Color.hex(0xECE7DC),
     },
+    .cursor = Color.hex(0xECE7DC),
+    .cursor_text = Color.hex(0x1A1917),
+    .term_fg = Color.hex(0xB9B2A4),
 };
 
 /// The same warm paper, lit: the dark set's greys inverted around the
@@ -120,6 +137,9 @@ pub const light_palette: Palette = .{
         Color.hex(0x6F695F), Color.hex(0xD9534F), Color.hex(0x4CA34E), Color.hex(0xBF8F1A),
         Color.hex(0x3B7FD4), Color.hex(0xB060C4), Color.hex(0x24A28E), Color.hex(0xA39C8E),
     },
+    .cursor = Color.hex(0x2A2724),
+    .cursor_text = Color.hex(0xF6F3EC),
+    .term_fg = Color.hex(0x5C574F),
 };
 
 /// Ink on paper, for e-ink panels. Pure white, pure black, and a few greys
@@ -164,6 +184,9 @@ pub const eink_palette: Palette = .{
         Color.hex(0x888888), Color.hex(0x000000), Color.hex(0x222222), Color.hex(0x444444),
         Color.hex(0x000000), Color.hex(0x333333), Color.hex(0x555555), Color.hex(0x000000),
     },
+    .cursor = Color.hex(0x000000),
+    .cursor_text = Color.hex(0xFFFFFF),
+    .term_fg = Color.hex(0x333333),
 };
 
 /// Muted colour on paper, for the colour e-paper panels (Kaleido and the
@@ -207,9 +230,20 @@ pub const eink_color_palette: Palette = .{
         Color.hex(0x6F695F), Color.hex(0xB86058), Color.hex(0x5E9460), Color.hex(0xA5852F),
         Color.hex(0x5C7EA8), Color.hex(0x9A6EA2), Color.hex(0x4E9184), Color.hex(0x2A2724),
     },
+    .cursor = Color.hex(0x1A1917),
+    .cursor_text = Color.hex(0xFFFFFF),
+    .term_fg = Color.hex(0x4A463F),
 };
 
 pub var scheme: Scheme = .dark;
+/// Bumped whenever the tokens change, so the window can follow a theme
+/// switch that keeps the scheme (see `cocoa.zig`).
+pub var generation: u32 = 0;
+/// The terminal theme (`themes.zig`) in force, whose kind is `scheme`;
+/// null = the design's own palette for the scheme.
+pub var active_theme: ?*const themes.Theme = null;
+/// The palette derived from the theme in force.
+var theme_palette: Palette = undefined;
 
 pub var bg = dark_palette.bg;
 pub var bg_side = dark_palette.bg_side;
@@ -231,7 +265,8 @@ pub var accent = dark_palette.accents[0];
 pub var accent_options = dark_palette.accents;
 /// Which of `accent_options` is on; null when the config set a custom colour.
 pub var accent_choice: ?usize = 0;
-pub const accent_names = [_][]const u8{ "Amber", "Peach", "Lime", "Rose" };
+/// What each of `accent_options` is called in this scheme or theme.
+pub var accent_labels = design_accent_labels;
 pub var on_accent = dark_palette.on_accent;
 pub var teal = dark_palette.teal;
 pub var red = dark_palette.red;
@@ -244,6 +279,10 @@ pub var line_highlight = dark_palette.line_highlight;
 pub var block_border = dark_palette.block_border;
 pub var caret_blinks = dark_palette.caret_blinks;
 pub var soft_shadow = dark_palette.soft_shadow;
+pub var cursor = dark_palette.cursor;
+pub var cursor_text = dark_palette.cursor_text;
+pub var term_fg = dark_palette.term_fg;
+var sel: ?Color = null;
 /// A custom accent from the config, kept so it comes back after e-ink.
 var custom_accent: ?Color = null;
 
@@ -254,6 +293,8 @@ pub fn selection() Color {
     // On colour e-paper a translucent accent would dither: a pale, fully
     // opaque wash of the accent reads the same and stays crisp.
     if (scheme == .eink_color) return .{ .r = accent.r * 0.2 + 0.8, .g = accent.g * 0.2 + 0.8, .b = accent.b * 0.2 + 0.8, .a = 1 };
+    // A terminal theme brings its own (drawn under the text).
+    if (sel) |c| return c;
     return accent.alpha(0.28);
 }
 
@@ -310,12 +351,18 @@ pub fn palette(s: Scheme) *const Palette {
     };
 }
 
-/// Puts a scheme's colours in every token. A named accent follows the
-/// scheme (each has its own tuning), a custom one stays as it is — except
-/// on e-ink, where the accent is always black.
-pub fn setScheme(s: Scheme) void {
+/// Puts a scheme's colours in every token: those of terminal theme `t`
+/// when one is given (the scheme is its kind), else the design's. A named
+/// accent follows the scheme (each has its own tuning), a custom one stays
+/// as it is — except on e-ink, where the accent is always black.
+pub fn setScheme(s: Scheme, t: ?*const themes.Theme) void {
     scheme = s;
-    const p = palette(s);
+    active_theme = t;
+    generation +%= 1;
+    const p = if (t) |th| blk: {
+        theme_palette = themePalette(th);
+        break :blk &theme_palette;
+    } else palette(s);
     bg = p.bg;
     bg_side = p.bg_side;
     bg_block = p.bg_block;
@@ -341,8 +388,83 @@ pub fn setScheme(s: Scheme) void {
     caret_blinks = p.caret_blinks;
     soft_shadow = p.soft_shadow;
     accent_options = p.accents;
+    accent_labels = p.accent_labels;
     ansi = p.ansi;
+    cursor = p.cursor;
+    cursor_text = p.cursor_text;
+    term_fg = p.term_fg;
+    sel = p.sel;
     refreshAccent();
+}
+
+/// The workspace in a terminal theme. The terminal's own colours are the
+/// theme's exactly: background (blocks and full-screen programs alike,
+/// so blocks get a border instead of a tint), foreground, cursor,
+/// selection and ANSI. The chrome is mixed from background and
+/// foreground. The accent options are the theme's accent, then its
+/// yellow, blue and magenta (whichever of them is not the accent).
+pub fn themePalette(t: *const themes.Theme) Palette {
+    const b = rgb(t.background);
+    const f = rgb(t.foreground);
+    const dark = t.kind == .dark;
+    const black = Color.hex(0x000000);
+    const shade = if (dark) Color.mix(b, black, 0.28) else Color.mix(b, black, 0.045);
+    var colors: [16]Color = undefined;
+    for (&colors, t.ansi) |*c, v| c.* = rgb(v);
+    var p: Palette = .{
+        .bg = b,
+        .bg_side = shade,
+        .bg_block = b,
+        .bg_inset = shade,
+        .line = Color.mix(b, f, 0.13),
+        .line_strong = Color.mix(b, f, 0.24),
+        .bg_panel = Color.mix(b, f, 0.035),
+        .bg_panel_footer = shade,
+        .chip_active = Color.mix(b, f, 0.11),
+        .scrim = if (dark) black.alpha(0.5) else Color.mix(f, black, 0.5).alpha(0.35),
+        .text = f,
+        .text_2 = Color.mix(f, b, 0.2),
+        .text_3 = Color.mix(f, b, 0.38),
+        .on_accent = if (luminance(rgb(t.accent)) > 0.45) (if (dark) b else Color.hex(0x1A1917)) else (if (dark) f else b),
+        .teal = colors[6],
+        .red = colors[1],
+        .red_line = Color.mix(b, colors[1], 0.4),
+        .hover = f.alpha(0.06),
+        .pressed = f.alpha(0.10),
+        .highlight = f.alpha(0.07),
+        .line_highlight = f.alpha(0.035),
+        .block_border = 1,
+        .caret_blinks = true,
+        .soft_shadow = true,
+        .accents = undefined,
+        .accent_labels = undefined,
+        .ansi = colors,
+        .cursor = rgb(t.cursor),
+        .cursor_text = rgb(t.cursor_text),
+        .term_fg = f,
+        .sel = rgb(t.selection),
+    };
+    p.accents[0] = rgb(t.accent);
+    p.accent_labels[0] = "Theme accent";
+    const extra = [_]struct { i: usize, name: []const u8 }{ .{ .i = 3, .name = "Yellow" }, .{ .i = 4, .name = "Blue" }, .{ .i = 5, .name = "Magenta" }, .{ .i = 2, .name = "Green" } };
+    var n: usize = 1;
+    for (extra) |e| {
+        if (n == p.accents.len) break;
+        if (t.ansi[e.i] == t.accent) continue;
+        p.accents[n] = colors[e.i];
+        p.accent_labels[n] = e.name;
+        n += 1;
+    }
+    return p;
+}
+
+/// A `0xRRGGBB` value as a colour.
+pub fn rgb(v: u24) Color {
+    return Color.fromRgb8(@intCast((v >> 16) & 0xff), @intCast((v >> 8) & 0xff), @intCast(v & 0xff));
+}
+
+fn luminance(c: Color) f32 {
+    return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
 }
 
 /// The accent for the scheme in force: the chosen option in its tuning,
@@ -365,21 +487,28 @@ pub fn setAccent(i: usize) void {
 }
 
 /// Any colour, as written into the config file by hand.
-pub fn setCustomAccent(rgb: u24) void {
+pub fn setCustomAccent(value: u24) void {
     accent_choice = null;
-    custom_accent = Color.fromRgb8(@intCast((rgb >> 16) & 0xff), @intCast((rgb >> 8) & 0xff), @intCast(rgb & 0xff));
+    custom_accent = rgb(value);
     refreshAccent();
 }
 
 // Metrics (points).
+// The spacing ones are `var`s: compact mode (Settings › Mode, `setCompact`)
+// swaps in tighter values, the way `setScheme` swaps the colours.
+
+/// Compact mode is on: tighter spacing everywhere, square corners, and
+/// the terminal's blocks and input across the full width of their pane.
+pub var compact: bool = false;
 /// Titlebar band at the very top of the window: the sidebar header on the
 /// left, the tab strip on the right. The transparent titlebar sits over it,
-/// so its empty parts drag the window.
-pub const header_h: f32 = 52;
+/// so its empty parts drag the window. Compact mode asks AppKit for the
+/// compact toolbar titlebar, which is this tall.
+pub var header_h: f32 = 52;
 pub const palette_w: f32 = 720;
 pub const palette_top: f32 = 112;
-pub const sidebar_default_w: f32 = 300;
-pub const sidebar_min_w: f32 = 208;
+pub var sidebar_default_w: f32 = 300;
+pub var sidebar_min_w: f32 = 208;
 pub const sidebar_max_w: f32 = 520;
 pub const files_default_w: f32 = 260;
 pub const files_min_w: f32 = 180;
@@ -388,15 +517,62 @@ pub const content_max_w: f32 = 880;
 /// Split panes: the strip of a pane that is not under the titlebar band,
 /// the narrowest a pane gets, the line between two panes and the extra
 /// width around it that grabs the mouse.
-pub const pane_strip_h: f32 = 40;
+pub var pane_strip_h: f32 = 40;
 pub const pane_min: f32 = 160;
 pub const divider_w: f32 = 1;
 pub const divider_grab: f32 = 9;
-pub const content_pad: f32 = 24;
-pub const block_gap: f32 = 14;
-pub const block_radius: f32 = 10;
-pub const block_pad_x: f32 = 18;
+pub var content_pad: f32 = 24;
+pub var block_gap: f32 = 14;
+pub var block_radius: f32 = 10;
+pub var block_pad_x: f32 = 18;
+/// Room above a terminal block's command and below its output, and
+/// above and below the text of the command input.
+pub var block_pad_y: f32 = 14;
+pub var input_pad_y: f32 = 16;
 pub const output_line_h: f32 = 22;
+/// A row of a terminal block's output.
+pub var term_line_h: f32 = output_line_h;
+/// Sidebar rows (projects, then their resources), how far they sit in
+/// from the sidebar's edges, and their corners.
+pub var side_row_h: f32 = 32;
+pub var side_res_h: f32 = 30;
+pub var side_inset: f32 = 8;
+pub var row_radius: f32 = 8;
+/// Tabs in a strip: the padding either side of a title and the pill
+/// behind a hovered one.
+pub var tab_pad: f32 = 12;
+pub var tab_pill_h: f32 = 34;
+/// Compact mode's sizes for the tab-like ones above. The files panel's
+/// Files / Search / Git tabs use them in both modes.
+pub const compact_tab_pad: f32 = 9;
+pub const compact_tab_pill_h: f32 = 26;
+pub const compact_strip_h: f32 = 30;
+pub const compact_row_radius: f32 = 3;
+
+/// Switches between the regular spacing and compact mode's. The caller
+/// redraws; the window's titlebar follows `header_h` (see `cocoa.zig`).
+pub fn setCompact(on: bool) void {
+    if (compact == on) return;
+    compact = on;
+    header_h = if (on) 38 else 52;
+    sidebar_default_w = if (on) 220 else 300;
+    sidebar_min_w = if (on) 150 else 208;
+    pane_strip_h = if (on) compact_strip_h else 40;
+    content_pad = if (on) 12 else 24;
+    block_gap = if (on) 8 else 14;
+    block_radius = if (on) 0 else 10;
+    block_pad_x = if (on) 10 else 18;
+    block_pad_y = if (on) 6 else 14;
+    input_pad_y = if (on) 8 else 16;
+    term_line_h = if (on) 18 else output_line_h;
+    side_row_h = if (on) 24 else 32;
+    side_res_h = if (on) 22 else 30;
+    side_inset = if (on) 4 else 8;
+    row_radius = if (on) compact_row_radius else 8;
+    tab_pad = if (on) compact_tab_pad else 12;
+    tab_pill_h = if (on) compact_tab_pill_h else 34;
+    generation +%= 1;
+}
 
 // Type ramp.
 pub const font_ui = Font.sans(14);
@@ -442,4 +618,13 @@ pub fn scopeColor(scope: @import("../syntax/lexer.zig").Scope) Color {
         .field_b => ansi[10],
         .list => accent,
     };
+}
+
+test "theme palette: exact colours, accents skip the one that is the accent" {
+    const p = themePalette(&themes.all[themes.find("solarized-light").?]);
+    try @import("std").testing.expectEqual(rgb(0xFDF6E3), p.bg);
+    try @import("std").testing.expectEqual(rgb(0x657B83), p.term_fg);
+    try @import("std").testing.expectEqualStrings("Yellow", p.accent_labels[1]);
+    // Solarized Dark's accent is its yellow, so the options skip to blue.
+    try @import("std").testing.expectEqualStrings("Blue", themePalette(&themes.all[themes.find("solarized-dark").?]).accent_labels[1]);
 }

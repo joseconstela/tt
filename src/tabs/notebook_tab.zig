@@ -52,6 +52,7 @@ const ipynb = @import("../notebook/ipynb.zig");
 const bridge = @import("../notebook/bridge.zig");
 const buffer_mod = @import("../term/buffer.zig");
 const selection = @import("../term/selection.zig");
+const links = @import("../links.zig");
 const Parser = @import("../term/parser.zig").Parser;
 const TextEditor = @import("text_editor.zig").TextEditor;
 const MarkdownView = @import("markdown_view.zig").MarkdownView;
@@ -3483,6 +3484,18 @@ pub const NotebookTab = struct {
         // the selection selects the word under the pointer, then asks for
         // the edit menu.
         const mine = self.sel_cell == cell_salt and self.sel_out == index and !self.sel_all;
+        // A link under the pointer: ⌘/⌃-click opens it, before the
+        // selection below can take the press (or the ⌃-click's menu).
+        var link_buf: [links.max_len]u8 = undefined;
+        const link: ?selection.Link = blk: {
+            const cell_w = ui.text.cellAdvance(theme.font_output);
+            const rows_rect: Rect = .{ .x = x, .y = y, .w = @as(f32, @floatFromInt(cols)) * cell_w, .h = @as(f32, @floatFromInt(@max(1, o.rows))) * line_h };
+            if (!ui.mouseIn(rows_rect)) break :blk null;
+            const layout: selection.Rows = .{ .starts = o.row_starts.items, .first_row = o.first_row, .rows = o.rows, .cols = cols };
+            const found = selection.linkUnder(&o.buf, layout, x, y, cell_w, line_h, ui.mx, ui.my, &link_buf) orelse break :blk null;
+            _ = ui.link(found.url);
+            break :blk found;
+        };
         {
             const cell_w = ui.text.cellAdvance(theme.font_output);
             const layout: selection.Rows = .{ .starts = o.row_starts.items, .first_row = o.first_row, .rows = o.rows, .cols = cols };
@@ -3551,7 +3564,7 @@ pub const NotebookTab = struct {
                         dl.rect(.{ .x = (x_px + col * cell_px) / scale, .y = y, .w = sw * cell_px / scale, .h = line_h }, theme.selection());
                     }
                 }
-                var fg = resolve(st.fg, if (st.bold) theme.text else theme.text_2, .fg);
+                var fg = resolve(st.fg, if (st.bold) theme.text else theme.term_fg, .fg);
                 var bg: ?Color = if (st.bg != buffer_mod.color_default) resolve(st.bg, theme.bg_block, .bg) else null;
                 if (st.inverse) {
                     const old_fg = fg;
@@ -3559,6 +3572,8 @@ pub const NotebookTab = struct {
                     bg = old_fg;
                 }
                 if (st.dim) fg = fg.alpha(0.6);
+                const on_link = if (link) |lk| lk.covers(line_idx, cell_idx) else false;
+                if (on_link and ui.linkModifier()) fg = theme.scopeColor(.link);
                 const w_cells: f32 = @floatFromInt(@max(1, gfx_text.cellWidth(cell.cp)));
                 const cx = (x_px + col * cell_px) / scale;
                 if (bg) |bc| dl.rect(.{ .x = cx, .y = y, .w = w_cells * cell_px / scale, .h = line_h }, bc);
@@ -3566,7 +3581,7 @@ pub const NotebookTab = struct {
                     const font = if (st.bold) theme.font_output_bold else theme.font_output;
                     _ = dl.glyph(font, cell.cp, x_px + col * cell_px, baseline_px, fg, clip);
                 }
-                if (st.underline) dl.rect(.{ .x = cx, .y = y + line_h - 5, .w = w_cells * cell_px / scale, .h = 1 }, fg);
+                if (st.underline or on_link) dl.rect(.{ .x = cx, .y = y + line_h - 5, .w = w_cells * cell_px / scale, .h = 1 }, fg);
                 col += @floatFromInt(gfx_text.cellWidth(cell.cp));
             }
             y += line_h;

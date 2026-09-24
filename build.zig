@@ -13,6 +13,12 @@ const frameworks = [_][]const u8{
     // Website tabs: camera and microphone access, desktop notifications.
     "AVFoundation",
     "UserNotifications",
+    // Physical interactions: camera frames and what Vision recognises in them.
+    "CoreMedia",
+    "CoreVideo",
+    "Vision",
+    // Voice commands: speech recognised on this Mac.
+    "Speech",
 };
 
 const info_plist =
@@ -34,8 +40,9 @@ const info_plist =
     \\  <key>CFBundleIconName</key><string>icon</string>
     \\  <key>CFBundleIconFile</key><string>icon</string>
     \\  <!-- Website tabs (video calls): macOS shows these when it asks. -->
-    \\  <key>NSCameraUsageDescription</key><string>Websites open in tt, such as video calls, can use the camera when you allow them.</string>
-    \\  <key>NSMicrophoneUsageDescription</key><string>Websites open in tt, such as video calls, can use the microphone when you allow them.</string>
+    \\  <key>NSCameraUsageDescription</key><string>tt can notice when you look away from the screen (Settings › Physical interactions: analysed on this Mac, never recorded), and websites open in tt, such as video calls, can use the camera when you allow them.</string>
+    \\  <key>NSMicrophoneUsageDescription</key><string>tt listens for its trigger word when you turn voice commands on (Settings › Physical interactions: recognised on this Mac, never recorded), and websites open in tt, such as video calls, can use the microphone when you allow them.</string>
+    \\  <key>NSSpeechRecognitionUsageDescription</key><string>tt recognises what you say on this Mac to notice its trigger word and your voice commands. Nothing is recorded or sent anywhere.</string>
     \\  <key>NSAppTransportSecurity</key>
     \\  <dict>
     \\    <key>NSAllowsArbitraryLoadsInWebContent</key><true/>
@@ -143,6 +150,8 @@ pub fn build(b: *std.Build) void {
     test_mod.addAnonymousImport("jupyter_bridge", .{ .root_source_file = b.path("assets/notebook/tt_jupyter.py") });
     // The notebook tab's tests reach the texture code, which talks to Metal through the runtime.
     test_mod.linkSystemLibrary("objc", .{});
+    // The voice tests turn captured sound into PCM buffers.
+    for ([_][]const u8{ "Foundation", "AVFoundation", "CoreMedia" }) |f| test_mod.linkFramework(f, .{});
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

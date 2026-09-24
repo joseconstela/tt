@@ -184,8 +184,6 @@ const commands = [_]Command{
     .{ .prefix = "Page:", .label = "Forward", .kbd = "⌘⌥→", .action = .web_forward },
 };
 
-const accent_names = [_][]const u8{ "Amber", "Peach", "Lime", "Rose" };
-
 const max_entries = 64;
 const max_tabs = 16;
 /// File rows for a query; fewer for an empty one, which is a browse.
@@ -600,7 +598,7 @@ pub const Palette = struct {
             self.push(q, .{
                 .group = .settings,
                 .prefix = "Accent colour ›",
-                .label = accent_names[i],
+                .label = theme.accent_labels[i],
                 .detail = if (current) "current" else "",
                 .kbd = false,
                 .dot = c,

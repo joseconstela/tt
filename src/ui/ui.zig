@@ -56,6 +56,9 @@ pub const Ui = struct {
     press_y: f32 = 0,
     /// A secondary click (right button or ⌃-click) landed this frame.
     right_pressed: bool = false,
+    /// That secondary click was a ⌃-click: over a link it opens the link
+    /// instead of a menu (see `link`).
+    ctrl_click: bool = false,
     scroll_x: f32 = 0,
     scroll_y: f32 = 0,
     mods: Mods = .{},
@@ -74,6 +77,15 @@ pub const Ui = struct {
     /// Set by a text surface that took a secondary click this frame (see
     /// `EditMenu`); the app opens the menu once the frame is drawn.
     edit_menu: ?EditMenu = null,
+    /// The link under the pointer this frame (its address), recorded by the
+    /// view that drew it; the app shows where it goes and opens it when
+    /// `link_open` says it was ⌘- or ⌃-clicked.
+    link_buf: [2048]u8 = undefined,
+    link_len: usize = 0,
+    link_open: bool = false,
+    /// Where the view showing that link is (its clip when it recorded the
+    /// link): the bubble with the address sits at its bottom.
+    link_area: Rect = .{},
 
     pub fn init(gpa: std.mem.Allocator, dl: *draw.DrawList, text: *text_mod.TextEngine) Ui {
         return .{ .gpa = gpa, .dl = dl, .text = text };
@@ -88,6 +100,8 @@ pub const Ui = struct {
         self.cursor = .arrow;
         self.wants_frame = false;
         self.edit_menu = null;
+        self.link_len = 0;
+        self.link_open = false;
         self.interactive.clearRetainingCapacity();
     }
 
@@ -98,6 +112,7 @@ pub const Ui = struct {
         self.pressed = false;
         self.released = false;
         self.right_pressed = false;
+        self.ctrl_click = false;
         self.scroll_x = 0;
         self.scroll_y = 0;
     }
@@ -117,6 +132,36 @@ pub const Ui = struct {
         if (!self.right_pressed or !self.mouseIn(r)) return false;
         self.right_pressed = false;
         return true;
+    }
+
+    /// ⌘ or ⌃ is held: the modifier that makes a click follow a link.
+    pub fn linkModifier(self: *const Ui) bool {
+        return (self.mods.cmd or self.mods.ctrl) and !self.mods.alt;
+    }
+
+    /// The pointer is over a link to `url` (the caller hit-tested its
+    /// text, before anything under it took the press). Records it for the
+    /// app, which shows where it goes and the pointing hand while ⌘ or ⌃ is
+    /// held. True when the link was ⌘- or ⌃-clicked this frame: the press
+    /// (or the secondary click) is consumed, so no selection or menu comes
+    /// of it, and the app opens the address.
+    pub fn link(self: *Ui, url: []const u8) bool {
+        if (url.len == 0 or url.len > self.link_buf.len or !self.mouse_inside) return false;
+        @memcpy(self.link_buf[0..url.len], url);
+        self.link_len = url.len;
+        self.link_area = self.dl.currentClip();
+        const clicked = self.ctrl_click or (self.pressed and self.mods.cmd and !self.mods.alt and self.active == 0);
+        if (!clicked) return false;
+        self.ctrl_click = false;
+        self.right_pressed = false;
+        self.pressed = false;
+        self.link_open = true;
+        return true;
+    }
+
+    /// The address `link` recorded this frame ("" when none).
+    pub fn hoveredLink(self: *const Ui) []const u8 {
+        return self.link_buf[0..self.link_len];
     }
 
     /// Asks for the edit menu at the pointer (see `EditMenu`).

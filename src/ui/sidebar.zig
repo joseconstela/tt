@@ -146,7 +146,8 @@ const ProjDrop = struct {
 };
 
 pub const Sidebar = struct {
-    width: f32 = theme.sidebar_default_w,
+    /// Set from `theme.sidebar_default_w` when the app starts (it depends on compact mode).
+    width: f32 = 300,
     collapsed: bool = false,
     /// Whether the default project's resources are listed (not persisted).
     default_open: bool = true,
@@ -241,19 +242,19 @@ pub const Sidebar = struct {
         // Header: brand + collapse button.
         const brand_x = @max(18, chrome.inset_left + 14);
         _ = dl.textCentered(theme.font_brand, brand_x, theme.header_h / 2, "tt", theme.accent);
-        const toggle_r: Rect = .{ .x = w - 10 - 36, .y = 8, .w = 36, .h = 36 };
+        const toggle_r = bandButton(w - 10 - bandButtonSize());
         const tb = ui.button(Ui.id("sidebar.toggle", 0), toggle_r);
-        ui.feedback(toggle_r, 8, tb);
-        dl.icon(.sidebar, toggle_r.x + 9, toggle_r.y + 9, 18, theme.text_2);
+        ui.feedback(toggle_r, theme.row_radius, tb);
+        dl.icon(.sidebar, toggle_r.x + (toggle_r.w - 18) / 2, toggle_r.y + (toggle_r.h - 18) / 2, 18, theme.text_2);
         if (tb.clicked) self.collapsed = true;
 
         if (ctx.settings()) |s| return drawSettingsMenu(ui, w, s);
 
         // "+": add a folder as a project.
-        const plus_r: Rect = .{ .x = toggle_r.x - 4 - 36, .y = 8, .w = 36, .h = 36 };
+        const plus_r = bandButton(toggle_r.x - 4 - bandButtonSize());
         const pb = ui.button(Ui.id("sidebar.add", 0), plus_r);
-        ui.feedback(plus_r, 8, pb);
-        dl.icon(.plus, plus_r.x + 9, plus_r.y + 9, 18, if (pb.hover) theme.text else theme.text_2);
+        ui.feedback(plus_r, theme.row_radius, pb);
+        dl.icon(.plus, plus_r.x + (plus_r.w - 18) / 2, plus_r.y + (plus_r.h - 18) / 2, 18, if (pb.hover) theme.text else theme.text_2);
         if (pb.clicked) res.add_project = true;
 
         const y: f32 = theme.header_h;
@@ -267,7 +268,7 @@ pub const Sidebar = struct {
         dl.pushClip(area);
         defer dl.popClip();
 
-        var cy = y + 10 - self.scroll;
+        var cy = y + (if (theme.compact) @as(f32, 4) else 10) - self.scroll;
         const top = cy;
         const default_group = tab_mod.TabManager.default_group;
 
@@ -282,9 +283,9 @@ pub const Sidebar = struct {
         {
             const hy = cy;
             cy = self.groupRow(ui, cy, w, ctx, res, .{ .gid = default_group, .name = "Default project", .icon = ctx.projects.default_icon, .open = &self.default_open, .target = .default_project, .id = 0 });
-            if (drag_kind == .resource and pointerInBand(ui, hy, 32)) {
+            if (drag_kind == .resource and pointerInBand(ui, hy, theme.side_row_h)) {
                 const first: ?u32 = if (ctx.projects.default_resources.items.len > 0) ctx.projects.default_resources.items[0].id else null;
-                rd.onto(default_group, first, hy + 32);
+                rd.onto(default_group, first, hy + theme.side_row_h);
             }
         }
         if (self.default_open) {
@@ -303,9 +304,9 @@ pub const Sidebar = struct {
             const hy = cy;
             if (drag_kind == .project) pd.gap(p.id, hy);
             cy = self.groupRow(ui, cy, w, ctx, res, .{ .gid = p.id, .name = p.name, .icon = p.icon, .open = &p.open, .current = ctx.current_project == p.id, .target = .project, .id = p.id });
-            if (drag_kind == .resource and pointerInBand(ui, hy, 32)) {
+            if (drag_kind == .resource and pointerInBand(ui, hy, theme.side_row_h)) {
                 const first: ?u32 = if (p.resources.items.len > 0) p.resources.items[0].id else null;
-                rd.onto(p.id, first, hy + 32);
+                rd.onto(p.id, first, hy + theme.side_row_h);
             }
             if (p.open) {
                 for (p.resources.items) |*r| {
@@ -383,7 +384,7 @@ pub const Sidebar = struct {
     /// Returns the y under the row.
     fn groupRow(self: *Sidebar, ui: *Ui, y: f32, w: f32, ctx: Context, res: *Result, spec: RowSpec) f32 {
         const dl = ui.dl;
-        const r: Rect = .{ .x = 8, .y = y, .w = w - 16, .h = 32 };
+        const r: Rect = .{ .x = theme.side_inset, .y = y, .w = w - 2 * theme.side_inset, .h = theme.side_row_h };
         const hovered = ui.mouseIn(r);
         var right = r.right() - 6;
         var shell_st: ui_mod.ButtonState = .{};
@@ -399,8 +400,8 @@ pub const Sidebar = struct {
         const src = spec.target == .project and self.dragActive(.project, spec.id);
         if (ui.rightClicked(r)) res.menu = .{ .target = spec.target, .id = spec.id, .x = ui.mx, .y = ui.my };
         const shown = ctx.tabs.groupId() == spec.gid;
-        if (shown) dl.rrect(r, 8, theme.accent.alpha(0.14)) else ui.feedback(r, 8, st);
-        if (src) dl.rrect(r, 8, theme.accent.alpha(0.12));
+        if (shown) dl.rrect(r, theme.row_radius, theme.accent.alpha(0.14)) else ui.feedback(r, theme.row_radius, st);
+        if (src) dl.rrect(r, theme.row_radius, theme.accent.alpha(0.12));
         if (dropTarget(ui, ctx, r)) res.drop_file = .{ .gid = spec.gid };
         if (spec.current) dl.rrect(.{ .x = r.x + 2, .y = r.centerY() - 8, .w = 3, .h = 16 }, 1.5, theme.accent);
         _ = dl.textCentered(theme.font_section, r.x + 10, r.centerY(), if (spec.open.*) "▾" else "▸", if (cs.hover) theme.text else theme.text_3);
@@ -418,15 +419,15 @@ pub const Sidebar = struct {
                 res.select_project = spec.id;
             }
         } else if (st.clicked and !src) res.open_group = spec.gid;
-        return y + 32 + 2;
+        return y + theme.side_row_h + 2;
     }
 
     /// While a file is being dragged, the row under the pointer shows it
     /// would take it; true on the frame the file is let go over it.
     fn dropTarget(ui: *Ui, ctx: Context, r: Rect) bool {
         if (!ctx.dragging_file or !ui.mouseIn(r)) return false;
-        ui.dl.rrect(r, 8, theme.accent.alpha(0.12));
-        ui.dl.border(r, 8, 1, theme.accent.alpha(0.7));
+        ui.dl.rrect(r, theme.row_radius, theme.accent.alpha(0.12));
+        ui.dl.border(r, theme.row_radius, 1, theme.accent.alpha(0.7));
         return ui.released;
     }
 
@@ -443,7 +444,7 @@ pub const Sidebar = struct {
     /// shows them, a right-click asks for its menu (rename, icon, remove).
     fn resourceRow(self: *Sidebar, ui: *Ui, y: f32, w: f32, r: *Resource, owner: u32, ctx: Context, res: *Result) f32 {
         const dl = ui.dl;
-        const row: Rect = .{ .x = 8, .y = y, .w = w - 16, .h = 30 };
+        const row: Rect = .{ .x = theme.side_inset, .y = y, .w = w - 2 * theme.side_inset, .h = theme.side_res_h };
         // No buttons: a new tab comes from the strip (or ⌘T) while the
         // resource is on show.
         const st = ui.button(Ui.id("sidebar.res", r.id), row);
@@ -451,8 +452,8 @@ pub const Sidebar = struct {
         const src = self.dragActive(.resource, r.id);
         if (ui.rightClicked(row)) res.menu = .{ .target = .resource, .id = r.id, .x = ui.mx, .y = ui.my };
         const selected = ctx.tabs.groupId() == r.id;
-        if (selected) dl.rrect(row, 8, theme.accent.alpha(0.14)) else ui.feedback(row, 8, st);
-        if (src) dl.rrect(row, 8, theme.accent.alpha(0.12));
+        if (selected) dl.rrect(row, theme.row_radius, theme.accent.alpha(0.14)) else ui.feedback(row, theme.row_radius, st);
+        if (src) dl.rrect(row, theme.row_radius, theme.accent.alpha(0.12));
         // A file dropped on a resource joins the resource's project.
         if (dropTarget(ui, ctx, row)) res.drop_file = .{ .gid = owner };
 
@@ -468,7 +469,7 @@ pub const Sidebar = struct {
         _ = dl.textEllipsis(theme.font_side, lx, row.centerY(), r.name, right - 4 - lx, if (selected or st.hover) theme.text else theme.text_2);
 
         if (st.clicked and !src) res.open_resource = r.id;
-        return y + 30 + 2;
+        return y + theme.side_res_h + 2;
     }
 
     /// A group's tab count ("3 tabs") and a dot while one of them runs,
@@ -510,24 +511,25 @@ pub const Sidebar = struct {
 
         // Title where the project row usually sits.
         {
-            const r: Rect = .{ .x = 8, .y = y, .w = w - 16, .h = 36 };
-            dl.icon(.settings, r.x + 10, r.y + 9.5, 17, theme.text_2);
+            const h = theme.side_row_h + 4;
+            const r: Rect = .{ .x = theme.side_inset, .y = y, .w = w - 2 * theme.side_inset, .h = h };
+            dl.icon(.settings, r.x + 10, r.centerY() - 8.5, 17, theme.text_2);
             const lx = r.x + 10 + 17 + 10;
             _ = dl.textEllipsis(theme.font_ui_medium, lx, r.centerY(), "Settings", r.right() - 10 - lx, theme.text);
-            y += 36 + 10;
+            y += h + (if (theme.compact) @as(f32, 4) else 10);
         }
         dl.rect(.{ .x = 0, .y = y, .w = w, .h = 1 }, theme.line);
-        y += 1 + 10;
+        y += 1 + (if (theme.compact) @as(f32, 4) else 10);
 
         for (settings_mod.sections) |sec| {
-            const head: Rect = .{ .x = 8, .y = y, .w = w - 16, .h = 32 };
+            const head: Rect = .{ .x = theme.side_inset, .y = y, .w = w - 2 * theme.side_inset, .h = theme.side_row_h };
             _ = dl.textEllipsis(theme.font_section, head.x + 10, head.centerY(), sec.title, head.w - 20, theme.text_3);
-            y += 32 + 2;
+            y += head.h + 2;
             for (sec.pages) |page| {
-                const row: Rect = .{ .x = 8, .y = y, .w = w - 16, .h = 30 };
+                const row: Rect = .{ .x = theme.side_inset, .y = y, .w = w - 2 * theme.side_inset, .h = theme.side_res_h };
                 const st = ui.button(Ui.id("sidebar.settings.page", @intFromEnum(page)), row);
                 const selected = s.page == page;
-                if (selected) dl.rrect(row, 8, theme.accent.alpha(0.14)) else ui.feedback(row, 8, st);
+                if (selected) dl.rrect(row, theme.row_radius, theme.accent.alpha(0.14)) else ui.feedback(row, theme.row_radius, st);
 
                 const ix = row.x + 14;
                 dl.icon(page.icon(), ix, row.centerY() - 7, 14, if (selected) theme.text else theme.text_3);
@@ -536,10 +538,22 @@ pub const Sidebar = struct {
                 if (!page.ready() and right - lx > 110) right = settings_mod.drawSoonPill(ui, right, row.centerY()) - 8;
                 _ = dl.textEllipsis(theme.font_side, lx, row.centerY(), page.label(), right - 4 - lx, if (selected or st.hover) theme.text else theme.text_2);
                 if (st.clicked) s.page = page;
-                y += 30 + 2;
+                y += row.h + 2;
             }
-            y += 8;
+            y += if (theme.compact) 2 else 8;
         }
+    }
+
+    /// The side of a square button in the titlebar band (toggle, "+"):
+    /// 36pt in the regular 52pt band, smaller in compact mode's.
+    fn bandButtonSize() f32 {
+        return @min(36, theme.header_h - 10);
+    }
+
+    /// A band button at `x`, centred on the band's height.
+    fn bandButton(x: f32) Rect {
+        const b = bandButtonSize();
+        return .{ .x = x, .y = (theme.header_h - b) / 2, .w = b, .h = b };
     }
 
     // ── collapsed ───────────────────────────────────────────────────────
@@ -549,10 +563,10 @@ pub const Sidebar = struct {
     fn drawCollapsed(self: *Sidebar, ui: *Ui, chrome: Chrome, res: *Result) void {
         const dl = ui.dl;
         const x: f32 = @max(12, chrome.inset_left + 8);
-        const toggle_r: Rect = .{ .x = x, .y = 8, .w = 36, .h = 36 };
+        const toggle_r = bandButton(x);
         const tb = ui.button(Ui.id("sidebar.toggle", 0), toggle_r);
-        ui.feedback(toggle_r, 8, tb);
-        dl.icon(.sidebar, toggle_r.x + 9, toggle_r.y + 9, 18, theme.text_2);
+        ui.feedback(toggle_r, theme.row_radius, tb);
+        dl.icon(.sidebar, toggle_r.x + (toggle_r.w - 18) / 2, toggle_r.y + (toggle_r.h - 18) / 2, 18, theme.text_2);
         if (tb.clicked) self.collapsed = false;
         res.band_inset = toggle_r.right() + 8;
     }

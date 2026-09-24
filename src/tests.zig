@@ -23,6 +23,9 @@ test {
     _ = @import("file_index.zig");
     _ = @import("ui/icon_spec.zig");
     _ = @import("config.zig");
+    _ = @import("physical/posture.zig");
+    _ = @import("physical/trigger.zig");
+    _ = @import("platform/speech.zig");
     _ = @import("objc.zig");
     _ = @import("tabs/web_tab.zig");
     _ = @import("tabs/web_bridge.zig");
@@ -32,6 +35,9 @@ test {
     _ = @import("git.zig");
     _ = @import("coding_agents.zig");
     _ = @import("paths.zig");
+    _ = @import("links.zig");
+    _ = @import("ui/themes.zig");
+    _ = @import("ui/theme.zig");
     _ = @import("search.zig");
     _ = @import("notebook/ipynb.zig");
     _ = @import("notebook/bridge.zig");

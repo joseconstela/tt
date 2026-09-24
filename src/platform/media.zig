@@ -1,4 +1,4 @@
-//! The Mac's cameras and microphones, as Settings › Permissions shows them:
+//! The Mac's cameras and microphones, as Settings › Browser shows them:
 //! whether macOS lets tt use them (the privacy switch every app has), the
 //! devices there are and which one is the system's default. Websites in
 //! tabs pick among the devices themselves; this only reads (and asks macOS
@@ -104,6 +104,28 @@ pub fn devices(gpa: std.mem.Allocator, kind: Kind) []Device {
 pub fn freeDevices(gpa: std.mem.Allocator, list: []Device) void {
     for (list) |d| gpa.free(d.name);
     gpa.free(list);
+}
+
+/// The system's default device of `kind` (an autoreleased AVCaptureDevice),
+/// null when there is none.
+pub fn defaultDevice(kind: Kind) id {
+    const cls = objc.objc_getClass("AVCaptureDevice");
+    if (cls == null) return null;
+    return msg(id, cls, "defaultDeviceWithMediaType:", .{mediaType(kind)});
+}
+
+/// The device of `kind` that macOS calls `name` (autoreleased), null when
+/// none is connected by that name.
+pub fn findDevice(kind: Kind, name: []const u8) id {
+    if (objc.objc_getClass("AVCaptureDevice") == null) return null;
+    const list = deviceList(kind);
+    const n: usize = if (list != null) @intCast(msg(NSUInteger, list, "count", .{})) else 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const dev = msg(id, list, "objectAtIndex:", .{@as(NSUInteger, i)});
+        if (std.mem.eql(u8, objc.utf8(msg(id, dev, "localizedName", .{})), name)) return dev;
+    }
+    return null;
 }
 
 extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;

@@ -11,6 +11,7 @@ const gfx_text = @import("../gfx/text.zig");
 const session_mod = @import("../term/session.zig");
 const buffer_mod = @import("../term/buffer.zig");
 const selection = @import("../term/selection.zig");
+const links = @import("../links.zig");
 const screen_mod = @import("../term/screen.zig");
 const boxdraw = @import("../gfx/boxdraw.zig");
 const Editor = @import("../input/editor.zig").Editor;
@@ -32,8 +33,14 @@ const Buffer = buffer_mod.Buffer;
 
 const collapse_threshold: u32 = 30;
 const collapsed_rows: u32 = 24;
-const line_h = theme.output_line_h;
 const input_row_h: f32 = 23;
+
+/// The room kept between blocks and around the column: none in compact
+/// mode, where the blocks and the input butt up against each other and
+/// the pane's edges.
+fn blockEdge(regular: f32) f32 {
+    return if (theme.compact) 0 else regular;
+}
 
 const note_no_agent = "No agent takes plain-English lines yet: pick one under Settings › AI › Features.";
 const note_empty_question = "Put the question after the #.";
@@ -1129,7 +1136,9 @@ pub const TerminalTab = struct {
         self.scroll_px = 0;
         self.mouse_down = false;
 
-        const col_w = @max(240, @min(theme.content_max_w, rect.w - 2 * theme.content_pad));
+        // Compact mode: blocks and input take the pane's full width, flush
+        // with its edges and bottom, like a plain terminal.
+        const col_w = if (theme.compact) rect.w else @max(240, @min(theme.content_max_w, rect.w - 2 * theme.content_pad));
         const col_x = rect.x + (rect.w - col_w) / 2;
 
         // Output width drives the PTY size so programs wrap where we do.
@@ -1140,8 +1149,8 @@ pub const TerminalTab = struct {
 
         self.refreshSuggestion();
         const input_h = self.inputHeight(ui, col_w);
-        const input_rect: Rect = .{ .x = col_x, .y = rect.bottom() - theme.content_pad - input_h, .w = col_w, .h = input_h };
-        const area: Rect = .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = @max(0, input_rect.y - theme.block_gap - rect.y) };
+        const input_rect: Rect = .{ .x = col_x, .y = rect.bottom() - blockEdge(theme.content_pad) - input_h, .w = col_w, .h = input_h };
+        const area: Rect = .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = @max(0, input_rect.y - blockEdge(theme.block_gap) - rect.y) };
 
         // A click anywhere drops the output selection; a press on output text
         // starts a new one later in this same frame.
@@ -1218,12 +1227,13 @@ pub const TerminalTab = struct {
             l.first_row = b.total_rows - collapsed_rows;
             l.hidden = l.first_row;
         }
-        const hidden_row: f32 = if (l.hidden > 0) line_h else 0;
-        const out_h = @as(f32, @floatFromInt(l.rows)) * line_h + hidden_row;
+        const hidden_row: f32 = if (l.hidden > 0) theme.term_line_h else 0;
+        const out_h = @as(f32, @floatFromInt(l.rows)) * theme.term_line_h + hidden_row;
         const has_body = l.rows > 0 or l.note != null;
 
+        const pad_y = theme.block_pad_y;
         if (l.failed) {
-            l.header_h = 14 + 21 + (if (has_body) @as(f32, 6) else 0);
+            l.header_h = pad_y + 21 + (if (has_body) @as(f32, 6) else 0);
             l.h = l.header_h;
             if (l.note != null) l.h += @as(f32, @floatFromInt(l.note_lines)) * 21;
             if (l.rows > 0) l.h += 10 + out_h + 10;
@@ -1231,12 +1241,12 @@ pub const TerminalTab = struct {
                 l.explain_lines = if (b.explanation.items.len == 0) 1 else wrapParagraphCount(ui, theme.font_ui, b.explanation.items, col_w - 2 * theme.block_pad_x);
                 l.h += explain_gap + explain_label_h + @as(f32, @floatFromInt(l.explain_lines)) * explain_line_h;
             }
-            l.h += 14 + 34 + 16;
+            l.h += pad_y + 34 + pad_y + 2;
         } else {
-            l.header_h = 14 + 21 + (if (has_body) @as(f32, 10) else 14);
+            l.header_h = pad_y + 21 + (if (has_body) @as(f32, if (theme.compact) 2 else 10) else pad_y);
             l.h = l.header_h;
-            if (l.note != null) l.h += @as(f32, @floatFromInt(l.note_lines)) * 21 + 14;
-            if (l.rows > 0) l.h += out_h + (if (l.collapsible) @as(f32, 4 + 28 + 10) else 14);
+            if (l.note != null) l.h += @as(f32, @floatFromInt(l.note_lines)) * 21 + pad_y;
+            if (l.rows > 0) l.h += out_h + (if (l.collapsible) @as(f32, 4 + 28 + 10) else pad_y);
         }
         return l;
     }
@@ -1247,9 +1257,10 @@ pub const TerminalTab = struct {
 
         // Total height first, so scrolling can be clamped and kept stable.
         var total: f32 = 0;
-        for (blocks) |b| total += self.layoutBlock(ui, b, cols, col_w).h + theme.block_gap;
-        if (blocks.len > 0) total -= theme.block_gap;
-        total += theme.content_pad; // breathing room above the first block
+        const gap = blockEdge(theme.block_gap);
+        for (blocks) |b| total += self.layoutBlock(ui, b, cols, col_w).h + gap;
+        if (blocks.len > 0) total -= gap;
+        total += blockEdge(theme.content_pad); // breathing room above the first block
         if (self.scroll > 0 and self.content_h > 0 and total != self.content_h) {
             // Content grew/shrank below the viewport: keep what the user reads in place.
             self.scroll = @max(0, self.scroll + (total - self.content_h));
@@ -1273,8 +1284,8 @@ pub const TerminalTab = struct {
             if (y < area.bottom() and y + l.h > area.y) {
                 self.drawBlock(ui, b, l, .{ .x = col_x, .y = y, .w = col_w, .h = l.h }, area, cols);
             }
-            y -= theme.block_gap;
-            if (y + theme.block_gap < area.y - 4000) break; // far above the viewport
+            y -= gap;
+            if (y + gap < area.y - 4000) break; // far above the viewport
         }
 
         sidebar.drawScrollbarAxis(ui, vbar, .vertical, area, max_scroll - self.scroll, total);
@@ -1282,12 +1293,16 @@ pub const TerminalTab = struct {
 
     fn drawBlock(self: *TerminalTab, ui: *Ui, b: *Block, l: BlockLayout, r: Rect, area: Rect, cols: u32) void {
         const dl = ui.dl;
-        dl.shape(r, theme.block_radius, theme.bg_block, if (l.failed) 1 else theme.block_border, if (l.failed) theme.red_line else theme.line);
+        if (theme.compact and !l.failed) {
+            // Rows of one listing: no card, a hairline under each block.
+            dl.rect(r, theme.bg_block);
+            dl.rect(.{ .x = r.x, .y = r.bottom() - 1, .w = r.w, .h = 1 }, theme.line);
+        } else dl.shape(r, theme.block_radius, theme.bg_block, if (l.failed) 1 else theme.block_border, if (l.failed) theme.red_line else theme.line);
         const px = r.x + theme.block_pad_x;
         const inner_w = r.w - 2 * theme.block_pad_x;
 
         // Header: "$ command" … status.
-        const head_cy = r.y + 14 + 10.5;
+        const head_cy = r.y + theme.block_pad_y + 10.5;
         var status_buf: [64]u8 = undefined;
         const status_text = statusText(b, self.now, &status_buf);
         const status_color = switch (b.state) {
@@ -1326,13 +1341,13 @@ pub const TerminalTab = struct {
 
         if (l.note) |note| {
             y = drawWrapped(ui, theme.font_ui, note, px, y, inner_w, 21, theme.text_2);
-            if (!l.failed) y += 14;
+            if (!l.failed) y += theme.block_pad_y;
         }
 
         if (l.rows > 0) {
             if (l.failed) {
-                const inset: Rect = .{ .x = px, .y = y, .w = inner_w, .h = 20 + @as(f32, @floatFromInt(l.rows)) * line_h + (if (l.hidden > 0) line_h else 0) };
-                dl.rrect(inset, 8, theme.bg_inset);
+                const inset: Rect = .{ .x = px, .y = y, .w = inner_w, .h = 20 + @as(f32, @floatFromInt(l.rows)) * theme.term_line_h + (if (l.hidden > 0) theme.term_line_h else 0) };
+                dl.rrect(inset, theme.row_radius, theme.bg_inset);
                 y = self.drawRows(ui, b, l, px + 14, y + 10, area, cols) + 10;
             } else {
                 y = self.drawRows(ui, b, l, px, y, area, cols);
@@ -1343,7 +1358,7 @@ pub const TerminalTab = struct {
             if (l.explain_lines > 0) y = self.drawExplanation(ui, b, px, y, inner_w);
 
             // Action row (design: Fix with agent · Explain · Run again ··· Show full output).
-            const by = y + 14;
+            const by = y + theme.block_pad_y;
             var bx = px;
             const fix_id = Ui.id("block.fix", b.id);
             bx = self.actionButton(ui, fix_id, bx, by, "Fix with agent", .primary) + 10;
@@ -1384,12 +1399,12 @@ pub const TerminalTab = struct {
         const st = ui.button(wid, r);
         switch (kind) {
             .primary => {
-                ui.dl.rrect(r, 8, if (st.held) theme.accent.alpha(0.8) else if (st.hover) Color.mix(theme.accent, theme.text, 0.18) else theme.accent);
+                ui.dl.rrect(r, theme.row_radius, if (st.held) theme.accent.alpha(0.8) else if (st.hover) Color.mix(theme.accent, theme.text, 0.18) else theme.accent);
                 _ = ui.dl.textCentered(font, r.x + pad, r.centerY(), label, theme.on_accent);
             },
             .outline => {
-                ui.feedback(r, 8, st);
-                ui.dl.border(r, 8, 1, theme.line_strong);
+                ui.feedback(r, theme.row_radius, st);
+                ui.dl.border(r, theme.row_radius, 1, theme.line_strong);
                 _ = ui.dl.textCentered(font, r.x + pad, r.centerY(), label, theme.text);
             },
         }
@@ -1457,20 +1472,33 @@ pub const TerminalTab = struct {
         if (l.hidden > 0) {
             var buf: [64]u8 = undefined;
             const label = std.fmt.bufPrint(&buf, "··· {d} earlier lines", .{l.hidden}) catch "···";
-            _ = dl.textCentered(theme.font_output, x, y + line_h / 2, label, theme.text_3);
-            y += line_h;
+            _ = dl.textCentered(theme.font_output, x, y + theme.term_line_h / 2, label, theme.text_3);
+            y += theme.term_line_h;
         }
         if (b.row_starts.items.len == 0) return y;
+
+        // A link under the pointer: ⌘/⌃-click opens it, before the
+        // selection below can take the press.
+        var link_buf: [links.max_len]u8 = undefined;
+        const link: ?selection.Link = blk: {
+            const cell_w = ui.text.cellAdvance(theme.font_output);
+            const rows_rect: Rect = .{ .x = x, .y = y, .w = @as(f32, @floatFromInt(cols)) * cell_w, .h = @as(f32, @floatFromInt(l.rows)) * theme.term_line_h };
+            if (!ui.mouseIn(rows_rect)) break :blk null;
+            const rows: selection.Rows = .{ .starts = b.row_starts.items, .first_row = l.first_row, .rows = l.rows, .cols = cols };
+            const found = selection.linkUnder(&b.buf, rows, x, y, cell_w, theme.term_line_h, ui.mx, ui.my, &link_buf) orelse break :blk null;
+            _ = ui.link(found.url);
+            break :blk found;
+        };
 
         // Mouse text selection (drag; double-click = word, triple-click = line).
         {
             const cell_w = ui.text.cellAdvance(theme.font_output);
-            const rows_rect: Rect = .{ .x = x - 6, .y = y, .w = @as(f32, @floatFromInt(cols)) * cell_w + 12, .h = @as(f32, @floatFromInt(l.rows)) * line_h };
+            const rows_rect: Rect = .{ .x = x - 6, .y = y, .w = @as(f32, @floatFromInt(cols)) * cell_w + 12, .h = @as(f32, @floatFromInt(l.rows)) * theme.term_line_h };
             const d = ui.drag(Ui.id("block.select", b.id), rows_rect);
             if (d.hover or d.dragging) ui.cursor = .ibeam;
             if (d.started or d.dragging) {
                 const rows: selection.Rows = .{ .starts = b.row_starts.items, .first_row = l.first_row, .rows = l.rows, .cols = cols };
-                const pos = selection.hitTest(&b.buf, rows, x, y, cell_w, line_h, ui.mx, ui.my);
+                const pos = selection.hitTest(&b.buf, rows, x, y, cell_w, theme.term_line_h, ui.mx, ui.my);
                 if (d.started) {
                     self.editor.anchor = null;
                     self.sel_block = b.id;
@@ -1486,10 +1514,10 @@ pub const TerminalTab = struct {
         var row = l.first_row;
         const end_row = l.first_row + l.rows;
         if (y < area.y) {
-            const skip: u32 = @intFromFloat(@floor((area.y - y) / line_h));
+            const skip: u32 = @intFromFloat(@floor((area.y - y) / theme.term_line_h));
             const s = @min(skip, l.rows);
             row += s;
-            y += @as(f32, @floatFromInt(s)) * line_h;
+            y += @as(f32, @floatFromInt(s)) * theme.term_line_h;
         }
 
         // Locate the logical line containing `row`.
@@ -1510,7 +1538,7 @@ pub const TerminalTab = struct {
 
         while (row < end_row and line_idx < b.row_starts.items.len) : (row += 1) {
             if (y > area.bottom()) {
-                y += @as(f32, @floatFromInt(end_row - row)) * line_h;
+                y += @as(f32, @floatFromInt(end_row - row)) * theme.term_line_h;
                 break;
             }
             while (line_idx + 1 < b.row_starts.items.len and b.row_starts.items[line_idx + 1] <= row) line_idx += 1;
@@ -1519,7 +1547,7 @@ pub const TerminalTab = struct {
             const from = @min(cells.len, @as(usize, seg) * cols);
             const to = @min(cells.len, from + cols);
 
-            const baseline_px = @round(ui.text.baselineForCenter(theme.font_output, y + line_h / 2) * scale);
+            const baseline_px = @round(ui.text.baselineForCenter(theme.font_output, y + theme.term_line_h / 2) * scale);
             const x_px = @round(x * scale);
             var col: f32 = 0;
             for (cells[from..to], from..) |cell, cell_idx| {
@@ -1528,10 +1556,10 @@ pub const TerminalTab = struct {
                     const here: selection.Pos = .{ .line = line_idx, .cell = cell_idx };
                     if (!here.before(s[0]) and here.before(s[1])) {
                         const sw: f32 = @floatFromInt(@max(1, gfx_text.cellWidth(cell.cp)));
-                        dl.rect(.{ .x = (x_px + col * cell_px) / scale, .y = y, .w = sw * cell_px / scale, .h = line_h }, theme.selection());
+                        dl.rect(.{ .x = (x_px + col * cell_px) / scale, .y = y, .w = sw * cell_px / scale, .h = theme.term_line_h }, theme.selection());
                     }
                 }
-                var fg = resolve(st.fg, if (st.bold) theme.text else theme.text_2, .fg);
+                var fg = resolve(st.fg, if (st.bold) theme.text else theme.term_fg, .fg);
                 var bg: ?Color = if (st.bg != buffer_mod.color_default) resolve(st.bg, theme.bg_block, .bg) else null;
                 if (st.inverse) {
                     const old_fg = fg;
@@ -1539,18 +1567,20 @@ pub const TerminalTab = struct {
                     bg = old_fg;
                 }
                 if (st.dim) fg = fg.alpha(0.6);
+                const on_link = if (link) |lk| lk.covers(line_idx, cell_idx) else false;
+                if (on_link and ui.linkModifier()) fg = theme.scopeColor(.link);
                 const w_cells: f32 = @floatFromInt(@max(1, gfx_text.cellWidth(cell.cp)));
                 const cx = (x_px + col * cell_px) / scale;
-                if (bg) |c| dl.rect(.{ .x = cx, .y = y, .w = w_cells * cell_px / scale, .h = line_h }, c);
-                if (cell.cp != ' ' and !boxdraw.draw(dl, .{ .x = cx, .y = y, .w = w_cells * cell_px / scale, .h = line_h }, cell.cp, fg)) {
+                if (bg) |c| dl.rect(.{ .x = cx, .y = y, .w = w_cells * cell_px / scale, .h = theme.term_line_h }, c);
+                if (cell.cp != ' ' and !boxdraw.draw(dl, .{ .x = cx, .y = y, .w = w_cells * cell_px / scale, .h = theme.term_line_h }, cell.cp, fg)) {
                     const font = if (st.bold) theme.font_output_bold else theme.font_output;
                     _ = dl.glyph(font, cell.cp, x_px + col * cell_px, baseline_px, fg, clip);
                 }
-                if (st.underline) dl.rect(.{ .x = cx, .y = y + line_h - 5, .w = w_cells * cell_px / scale, .h = 1 }, fg);
-                if (st.strike) dl.rect(.{ .x = cx, .y = y + line_h / 2, .w = w_cells * cell_px / scale, .h = 1 }, fg);
+                if (st.underline or on_link) dl.rect(.{ .x = cx, .y = y + theme.term_line_h - 5, .w = w_cells * cell_px / scale, .h = 1 }, fg);
+                if (st.strike) dl.rect(.{ .x = cx, .y = y + theme.term_line_h / 2, .w = w_cells * cell_px / scale, .h = 1 }, fg);
                 col += @floatFromInt(gfx_text.cellWidth(cell.cp));
             }
-            y += line_h;
+            y += theme.term_line_h;
         }
         return y;
     }
@@ -1566,6 +1596,11 @@ pub const TerminalTab = struct {
         dl.rect(rect, theme.bg);
         dl.pushClip(rect);
         defer dl.popClip();
+        // A link on the row under the pointer: ⌘/⌃-click opens it instead of
+        // reaching the program.
+        var link_buf: [links.max_len]u8 = undefined;
+        const link = screenLink(ui, rect, rs, cell_w, cell_h, &link_buf);
+        if (link) |lk| _ = ui.link(lk.url);
         self.screenMouse(ui, rect, scr, cell_w, cell_h);
 
         const scale = dl.scale;
@@ -1607,7 +1642,9 @@ pub const TerminalTab = struct {
                 if (cp == 0 or cp == ' ') continue;
                 const st: screen_mod.Style = if (raw.style_id == 0) .{} else style_in;
                 if (st.flags.invisible) continue;
-                const colors = screenColors(rs, st);
+                var colors = screenColors(rs, st);
+                const on_link = if (link) |lk| lk.row == y and lk.span.contains(cx_i) else false;
+                if (on_link and ui.linkModifier()) colors.fg = theme.scopeColor(.link);
                 const w_cells: f32 = if (raw.wide == .wide) 2 else 1;
                 const gx_px = x0_px + @as(f32, @floatFromInt(cx_i)) * cell_px;
                 const cell_rect: Rect = .{ .x = gx_px / scale, .y = row_y, .w = w_cells * cell_w, .h = cell_h };
@@ -1615,7 +1652,7 @@ pub const TerminalTab = struct {
                     const font = if (st.flags.bold) theme.font_output_bold else theme.font_output;
                     _ = dl.glyph(font, cp, gx_px, baseline_px, colors.fg, clip);
                 }
-                if (st.flags.underline != .none) dl.rect(.{ .x = cell_rect.x, .y = row_y + cell_h - 2, .w = cell_rect.w, .h = 1 }, colors.fg);
+                if (st.flags.underline != .none or on_link) dl.rect(.{ .x = cell_rect.x, .y = row_y + cell_h - 2, .w = cell_rect.w, .h = 1 }, colors.fg);
                 if (st.flags.strikethrough) dl.rect(.{ .x = cell_rect.x, .y = row_y + @floor(cell_h / 2), .w = cell_rect.w, .h = 1 }, colors.fg);
             }
         }
@@ -1656,26 +1693,26 @@ pub const TerminalTab = struct {
             return;
         }
         switch (rs.cursor.visual_style) {
-            .bar => dl.rect(.{ .x = cx, .y = cy, .w = 2, .h = cell_h }, theme.text),
-            .underline => dl.rect(.{ .x = cx, .y = cy + cell_h - 2, .w = cw, .h = 2 }, theme.text),
+            .bar => dl.rect(.{ .x = cx, .y = cy, .w = 2, .h = cell_h }, theme.cursor),
+            .underline => dl.rect(.{ .x = cx, .y = cy + cell_h - 2, .w = cw, .h = 2 }, theme.cursor),
             .block => {
-                dl.rect(r, theme.text);
-                // The glyph under it, in the background colour.
+                dl.rect(r, theme.cursor);
+                // The glyph under it, in the cursor's text colour.
                 const raw = rs.cursor.cell;
                 const cp: u21 = switch (raw.content_tag) {
                     .codepoint, .codepoint_grapheme => raw.content.codepoint.data,
                     else => 0,
                 };
-                if (cp != 0 and cp != ' ' and !boxdraw.draw(dl, r, cp, theme.bg)) {
+                if (cp != 0 and cp != ' ' and !boxdraw.draw(dl, r, cp, theme.cursor_text)) {
                     const baseline_px = @round(ui.text.baselineForCenter(theme.font_output, cy + cell_h / 2) * scale);
                     const clip = blk: {
                         const c = dl.currentClip();
                         break :blk [4]f32{ @round(c.x * scale), @round(c.y * scale), @round(c.right() * scale), @round(c.bottom() * scale) };
                     };
-                    _ = dl.glyph(theme.font_output, cp, @round(cx * scale), baseline_px, theme.bg, clip);
+                    _ = dl.glyph(theme.font_output, cp, @round(cx * scale), baseline_px, theme.cursor_text, clip);
                 }
             },
-            else => dl.border(r, 0, 1, theme.text),
+            else => dl.border(r, 0, 1, theme.cursor),
         }
     }
 
@@ -1806,7 +1843,7 @@ pub const TerminalTab = struct {
 
     fn inputHeight(self: *TerminalTab, ui: *Ui, box_w: f32) f32 {
         const l = self.inputLayout(ui, box_w);
-        return 16 + @as(f32, @floatFromInt(l.rows)) * input_row_h + 16;
+        return 2 * theme.input_pad_y + @as(f32, @floatFromInt(l.rows)) * input_row_h;
     }
 
     /// Byte offset of the character cell at (row, col) in the wrapped layout.
@@ -1839,11 +1876,15 @@ pub const TerminalTab = struct {
         const lay = self.inputLayout(ui, r.w);
         const cell = ui.text.cellAdvance(theme.font_input);
         const border_color = if (!focused) theme.line_strong else if (busy) theme.teal.alpha(0.75) else theme.accent;
-        dl.shape(r, theme.block_radius, theme.bg_inset, 1, border_color);
+        if (theme.compact) {
+            // Flush with the pane: a line on top says where the focus is.
+            dl.rect(r, theme.bg_inset);
+            dl.rect(.{ .x = r.x, .y = r.y, .w = r.w, .h = 1 }, border_color);
+        } else dl.shape(r, theme.block_radius, theme.bg_inset, 1, border_color);
 
         const px = r.x + theme.block_pad_x;
         const text_x = px + lay.prompt_w;
-        const text_y = r.y + 16;
+        const text_y = r.y + theme.input_pad_y;
         self.text_x = text_x;
         self.text_y = text_y;
         self.text_cols = lay.cols;
@@ -1864,7 +1905,7 @@ pub const TerminalTab = struct {
         }
 
         // Mouse: place caret / drag-select.
-        const text_rect: Rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = 16 + @as(f32, @floatFromInt(lay.rows)) * input_row_h + 8 };
+        const text_rect: Rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = theme.input_pad_y + @as(f32, @floatFromInt(lay.rows)) * input_row_h + 8 };
         const d = ui.drag(Ui.id("input.text", self.wid_salt), text_rect);
         if (d.hover or d.dragging) ui.cursor = .ibeam;
         if (d.started or d.dragging) {
@@ -2032,6 +2073,30 @@ fn palette(n: u8) Color {
 /// Row height for a program's screen: the font's content height plus a
 /// little leading. Box-drawing glyphs are drawn by hand (gfx/boxdraw.zig),
 /// so lines still join across rows.
+const ScreenLink = struct { row: usize, span: links.Span, url: []const u8 };
+
+fn screenCp(raw: screen_mod.Cell) u21 {
+    return switch (raw.content_tag) {
+        .codepoint, .codepoint_grapheme => if (raw.content.codepoint.data == 0) ' ' else raw.content.codepoint.data,
+        else => ' ',
+    };
+}
+
+/// The link on the full-screen row under the pointer (a program's own
+/// wrapping is not known, so one row at a time), its address in `out`.
+fn screenLink(ui: *Ui, rect: Rect, rs: *const screen_mod.RenderState, cell_w: f32, cell_h: f32, out: []u8) ?ScreenLink {
+    if (!ui.mouseIn(rect)) return null;
+    const col: usize = @intFromFloat(@floor((ui.mx - rect.x) / cell_w));
+    const row: usize = @intFromFloat(@floor((ui.my - rect.y) / cell_h));
+    const rows_cells = rs.row_data.items(.cells);
+    if (row >= rs.rows or row >= rows_cells.len) return null;
+    const raws = rows_cells[row].slice().items(.raw);
+    const span = links.spanAt(screen_mod.Cell, raws, col, screenCp) orelse return null;
+    if (span.end - span.start > out.len) return null;
+    for (raws[span.start..span.end], 0..) |raw, i| out[i] = @intCast(screenCp(raw));
+    return .{ .row = row, .span = span, .url = out[0 .. span.end - span.start] };
+}
+
 fn screenLineHeight(ui: *Ui) f32 {
     const font = theme.font_output;
     return @ceil(ui.text.ascent(font) + ui.text.descent(font)) + 2;

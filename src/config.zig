@@ -6,11 +6,14 @@
 //! builds can read newer files.
 //!
 //!   ui:
-//!     mode: system          # dark | light | system | eink | eink-color
+//!     style: system         # dark | light | system | eink | eink-color, or a
+//!                           # terminal theme's id (dracula, solarized-light …)
 //!     accent: amber         # amber | peach | lime | rose | "#RRGGBB"
-//!   screens:                # the mode to use while the window is on a display
+//!     compact: false        # tighter spacing, full-width terminal (Settings › Mode)
+//!     nt_mode: false        # non-technical mode (a placeholder: changes nothing yet)
+//!   screens:                # the style to use while the window is on a display
 //!     - name: DASUNG Paperlike   # the display's name in System Settings
-//!       mode: eink               # dark | light | system | eink | eink-color
+//!       style: eink              # as ui.style (older files say `mode:`)
 //!   apis:                   # (older files say `agents:`; both are read)
 //!     - name: Claude
 //!       provider: anthropic # anthropic | openai | google | mistral | ollama | custom
@@ -31,6 +34,7 @@
 //!     strip_outputs: false                # save .ipynb files without their outputs
 //!     share_schema: true                  # agents asked from a notebook get variable names + types
 //!   browser:
+//!     open_links: tt                      # tt | browser: where ⌘/⌃-clicked links open
 //!     keep_cookies: false                 # false clears cookies and site data on close
 //!     homepage: ""                        # blank = a white page
 //!     do_not_track: false
@@ -42,6 +46,20 @@
 //!       camera: allow                     # allow | block; absent = the default above
 //!       microphone: allow
 //!       notifications: allow
+//!   physical:               # tt's own use of the camera (Settings › Physical interactions)
+//!     camera: ""                          # a camera's name; blank = the macOS default
+//!     blur_when_away: false               # blur the window while nobody looks at it
+//!     blur_after: 3                       # seconds of looking away before it blurs
+//!     sensitivity: normal                 # relaxed | normal | strict
+//!     center_yaw: 0                       # from Calibrate: the head while looking at
+//!     center_pitch: 0                     #   the screen, in degrees …
+//!     face_size: 0                        # … and its size (0 = not calibrated)
+//!     neck: 0
+//!   voice:                  # voice commands (Settings › Physical interactions › Voice)
+//!     enabled: false                      # listen for the trigger word while tt is open
+//!     microphone: ""                      # a microphone's name; blank = the macOS default
+//!     language: ""                        # what is spoken (en-US, es-ES …); blank = the Mac's language
+//!     trigger: tt                         # the word that starts a command
 //!
 //! In the code an "agent" is one of the APIs (a model at a provider); the
 //! coding agents installed on the Mac live in `coding_agents.zig`.
@@ -50,40 +68,52 @@
 //! (`touch`) so typing into a field does not rewrite the file per keystroke.
 const std = @import("std");
 const sys = @import("sys.zig");
+const themes = @import("ui/themes.zig");
+const posture = @import("physical/posture.zig");
 
-/// The UI's colour scheme (e-ink is black on white, for e-paper panels),
-/// or following macOS.
-pub const Mode = enum {
+/// The UI's style (Settings › Style): tt's own dark or light palette,
+/// following macOS between them, e-ink (black on white, for e-paper
+/// panels) and its colour variant, or one of the classic terminal themes.
+pub const Mode = union(enum) {
     dark,
     light,
     system,
     eink,
     eink_color,
+    /// A terminal theme: its index in `themes.all`.
+    theme: u8,
 
     pub fn label(self: Mode) []const u8 {
         return switch (self) {
-            .dark => "Dark",
-            .light => "Light",
+            .dark => "tt Dark",
+            .light => "tt Light",
             .system => "System",
             .eink => "E-ink",
             .eink_color => "E-ink colour",
+            .theme => |i| themes.all[i].name,
         };
     }
 
-    /// How the mode is written in the config file: a hyphen where the enum
-    /// tag has an underscore, so hand-editors see `eink-color`.
+    /// How the style is written in the config file: a hyphen where the tag
+    /// has an underscore, so hand-editors see `eink-color`; a theme by id.
     pub fn configName(self: Mode) []const u8 {
         return switch (self) {
             .eink_color => "eink-color",
+            .theme => |i| themes.all[i].id,
             else => @tagName(self),
         };
     }
 
+    pub fn eql(a: Mode, b: Mode) bool {
+        return std.meta.eql(a, b);
+    }
+
     fn parse(s: []const u8) ?Mode {
         if (std.ascii.eqlIgnoreCase(s, "eink-color") or std.ascii.eqlIgnoreCase(s, "eink-colour")) return .eink_color;
-        inline for (std.meta.fields(Mode)) |f| {
-            if (std.ascii.eqlIgnoreCase(s, f.name)) return @enumFromInt(f.value);
+        inline for (.{ "dark", "light", "system", "eink", "eink_color" }) |name| {
+            if (std.ascii.eqlIgnoreCase(s, name)) return @field(Mode, name);
         }
+        if (themes.find(s)) |i| return .{ .theme = @intCast(i) };
         return null;
     }
 };
@@ -234,6 +264,10 @@ pub const Notebooks = struct {
 
 /// Website tabs (see tabs/web_tab.zig).
 pub const Browser = struct {
+    /// Where a link ⌘- or ⌃-clicked in a command's output, a Markdown
+    /// preview, a notebook or a file opens: a website tab in tt (the
+    /// default) or the system's default browser.
+    open_links: LinkTarget = .tt,
     /// Keep cookies and site data between launches. Off (the default) uses a
     /// private, in-memory store that is cleared when the app closes.
     keep_cookies: bool = false,
@@ -262,6 +296,61 @@ pub const Browser = struct {
     }
 };
 
+/// Settings › Physical interactions: what tt itself does with the camera
+/// (see physical/camera_controller.zig).
+pub const Physical = struct {
+    /// The camera, by the name macOS gives it; blank = the macOS default.
+    camera: []u8 = "",
+    /// Blur the window while nobody looks at it.
+    blur_when_away: bool = false,
+    /// Seconds of looking away before the blur comes.
+    blur_after: f32 = 3,
+    /// How far the head may turn or nod before it counts as looking away.
+    sensitivity: posture.Sensitivity = .normal,
+    /// The head and shoulders while looking at the screen (Calibrate).
+    calibration: posture.Calibration = .{},
+
+    fn deinit(self: *Physical, gpa: std.mem.Allocator) void {
+        gpa.free(self.camera);
+        self.* = .{};
+    }
+};
+
+/// Settings › Physical interactions › Voice: voice commands, started by a
+/// trigger word (see physical/voice_controller.zig).
+pub const Voice = struct {
+    /// Listen for the trigger word while tt is open.
+    enabled: bool = false,
+    /// The microphone, by the name macOS gives it; blank = the macOS default.
+    microphone: []u8 = "",
+    /// The word that starts a command; blank = "tt".
+    trigger: []u8 = "",
+    /// The language spoken, as a code ("en-US"); blank = the Mac's language.
+    language: []u8 = "",
+
+    fn deinit(self: *Voice, gpa: std.mem.Allocator) void {
+        gpa.free(self.microphone);
+        gpa.free(self.language);
+        gpa.free(self.trigger);
+        self.* = .{};
+    }
+};
+
+/// Where links open (`Browser.open_links`).
+pub const LinkTarget = enum {
+    /// A new website tab, next to the current one.
+    tt,
+    /// The default web browser, outside tt.
+    browser,
+
+    fn parse(s: []const u8) ?LinkTarget {
+        const v = std.mem.trim(u8, s, " \t\"'");
+        if (std.ascii.eqlIgnoreCase(v, "tt") or std.ascii.eqlIgnoreCase(v, "inside") or std.ascii.eqlIgnoreCase(v, "tab")) return .tt;
+        if (std.ascii.eqlIgnoreCase(v, "browser") or std.ascii.eqlIgnoreCase(v, "system") or std.ascii.eqlIgnoreCase(v, "default") or std.ascii.eqlIgnoreCase(v, "outside")) return .browser;
+        return null;
+    }
+};
+
 /// What a website may do with something only the user can grant: ask each
 /// time (a bar under the address bar), or a standing yes or no.
 pub const Permission = enum {
@@ -286,7 +375,7 @@ pub const Permission = enum {
     }
 };
 
-/// What a website has to ask for (Settings › Permissions).
+/// What a website has to ask for (Settings › Browser).
 pub const SiteFeature = enum {
     camera,
     microphone,
@@ -357,6 +446,12 @@ pub const Config = struct {
     path: ?[]u8 = null,
     mode: Mode = .system,
     accent: Accent = .{ .named = 0 },
+    /// Compact mode: smaller spacing everywhere, square corners, the
+    /// terminal across the full width (`theme.setCompact`).
+    compact: bool = false,
+    /// "NT mode" (non-technical): only offered while compact mode is off.
+    /// A placeholder for now; nothing reads it yet.
+    nt_mode: bool = false,
     /// Displays with a mode of their own; the window follows whichever
     /// one it is on, and `mode` applies on any other.
     screens: std.ArrayList(Screen) = .empty,
@@ -366,6 +461,8 @@ pub const Config = struct {
     features: Features = .{},
     notebooks: Notebooks = .{},
     browser: Browser = .{},
+    physical: Physical = .{},
+    voice: Voice = .{},
     /// Bumped on every change, so views can notice edits made elsewhere.
     version: u64 = 0,
     /// A change waiting to be written (see `touch` / `saveIfDue`).
@@ -391,6 +488,8 @@ pub const Config = struct {
         self.gpa.free(self.features.fix_agent);
         self.gpa.free(self.features.fix_prompt);
         self.browser.deinit(self.gpa);
+        self.physical.deinit(self.gpa);
+        self.voice.deinit(self.gpa);
         if (self.path) |p| self.gpa.free(p);
         self.* = .{ .gpa = self.gpa };
     }
@@ -501,8 +600,20 @@ pub const Config = struct {
     }
 
     pub fn setMode(self: *Config, mode: Mode) void {
-        if (self.mode == mode) return;
+        if (self.mode.eql(mode)) return;
         self.mode = mode;
+        self.changed();
+    }
+
+    pub fn setCompact(self: *Config, on: bool) void {
+        if (self.compact == on) return;
+        self.compact = on;
+        self.changed();
+    }
+
+    pub fn setNtMode(self: *Config, on: bool) void {
+        if (self.nt_mode == on) return;
+        self.nt_mode = on;
         self.changed();
     }
 
@@ -540,7 +651,7 @@ pub const Config = struct {
                 self.changed();
                 return;
             };
-            if (sc.mode == m) return;
+            if (sc.mode.eql(m)) return;
             sc.mode = m;
             self.changed();
             return;
@@ -712,17 +823,19 @@ pub const Config = struct {
         const gpa = self.gpa;
         try out.appendSlice(gpa, "# tt settings. Changed from the Settings tab; safe to edit by hand.\n");
         try out.appendSlice(gpa, "ui:\n");
-        try out.print(gpa, "  mode: {s}   # dark | light | system | eink | eink-color\n", .{self.mode.configName()});
+        try out.print(gpa, "  style: {s}   # dark | light | system | eink | eink-color | a theme (Settings › Style)\n", .{self.mode.configName()});
         switch (self.accent) {
             .named => |i| try out.print(gpa, "  accent: {s}   # amber | peach | lime | rose | \"#RRGGBB\"\n", .{accent_names[@min(i, accent_names.len - 1)]}),
             .custom => |rgb| try out.print(gpa, "  accent: \"#{X:0>6}\"   # amber | peach | lime | rose | \"#RRGGBB\"\n", .{rgb}),
         }
+        try out.print(gpa, "  compact: {s}   # tighter spacing, full-width terminal (Settings › Mode)\n", .{if (self.compact) "true" else "false"});
+        try out.print(gpa, "  nt_mode: {s}   # non-technical mode (not in use yet)\n", .{if (self.nt_mode) "true" else "false"});
         if (self.screens.items.len > 0) {
-            try out.appendSlice(gpa, "screens:   # the mode to use while the window is on a display\n");
+            try out.appendSlice(gpa, "screens:   # the style to use while the window is on a display\n");
             for (self.screens.items) |sc| {
                 try out.appendSlice(gpa, "  - name: ");
                 try writeScalar(gpa, out, sc.name);
-                try out.print(gpa, "\n    mode: {s}\n", .{sc.mode.configName()});
+                try out.print(gpa, "\n    style: {s}\n", .{sc.mode.configName()});
             }
         }
         if (self.agents.items.len == 0) {
@@ -756,6 +869,7 @@ pub const Config = struct {
         try out.print(gpa, "  strip_outputs: {s}\n", .{if (self.notebooks.strip_outputs) "true" else "false"});
         try out.print(gpa, "  share_schema: {s}\n", .{if (self.notebooks.share_schema) "true" else "false"});
         try out.appendSlice(gpa, "browser:\n");
+        try out.print(gpa, "  open_links: {s}   # tt | browser: where ⌘/⌃-clicked links open\n", .{@tagName(self.browser.open_links)});
         try out.print(gpa, "  keep_cookies: {s}   # false clears cookies and site data on close\n", .{if (self.browser.keep_cookies) "true" else "false"});
         try writeField(gpa, out, "homepage", self.browser.homepage); // blank = a white page
         try out.print(gpa, "  do_not_track: {s}\n", .{if (self.browser.do_not_track) "true" else "false"});
@@ -774,6 +888,22 @@ pub const Config = struct {
                 }
             }
         }
+        const ph = &self.physical;
+        try out.appendSlice(gpa, "physical:   # tt's own use of the camera (Settings › Physical interactions)\n");
+        try writeField(gpa, out, "camera", ph.camera); // blank = the macOS default
+        try out.print(gpa, "  blur_when_away: {s}\n", .{if (ph.blur_when_away) "true" else "false"});
+        try out.print(gpa, "  blur_after: {d}   # seconds\n", .{ph.blur_after});
+        try out.print(gpa, "  sensitivity: {s}   # relaxed | normal | strict\n", .{@tagName(ph.sensitivity)});
+        try out.print(gpa, "  center_yaw: {d:.1}   # from Calibrate: the head while looking at the screen\n", .{ph.calibration.yaw});
+        try out.print(gpa, "  center_pitch: {d:.1}\n", .{ph.calibration.pitch});
+        try out.print(gpa, "  face_size: {d:.3}   # 0 = not calibrated\n", .{ph.calibration.face_size});
+        try out.print(gpa, "  neck: {d:.3}\n", .{ph.calibration.neck});
+        const vo = &self.voice;
+        try out.appendSlice(gpa, "voice:   # voice commands (Settings › Physical interactions › Voice)\n");
+        try out.print(gpa, "  enabled: {s}\n", .{if (vo.enabled) "true" else "false"});
+        try writeField(gpa, out, "microphone", vo.microphone); // blank = the macOS default
+        try writeField(gpa, out, "language", vo.language); // blank = the Mac's language
+        try writeField(gpa, out, "trigger", if (vo.trigger.len > 0) vo.trigger else "tt");
     }
 
     fn writeField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
@@ -826,12 +956,23 @@ pub const Config = struct {
         return true;
     }
 
-    const Section = enum { none, ui, agents, apis, features, screens, notebooks, browser, sites };
+    fn voiceString(vo: *Voice, key: []const u8) ?*[]u8 {
+        if (std.mem.eql(u8, key, "microphone")) return &vo.microphone;
+        if (std.mem.eql(u8, key, "trigger")) return &vo.trigger;
+        if (std.mem.eql(u8, key, "language")) return &vo.language;
+        return null;
+    }
+
+    const Section = enum { none, ui, agents, apis, features, screens, notebooks, browser, sites, physical, voice };
 
     /// Reads the subset `write` produces (plus hand edits of the same
     /// shape). Anything it does not understand is skipped.
     fn parse(self: *Config, data: []const u8) !void {
         var section: Section = .none;
+        // Files from when a theme was picked per scheme: the one for the
+        // scheme in use becomes the style (see the end).
+        var old_dark: ?Mode = null;
+        var old_light: ?Mode = null;
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |raw_line| {
             const line = stripComment(std.mem.trimEnd(u8, raw_line, "\r"));
@@ -859,10 +1000,19 @@ pub const Config = struct {
                 .none => {},
                 .ui => {
                     const kv = splitKey(body) orelse continue;
-                    if (std.mem.eql(u8, kv.key, "mode")) {
-                        if (Mode.parse(kv.value)) |m| self.mode = m;
+                    // `mode:` is what files from before Settings › Style say.
+                    if (std.mem.eql(u8, kv.key, "style") or std.mem.eql(u8, kv.key, "mode")) {
+                        if (Mode.parse(std.mem.trim(u8, kv.value, "\"' "))) |m| self.mode = m;
                     } else if (std.mem.eql(u8, kv.key, "accent")) {
                         if (parseAccent(kv.value)) |a| self.accent = a;
+                    } else if (std.mem.eql(u8, kv.key, "compact")) {
+                        self.compact = isTrue(kv.value);
+                    } else if (std.mem.eql(u8, kv.key, "nt_mode")) {
+                        self.nt_mode = isTrue(kv.value);
+                    } else if (std.mem.eql(u8, kv.key, "dark_theme")) {
+                        old_dark = Mode.parse(std.mem.trim(u8, kv.value, "\"' "));
+                    } else if (std.mem.eql(u8, kv.key, "light_theme")) {
+                        old_light = Mode.parse(std.mem.trim(u8, kv.value, "\"' "));
                     }
                 },
                 .features => {
@@ -903,7 +1053,9 @@ pub const Config = struct {
                 },
                 .browser => {
                     const kv = splitKey(body) orelse continue;
-                    if (std.mem.eql(u8, kv.key, "keep_cookies")) {
+                    if (std.mem.eql(u8, kv.key, "open_links")) {
+                        if (LinkTarget.parse(kv.value)) |t| self.browser.open_links = t;
+                    } else if (std.mem.eql(u8, kv.key, "keep_cookies")) {
                         self.browser.keep_cookies = isTrue(kv.value);
                     } else if (std.mem.eql(u8, kv.key, "do_not_track")) {
                         self.browser.do_not_track = isTrue(kv.value);
@@ -917,6 +1069,44 @@ pub const Config = struct {
                             .microphone => self.browser.microphone = p,
                             .notifications => self.browser.notifications = p,
                         };
+                    }
+                },
+                .physical => {
+                    const kv = splitKey(body) orelse continue;
+                    const ph = &self.physical;
+                    const bare = std.mem.trim(u8, kv.value, "\"' ");
+                    if (std.mem.eql(u8, kv.key, "camera")) {
+                        const v = try unquote(self.gpa, kv.value);
+                        defer self.gpa.free(v);
+                        self.setString(&ph.camera, v);
+                    } else if (std.mem.eql(u8, kv.key, "blur_when_away")) {
+                        ph.blur_when_away = isTrue(kv.value);
+                    } else if (std.mem.eql(u8, kv.key, "sensitivity")) {
+                        if (posture.Sensitivity.parse(bare)) |v| ph.sensitivity = v;
+                    } else if (std.fmt.parseFloat(f32, bare)) |v| {
+                        if (!std.math.isFinite(v)) continue;
+                        if (std.mem.eql(u8, kv.key, "blur_after")) {
+                            ph.blur_after = std.math.clamp(v, 0.5, 600);
+                        } else if (std.mem.eql(u8, kv.key, "center_yaw")) {
+                            ph.calibration.yaw = std.math.clamp(v, -90, 90);
+                        } else if (std.mem.eql(u8, kv.key, "center_pitch")) {
+                            ph.calibration.pitch = std.math.clamp(v, -90, 90);
+                        } else if (std.mem.eql(u8, kv.key, "face_size")) {
+                            ph.calibration.face_size = std.math.clamp(v, 0, 1);
+                        } else if (std.mem.eql(u8, kv.key, "neck")) {
+                            ph.calibration.neck = std.math.clamp(v, 0, 10);
+                        }
+                    } else |_| {}
+                },
+                .voice => {
+                    const kv = splitKey(body) orelse continue;
+                    const vo = &self.voice;
+                    if (std.mem.eql(u8, kv.key, "enabled")) {
+                        vo.enabled = isTrue(kv.value);
+                    } else if (voiceString(vo, kv.key)) |slot| {
+                        const v = try unquote(self.gpa, kv.value);
+                        defer self.gpa.free(v);
+                        self.setString(slot, std.mem.trim(u8, v, " \t"));
                     }
                 },
                 .sites => {
@@ -948,8 +1138,8 @@ pub const Config = struct {
                         const v = try unquote(self.gpa, kv.value);
                         defer self.gpa.free(v);
                         self.setString(&sc.name, v);
-                    } else if (std.mem.eql(u8, kv.key, "mode")) {
-                        if (Mode.parse(kv.value)) |m| sc.mode = m;
+                    } else if (std.mem.eql(u8, kv.key, "style") or std.mem.eql(u8, kv.key, "mode")) {
+                        if (Mode.parse(std.mem.trim(u8, kv.value, "\"' "))) |m| sc.mode = m;
                     }
                 },
                 .apis => {
@@ -1003,6 +1193,19 @@ pub const Config = struct {
                 _ = self.screens.orderedRemove(k);
             } else k += 1;
         }
+        // A theme picked for dark (light) mode is the style where that mode was.
+        const migrate = struct {
+            fn f(m: *Mode, dark: ?Mode, light: ?Mode) void {
+                const t = switch (m.*) {
+                    .dark => dark,
+                    .light => light,
+                    else => null,
+                } orelse return;
+                if (t == .theme) m.* = t;
+            }
+        }.f;
+        migrate(&self.mode, old_dark, old_light);
+        for (self.screens.items) |*sc| migrate(&sc.mode, old_dark, old_light);
         // Agents without a name are useless; drop them. Exactly one default.
         var i: usize = 0;
         while (i < self.agents.items.len) {
@@ -1145,6 +1348,26 @@ pub fn get() *Config {
 }
 
 // ── tests ───────────────────────────────────────────────────────────────
+test "ui: compact and NT mode round-trip, and default to off" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try a.parse("ui:\n  style: dark\n");
+    try std.testing.expect(!a.compact and !a.nt_mode);
+    a.setCompact(true);
+    a.setNtMode(true);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try a.write(&out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "  compact: true") != null);
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(out.items);
+    try std.testing.expect(b.compact and b.nt_mode);
+    try b.parse("ui:\n  compact: no\n  nt_mode: off\n");
+    try std.testing.expect(!b.compact and !b.nt_mode);
+}
+
 test "round trip through the YAML subset" {
     const gpa = std.testing.allocator;
     var a = Config.init(gpa);
@@ -1218,6 +1441,26 @@ test "fix_agent: auto is the blank default, off is off, and the defaults write b
     try std.testing.expectEqualStrings("claude", b.features.fix_agent);
 }
 
+test "styles: a theme by id round-trips; old per-scheme themes become the style" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try a.parse("ui:\n  mode: light\n  light_theme: solarized-light\nscreens:\n  - name: Desk\n    mode: dark\n");
+    try std.testing.expectEqualStrings("solarized-light", a.mode.configName());
+    // No theme was picked for dark mode: the display stays on tt's own.
+    try std.testing.expect(a.modeOn("Desk").eql(.dark));
+    a.setScreenMode("Desk", .{ .theme = @intCast(themes.find("dracula").?) });
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try a.write(&out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "style: solarized-light") != null);
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(out.items);
+    try std.testing.expectEqualStrings("Solarized Light", b.mode.label());
+    try std.testing.expectEqualStrings("Dracula", b.modeOn("Desk").label());
+}
+
 test "e-ink mode parses and round-trips" {
     const gpa = std.testing.allocator;
     var a = Config.init(gpa);
@@ -1229,7 +1472,7 @@ test "e-ink mode parses and round-trips" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try a.write(&out);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "mode: eink") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "style: eink") != null);
     var b = Config.init(gpa);
     defer b.deinit();
     try b.parse(out.items);
@@ -1249,7 +1492,7 @@ test "e-ink colour mode parses (hyphen or underscore) and round-trips with a hyp
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try a.write(&out);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "mode: eink-color") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "style: eink-color") != null);
     var b = Config.init(gpa);
     defer b.deinit();
     try b.parse(out.items);
@@ -1335,8 +1578,8 @@ test "screens: a mode per display round-trips, resolves and can be taken away" {
     defer out.deinit(gpa);
     try a.write(&out);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "screens:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "  - name: DASUNG Paperlike\n    mode: eink\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "  - name: \"Built-in Retina Display: 2\"\n    mode: light\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "  - name: DASUNG Paperlike\n    style: eink\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "  - name: \"Built-in Retina Display: 2\"\n    style: light\n") != null);
 
     var b = Config.init(gpa);
     defer b.deinit();
@@ -1403,6 +1646,8 @@ test "browser: cookies, homepage and do-not-track round trip and default to sess
     var a = Config.init(gpa);
     defer a.deinit();
     try std.testing.expect(!a.browser.keep_cookies and a.browser.homepage.len == 0 and !a.browser.do_not_track);
+    try std.testing.expectEqual(LinkTarget.tt, a.browser.open_links);
+    a.browser.open_links = .browser;
     a.browser.keep_cookies = true;
     a.setString(&a.browser.homepage, "https://ziglang.org/");
     a.browser.do_not_track = true;
@@ -1416,14 +1661,80 @@ test "browser: cookies, homepage and do-not-track round trip and default to sess
     defer b.deinit();
     try b.parse(text.items);
     try std.testing.expect(b.browser.keep_cookies and b.browser.do_not_track);
+    try std.testing.expectEqual(LinkTarget.browser, b.browser.open_links);
     try std.testing.expectEqualStrings("https://ziglang.org/", b.browser.homepage);
 
     // A blank homepage is what "start on a white page" writes and reads back.
     var c = Config.init(gpa);
     defer c.deinit();
-    try c.parse("browser:\n  keep_cookies: yes\n  homepage: \"\"\n  do_not_track: off\n");
+    try c.parse("browser:\n  keep_cookies: yes\n  homepage: \"\"\n  do_not_track: off\n  open_links: system\n");
     try std.testing.expect(c.browser.keep_cookies and !c.browser.do_not_track);
+    try std.testing.expectEqual(LinkTarget.browser, c.browser.open_links);
     try std.testing.expectEqualStrings("", c.browser.homepage);
+}
+
+test "physical: camera, blur and calibration round trip; the blur is off by default" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try std.testing.expect(!a.physical.blur_when_away and a.physical.camera.len == 0 and !a.physical.calibration.isSet());
+    a.setString(&a.physical.camera, "Studio Display Camera");
+    a.physical.blur_when_away = true;
+    a.physical.blur_after = 5;
+    a.physical.sensitivity = .strict;
+    a.physical.calibration = .{ .yaw = -12.5, .pitch = 8, .face_size = 0.25, .neck = 0.7 };
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try a.write(&text);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "physical:") != null);
+
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(text.items);
+    try std.testing.expectEqualStrings("Studio Display Camera", b.physical.camera);
+    try std.testing.expect(b.physical.blur_when_away);
+    try std.testing.expectEqual(@as(f32, 5), b.physical.blur_after);
+    try std.testing.expectEqual(posture.Sensitivity.strict, b.physical.sensitivity);
+    try std.testing.expectApproxEqAbs(@as(f32, -12.5), b.physical.calibration.yaw, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 8), b.physical.calibration.pitch, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), b.physical.calibration.face_size, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), b.physical.calibration.neck, 0.001);
+
+    // Hand edits: a blank camera, nonsense numbers ignored or kept in range.
+    var c = Config.init(gpa);
+    defer c.deinit();
+    try c.parse("physical:\n  camera: \"\"\n  blur_after: soon\n  sensitivity: RELAXED\n  face_size: 7\n");
+    try std.testing.expectEqualStrings("", c.physical.camera);
+    try std.testing.expectEqual(@as(f32, 3), c.physical.blur_after);
+    try std.testing.expectEqual(posture.Sensitivity.relaxed, c.physical.sensitivity);
+    try std.testing.expectEqual(@as(f32, 1), c.physical.calibration.face_size);
+}
+
+test "voice: off by default, round trips, a blank trigger is written as tt" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try std.testing.expect(!a.voice.enabled and a.voice.microphone.len == 0 and a.voice.trigger.len == 0);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try a.write(&text);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "  trigger: tt\n") != null);
+
+    a.voice.enabled = true;
+    a.setString(&a.voice.microphone, "MacBook Pro Microphone");
+    a.setString(&a.voice.trigger, "hey tt");
+    a.setString(&a.voice.language, "en-US");
+    text.clearRetainingCapacity();
+    try a.write(&text);
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(text.items);
+    try std.testing.expect(b.voice.enabled);
+    try std.testing.expectEqualStrings("MacBook Pro Microphone", b.voice.microphone);
+    try std.testing.expectEqualStrings("hey tt", b.voice.trigger);
+    try std.testing.expectEqualStrings("en-US", b.voice.language);
+    // The physical section before it is still read.
+    try std.testing.expect(!b.physical.blur_when_away);
 }
 
 test "sites: permissions round trip, fall back to the defaults and drop empty sites" {

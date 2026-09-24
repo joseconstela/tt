@@ -376,8 +376,8 @@ pub const FileBrowser = struct {
         dl.pushClip(.{ .x = rect.x + 1, .y = rect.y, .w = rect.w - 1, .h = rect.h });
         defer dl.popClip();
 
-        var y = rect.y + 8;
-        // The strip: Files and Search always, Git inside a repository.
+        var y = rect.y;
+        // The tabs: Files and Search always, Git inside a repository.
         const is_repo = self.git.isRepoFor(self.root.items);
         if (!is_repo and self.mode == .git) self.mode = .files;
         self.drawModeStrip(ui, rect, &y, is_repo);
@@ -441,12 +441,15 @@ pub const FileBrowser = struct {
         return res;
     }
 
-    /// The Files / Search / Git strip (the screenshot's pills): Search
-    /// carries the number of matches, Git the number of changes.
+    /// The Files / Search / Git tabs, drawn like the tab strip's but always
+    /// at compact mode's sizes: Search carries the number of matches, Git
+    /// the number of changes.
     fn drawModeStrip(self: *FileBrowser, ui: *Ui, rect: Rect, y: *f32, is_repo: bool) void {
         const dl = ui.dl;
-        const strip_h: f32 = 28;
-        var x = rect.x + 10;
+        const strip_h = theme.compact_strip_h;
+        const pad = theme.compact_tab_pad;
+        const pill_y = y.* + (strip_h - theme.compact_tab_pill_h) / 2;
+        var x = rect.x + 6;
         const modes = [_]struct { mode: Mode, label: []const u8 }{ .{ .mode = .files, .label = "Files" }, .{ .mode = .search, .label = "Search" }, .{ .mode = .git, .label = "Git" } };
         for (modes, 0..) |m, i| {
             if (m.mode == .git and !is_repo) continue;
@@ -457,25 +460,28 @@ pub const FileBrowser = struct {
                 .files => 0,
             };
             const count: []const u8 = if (n > 0) std.fmt.bufPrint(&count_buf, "{d}", .{n}) catch "" else "";
-            const lw = ui.text.measure(theme.font_side_medium, m.label);
-            const cw: f32 = if (count.len > 0) ui.text.measure(git_panel.font_badge, count) + 14 else 0;
-            const r: Rect = .{ .x = x, .y = y.*, .w = lw + 24 + cw, .h = strip_h };
-            const st = ui.button(Ui.id("files.mode", i), r);
             const selected = self.mode == m.mode;
-            if (selected) dl.rrect(r, 7, theme.chip_active) else ui.feedback(r, 7, st);
+            const font = if (selected) theme.font_tab_active else theme.font_tab;
+            const lw = ui.text.measure(font, m.label);
+            const cw: f32 = if (count.len > 0) ui.text.measure(git_panel.font_badge, count) + 14 else 0;
+            const r: Rect = .{ .x = x, .y = y.*, .w = lw + 2 * pad + cw, .h = strip_h };
+            const st = ui.button(Ui.id("files.mode", i), r);
+            if (st.hover and !selected) dl.rrect(.{ .x = r.x, .y = pill_y, .w = r.w, .h = theme.compact_tab_pill_h }, theme.compact_row_radius, theme.hover);
             const color = if (selected) theme.text else if (st.hover) theme.text_2 else theme.text_3;
-            _ = dl.textCentered(theme.font_side_medium, r.x + 12, r.centerY(), m.label, color);
+            _ = dl.textCentered(font, r.x + pad, r.centerY(), m.label, color);
             if (count.len > 0) {
-                const pill: Rect = .{ .x = r.x + 12 + lw + 6, .y = r.centerY() - 8, .w = cw - 6, .h = 16 };
+                const pill: Rect = .{ .x = r.x + pad + lw + 6, .y = r.centerY() - 8, .w = cw - 6, .h = 16 };
                 dl.rrect(pill, 8, if (selected) theme.accent else theme.accent.alpha(0.55));
                 _ = dl.textCentered(git_panel.font_badge, pill.x + 4, pill.centerY(), count, theme.on_accent);
             }
+            if (selected) dl.rect(.{ .x = r.x, .y = r.bottom() - 2, .w = r.w, .h = 2 }, theme.accent);
             if (st.clicked) {
                 self.setMode(m.mode);
                 if (m.mode == .search) self.search.activate(self.root.items, ui.now);
             }
-            x += r.w + 4;
+            x += r.w;
         }
+        dl.rect(.{ .x = rect.x + 1, .y = y.* + strip_h - 1, .w = rect.w - 1, .h = 1 }, theme.line);
         y.* += strip_h + 6;
     }
 

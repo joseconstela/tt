@@ -1,9 +1,9 @@
-//! Which colour scheme the window should be in: the one the user chose in
-//! Settings › Mode (dark, light or e-ink), or macOS's own when the mode is
-//! "system". The system setting is read from the global defaults through
+//! Which colour scheme the window should be in: the style the user chose in
+//! Settings › Style (tt's dark or light, e-ink, or a terminal theme, whose
+//! kind is the scheme), or macOS's own when the style is "system". The system setting is read from the global defaults through
 //! CoreFoundation, so it works the same with a window and headless.
 //!
-//! A display can have a mode of its own (Settings › Mode › Per screen, kept
+//! A display can have a style of its own (Settings › Style › Per screen, kept
 //! as `screens:` in the config): the platform layer tells this module which
 //! displays are connected and which one the window is on (`setScreens`),
 //! and `effectiveMode` is what the window should be in right now. Only tt's
@@ -11,6 +11,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const theme = @import("ui/theme.zig");
+const themes = @import("ui/themes.zig");
 
 /// The connected displays, by the names macOS gives them (System Settings
 /// › Displays), with duplicates told apart by a " (2)" suffix. Empty when
@@ -105,7 +106,7 @@ pub fn systemIsDark() bool {
     return CFStringCompare(value, dark, 1) == 0; // kCFCompareCaseInsensitive
 }
 
-/// The scheme a mode resolves to right now.
+/// The scheme a style resolves to right now (a theme's is its kind).
 pub fn resolve(mode: config.Mode) theme.Scheme {
     return switch (mode) {
         .dark => .dark,
@@ -113,14 +114,24 @@ pub fn resolve(mode: config.Mode) theme.Scheme {
         .eink => .eink,
         .eink_color => .eink_color,
         .system => if (systemIsDark()) .dark else .light,
+        .theme => |i| if (themes.all[i].kind == .dark) .dark else .light,
     };
 }
 
-/// Puts the tokens in the scheme `mode` resolves to; true when it changed.
+/// The terminal theme a style is, if it is one.
+pub fn themeOf(mode: config.Mode) ?*const themes.Theme {
+    return switch (mode) {
+        .theme => |i| &themes.all[i],
+        else => null,
+    };
+}
+
+/// Puts the tokens in the style `mode` resolves to; true when it changed.
 pub fn apply(mode: config.Mode) bool {
     const s = resolve(mode);
-    if (s == theme.scheme) return false;
-    theme.setScheme(s);
+    const t = themeOf(mode);
+    if (s == theme.scheme and t == theme.active_theme) return false;
+    theme.setScheme(s, t);
     return true;
 }
 

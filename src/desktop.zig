@@ -33,6 +33,33 @@ pub fn openExternally(path: []const u8) bool {
     return msg(bool, workspace(), "openURL:", .{fileUrl(path)});
 }
 
+/// Opens a web address (or a mailto:, ftp: … one) in the application the
+/// system uses for it: the default browser for http and https.
+pub fn openUrl(url: []const u8) bool {
+    const pool = objc.AutoreleasePool.push();
+    defer pool.pop();
+    const u = msg(id, objc.class("NSURL"), "URLWithString:", .{objc.nsString(url)});
+    if (u == null) return false;
+    return msg(bool, workspace(), "openURL:", .{u});
+}
+
+/// The name of the default web browser ("Safari", "Google Chrome"), into
+/// `buf`; "" when the system has none.
+pub fn defaultBrowserName(buf: []u8) []const u8 {
+    const pool = objc.AutoreleasePool.push();
+    defer pool.pop();
+    const probe = msg(id, objc.class("NSURL"), "URLWithString:", .{objc.nsString("https://example.com")});
+    const app = msg(id, workspace(), "URLForApplicationToOpenURL:", .{probe});
+    if (app == null) return "";
+    const path = objc.utf8(msg(id, app, "path", .{}));
+    var name = objc.utf8(msg(id, fileManager(), "displayNameAtPath:", .{objc.nsString(path)}));
+    if (name.len == 0) name = sys.basename(path);
+    if (std.mem.endsWith(u8, name, ".app")) name = name[0 .. name.len - 4];
+    const n = @min(buf.len, name.len);
+    @memcpy(buf[0..n], name[0..n]);
+    return buf[0..n];
+}
+
 /// Opens `path` with the application bundle at `app`.
 pub fn openWith(app: []const u8, path: []const u8) void {
     const pool = objc.AutoreleasePool.push();

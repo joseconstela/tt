@@ -24,6 +24,7 @@ const markdown = @import("../syntax/markdown.zig");
 const Document = @import("../input/document.zig").Document;
 const TextEditor = @import("text_editor.zig").TextEditor;
 const EditCommand = @import("../events.zig").EditCommand;
+const links = @import("../links.zig");
 
 const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
@@ -47,7 +48,8 @@ const fence_edge_h: f32 = 8;
 const html_edge_h: f32 = 6;
 const default_pad_top: f32 = 16;
 const default_pad_bottom: f32 = 48;
-const default_side_pad: f32 = theme.block_pad_x + 6;
+/// The regular block padding plus a little (compact mode leaves viewers be).
+const default_side_pad: f32 = 18 + 6;
 const quote_indent: f32 = 18;
 const list_text_indent: f32 = 22;
 const indent_px: f32 = 7;
@@ -60,6 +62,8 @@ const table_row_h: f32 = 22;
 const cell_pad_x: f32 = 10;
 const cell_pad_y: f32 = 4;
 const min_col_w: f32 = 36;
+/// How far either side of a column's rule a press grabs it to resize.
+const rule_grab: f32 = 4;
 const max_cols = markdown.max_cols;
 
 const Bullet = enum { none, dot, todo, done };
@@ -99,7 +103,55 @@ const Table = struct {
         for (self.widths[0..self.cols]) |cw| w += cw;
         return w;
     }
+
+    /// The x of column `c`'s right rule, relative to the table's left edge.
+    fn ruleX(self: *const Table, c: usize) f32 {
+        var x: f32 = 0;
+        for (self.widths[0 .. c + 1]) |cw| x += cw;
+        return x;
+    }
+
+    /// The table's first line: the header, or the alignment row.
+    fn first(self: *const Table) usize {
+        return self.header orelse self.sep;
+    }
 };
+
+/// Column widths the user dragged a table to. They belong to the view, never
+/// the file: kept while the tab is open, keyed by the table's alignment row
+/// (moved along as lines are inserted or removed above it).
+const ColumnWidths = struct {
+    sep: usize,
+    cols: u8,
+    widths: [max_cols]f32,
+};
+
+/// A column rule under the pointer: the table, the column whose right edge
+/// it is, and the area that grabs it.
+const ColumnRule = struct { table: Table, col: u8, rect: Rect };
+
+/// A column rule being dragged: the table's widths when it was grabbed.
+const ColumnDrag = struct {
+    sep: usize,
+    first: usize,
+    end: usize,
+    col: u8,
+    cols: u8,
+    x0: f32,
+    avail: f32,
+    start: [max_cols]f32,
+};
+
+/// Shrinks `widths` to `avail` when they overflow it, each column giving up
+/// its share of what it has above the minimum.
+fn fitWidths(widths: []f32, avail: f32) void {
+    var sum: f32 = 0;
+    for (widths) |w| sum += w;
+    const slack = sum - min_col_w * @as(f32, @floatFromInt(widths.len));
+    if (sum <= avail or slack <= 0) return;
+    const f = @min(1, (sum - avail) / slack);
+    for (widths) |*w| w.* -= (w.* - min_col_w) * f;
+}
 
 const Layout = struct {
     kind: markdown.BlockKind = .paragraph,
@@ -179,6 +231,11 @@ pub const MarkdownView = struct {
     tables: std.ArrayList(Table) = .empty,
     tables_serial: u64 = 0,
     tables_width: f32 = 0,
+    /// Widths the user gave tables by dragging their column rules.
+    col_widths: std.ArrayList(ColumnWidths) = .empty,
+    col_drag: ?ColumnDrag = null,
+    /// The rule under the pointer (or being dragged), drawn in the accent.
+    col_hot: ?struct { sep: usize, col: u8 } = null,
     width: f32 = 0,
     scroll: f32 = 0,
     content_h: f32 = 0,
@@ -202,6 +259,7 @@ pub const MarkdownView = struct {
         self.glyphs.deinit(self.gpa);
         self.heights.deinit(self.gpa);
         self.tables.deinit(self.gpa);
+        self.col_widths.deinit(self.gpa);
     }
 
     // ── height cache ────────────────────────────────────────────────────
@@ -222,6 +280,7 @@ pub const MarkdownView = struct {
                 return;
             };
             const first: usize = ch.first;
+            self.shiftColumnWidths(first, ch.old_count, ch.new_count);
             if (first + ch.old_count > self.heights.items.len) {
                 self.resetHeights(doc);
                 return;
@@ -247,6 +306,23 @@ pub const MarkdownView = struct {
             if (self.heights.items.len == doc.lineCount()) self.invalidateAround(doc, first, ch.new_count);
         }
         if (self.heights.items.len != doc.lineCount()) self.resetHeights(doc);
+    }
+
+    /// Keeps dragged column widths on their tables across an edit: rows
+    /// inserted or removed above move the alignment row, and a table whose
+    /// alignment row went away loses its widths.
+    fn shiftColumnWidths(self: *MarkdownView, first: usize, old_count: usize, new_count: usize) void {
+        var k: usize = 0;
+        while (k < self.col_widths.items.len) {
+            const o = &self.col_widths.items[k];
+            if (o.sep >= first + old_count) {
+                o.sep = o.sep - old_count + new_count;
+            } else if (o.sep >= first and o.sep >= first + new_count) {
+                _ = self.col_widths.swapRemove(k);
+                continue;
+            }
+            k += 1;
+        }
     }
 
     /// Lines whose layout depends on the changed ones: the line above (it
@@ -673,8 +749,73 @@ pub const MarkdownView = struct {
                 done[best] = true;
             }
         }
+        // Widths the user dragged win over the measured ones (a column
+        // added since keeps its own), shrunk to fit a narrower pane.
+        for (self.col_widths.items) |o| if (o.sep == sep) {
+            const k = @min(o.cols, t.cols);
+            @memcpy(t.widths[0..k], o.widths[0..k]);
+            fitWidths(t.widths[0..cols], avail);
+        };
         self.tables.append(self.gpa, t) catch {};
         return t;
+    }
+
+    /// The column rule under the point, within `rule_grab`: which table and
+    /// column (the rule is that column's right edge), and the grab area.
+    fn columnRuleAt(self: *MarkdownView, text: *gfx_text.TextEngine, doc: *const Document, body: Rect, cx0: f32, reveal: ?usize, mx: f32, my: f32) ?ColumnRule {
+        const hit = self.hitTest(text, doc, body, cx0, reveal, mx, my);
+        const t = hit.lay.table orelse return null;
+        const h = hit.lay.height();
+        if (hit.lay.table_role == .none or my < hit.top or my >= hit.top + h) return null;
+        var best: ?u8 = null;
+        var best_d: f32 = rule_grab;
+        for (0..t.cols) |c| {
+            const d = @abs(mx - (cx0 + t.x + t.ruleX(c)));
+            if (d <= best_d) {
+                best = @intCast(c);
+                best_d = d;
+            }
+        }
+        const col = best orelse return null;
+        const x = cx0 + t.x + t.ruleX(col);
+        return .{ .table = t, .col = col, .rect = .{ .x = x - rule_grab, .y = hit.top, .w = 2 * rule_grab, .h = h } };
+    }
+
+    /// Sets (or with null, forgets) a table's dragged widths and re-lays
+    /// its lines out.
+    fn setColumnWidths(self: *MarkdownView, sep: usize, first: usize, end: usize, cols: u8, widths: ?[max_cols]f32) void {
+        var k: usize = 0;
+        while (k < self.col_widths.items.len) : (k += 1) if (self.col_widths.items[k].sep == sep) break;
+        if (widths) |w| {
+            if (k < self.col_widths.items.len) {
+                self.col_widths.items[k] = .{ .sep = sep, .cols = cols, .widths = w };
+            } else self.col_widths.append(self.gpa, .{ .sep = sep, .cols = cols, .widths = w }) catch return;
+        } else if (k < self.col_widths.items.len) {
+            _ = self.col_widths.swapRemove(k);
+        } else return;
+        self.tables.clearRetainingCapacity();
+        const n = self.heights.items.len;
+        if (first < n) @memset(self.heights.items[first..@min(n, end)], -1);
+    }
+
+    /// The widths a drag has reached: the grabbed column follows the
+    /// pointer; past the room the table has, the columns to its right give
+    /// way down to their minimum, then the column stops.
+    fn draggedWidths(drag: ColumnDrag, mx: f32) [max_cols]f32 {
+        var w = drag.start;
+        const cols: usize = drag.cols;
+        w[drag.col] = @max(min_col_w, drag.start[drag.col] + mx - drag.x0);
+        var sum: f32 = 0;
+        for (w[0..cols]) |cw| sum += cw;
+        var over = sum - @max(drag.avail, sum - w[drag.col] + drag.start[drag.col]);
+        var c: usize = drag.col + 1;
+        while (over > 0 and c < cols) : (c += 1) {
+            const take = @min(over, @max(0, w[c] - min_col_w));
+            w[c] -= take;
+            over -= take;
+        }
+        if (over > 0) w[drag.col] = @max(min_col_w, w[drag.col] - over);
+        return w;
     }
 
     /// Caret position (row, x) for byte `rel` within the laid-out line.
@@ -830,9 +971,57 @@ pub const MarkdownView = struct {
         const vbar = Ui.id("markdown_view.vbar", self.salt);
         if (sidebar.scrollbarDrag(ui, vbar, .vertical, body, self.scroll, self.content_h)) |s| self.scroll = s;
 
+        // A table's column rule: dragging it resizes the column in this view
+        // only (the file keeps its text); a double-click goes back to the
+        // measured widths. It takes the press before the text below does.
+        self.col_hot = null;
+        var rule: ?ColumnRule = null;
+        if (self.col_drag == null and ui.active == 0 and ui.mouseIn(body)) {
+            rule = self.columnRuleAt(text, doc, body, cx0, reveal_before, ui.mx, ui.my);
+        }
+        const col_d = ui.drag(Ui.id("markdown_view.col", self.salt), if (rule) |r| r.rect else .{});
+        if (col_d.started) if (rule) |r| {
+            if (col_d.double_clicked) {
+                self.setColumnWidths(r.table.sep, r.table.first(), r.table.end, r.table.cols, null);
+            } else self.col_drag = .{
+                .sep = r.table.sep,
+                .first = r.table.first(),
+                .end = r.table.end,
+                .col = r.col,
+                .cols = r.table.cols,
+                .x0 = ui.mx,
+                .avail = self.width - r.table.x,
+                .start = r.table.widths,
+            };
+        };
+        if (!col_d.dragging) self.col_drag = null;
+        if (self.col_drag) |drag| {
+            if (ui.mx != drag.x0) self.setColumnWidths(drag.sep, drag.first, drag.end, drag.cols, draggedWidths(drag, ui.mx));
+            self.col_hot = .{ .sep = drag.sep, .col = drag.col };
+        } else if (col_d.hover) if (rule) |r| {
+            self.col_hot = .{ .sep = r.table.sep, .col = r.col };
+        };
+
+        // A link under the pointer: ⌘/⌃-click opens it, before the caret,
+        // a selection or the ⌃-click's menu can take the press.
+        var link: ?struct { line: usize, span: links.Span } = null;
+        if (ui.mouseIn(body)) {
+            const hit = self.hitTest(text, doc, body, cx0, reveal_before, ui.mx, ui.my);
+            if (self.glyphAt(hit, cx0, ui.mx, ui.my)) |off| {
+                if (links.markdownAt(doc.lineText(hit.line), off)) |t| {
+                    var url_buf: [links.max_len + 16]u8 = undefined;
+                    if (links.resolve(t.url, &url_buf)) |url| {
+                        _ = ui.link(url);
+                        link = .{ .line = hit.line, .span = t.span };
+                    }
+                }
+            }
+        }
+
         // Mouse.
         const d = ui.drag(Ui.id("markdown_view", self.salt), body);
         if (d.hover or d.dragging) ui.cursor = .ibeam;
+        if (self.col_hot != null) ui.cursor = .resize_lr;
         if (d.started or d.dragging) {
             const hit = self.hitTest(text, doc, body, cx0, reveal_before, ui.mx, ui.my);
             const off = hit.off;
@@ -904,7 +1093,12 @@ pub const MarkdownView = struct {
                 while (depth < lay.quote_depth) : (depth += 1) {
                     dl.rect(.{ .x = cx0 + @as(f32, @floatFromInt(depth)) * quote_indent, .y = y + lay.top_gap, .w = 3, .h = h - lay.top_gap }, theme.line_strong);
                 }
-                if (lay.table) |t| self.drawTableRow(dl, t, lay.table_role, i, cx0, y, h);
+                if (lay.table) |t| {
+                    self.drawTableRow(dl, t, lay.table_role, i, cx0, y, h);
+                    if (self.col_hot) |hot| if (hot.sep == t.sep and hot.col < t.cols) {
+                        dl.rect(.{ .x = cx0 + t.x + t.ruleX(hot.col) - 1, .y = y, .w = 2, .h = h }, theme.accent);
+                    };
+                }
                 const first_row_cy = y + lay.top_gap + lay.row_h / 2;
                 switch (lay.bullet) {
                     .none => {},
@@ -925,7 +1119,9 @@ pub const MarkdownView = struct {
                 }
 
                 // Glyphs.
+                const link_span: ?links.Span = if (link) |lk| (if (lk.line == i) lk.span else null) else null;
                 for (self.glyphs.items) |g| {
+                    const on_link = if (link_span) |sp| sp.contains(g.off) else false;
                     const gx = cx0 + lay.x0 + g.x;
                     const row_top = y + lay.top_gap + @as(f32, @floatFromInt(g.row)) * lay.row_h;
                     if (row_top > body.bottom() or row_top + lay.row_h < body.y) continue;
@@ -935,9 +1131,12 @@ pub const MarkdownView = struct {
                     };
                     if (g.cp != ' ' and g.cp != '\t') {
                         const baseline_px = @round(text.baselineForCenter(g.font, row_top + lay.row_h / 2) * scale);
-                        _ = dl.glyph(g.font, g.cp, @round(gx * scale), baseline_px, g.color, clip);
+                        const color = if (on_link and ui.linkModifier()) theme.scopeColor(.link) else g.color;
+                        _ = dl.glyph(g.font, g.cp, @round(gx * scale), baseline_px, color, clip);
                     }
-                    if (g.underline) dl.rect(.{ .x = gx, .y = row_top + lay.row_h - 5, .w = g.w, .h = 1 }, g.color.alpha(0.6));
+                    if (on_link) {
+                        dl.rect(.{ .x = gx, .y = row_top + lay.row_h - 5, .w = g.w, .h = 1 }, theme.scopeColor(.link));
+                    } else if (g.underline) dl.rect(.{ .x = gx, .y = row_top + lay.row_h - 5, .w = g.w, .h = 1 }, g.color.alpha(0.6));
                     if (g.strike) dl.rect(.{ .x = gx, .y = row_top + lay.row_h / 2, .w = g.w, .h = 1 }, g.color);
                 }
 
@@ -1017,6 +1216,18 @@ pub const MarkdownView = struct {
         const row: u16 = @intCast(std.math.clamp(@as(i64, @intFromFloat(@floor(rel_y / @max(1, lay.row_h)))), 0, @as(i64, lay.rows) - 1));
         const off = self.offsetInRow(doc.lineText(i).len, row, mx - cx0 - lay.x0);
         return .{ .off = doc.lineStartOf(i) + off, .line = i, .top = y, .lay = lay };
+    }
+
+    /// The byte (in its line) of the glyph under the point, from the layout
+    /// `hitTest` just left in `self.glyphs`; null between or past glyphs.
+    fn glyphAt(self: *const MarkdownView, hit: Hit, cx0: f32, mx: f32, my: f32) ?usize {
+        const lay = hit.lay;
+        for (self.glyphs.items) |g| {
+            const gx = cx0 + lay.x0 + g.x;
+            const top = hit.top + lay.top_gap + @as(f32, @floatFromInt(g.row)) * lay.row_h;
+            if (mx >= gx and mx < gx + g.w and my >= top and my < top + lay.row_h) return g.off;
+        }
+        return null;
     }
 
     /// The checkbox drawn for a task line whose block starts at `top`.

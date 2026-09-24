@@ -1,12 +1,15 @@
-//! Settings › Browser: how website tabs (tabs/web_tab.zig) behave. Three
-//! cards — Cookies, Homepage, Privacy — each editing `config.browser` in
-//! place. Homepage's "Custom address" holds a single text field, so this
-//! page owns one keyboard focus like the APIs page does.
+//! Settings › Browser: how website tabs (tabs/web_tab.zig) behave. The
+//! "Website tabs" page has two cards — Links (where ⌘/⌃-clicked links
+//! open) and Homepage; the "Privacy" page has Cookies and Do Not Track.
+//! Each card edits `config.browser` in place. Homepage's "Custom address"
+//! holds a single text field, so that page owns one keyboard focus like
+//! the APIs page does.
 const std = @import("std");
 const ui_mod = @import("../ui/ui.zig");
 const theme = @import("../ui/theme.zig");
 const field = @import("../ui/field.zig");
 const config = @import("../config.zig");
+const desktop = @import("../desktop.zig");
 const EditCommand = @import("../events.zig").EditCommand;
 
 const Ui = ui_mod.Ui;
@@ -14,7 +17,7 @@ const Rect = ui_mod.Rect;
 
 const font = theme.font_ui;
 const row_h: f32 = 36;
-const card_pad = theme.block_pad_x;
+const card_pad: f32 = 18; // the regular block padding, in compact mode too
 /// Height of a card's title and hint lines.
 const card_head: f32 = 70;
 
@@ -28,6 +31,9 @@ pub const Page = struct {
     /// Loaded from the config the first time the page is drawn.
     want_custom: bool = false,
     loaded: bool = false,
+    /// The default browser's name, looked up when the page is first drawn.
+    browser_buf: [64]u8 = undefined,
+    browser_name: []const u8 = "",
 
     pub fn init(gpa: std.mem.Allocator) Page {
         return .{ .gpa = gpa, .focus = field.Focus.init(gpa) };
@@ -107,15 +113,14 @@ pub const Page = struct {
         if (!self.loaded) {
             self.loaded = true;
             self.want_custom = cfg.browser.homepage.len > 0;
+            self.browser_name = desktop.defaultBrowserName(&self.browser_buf);
         }
         var press_outside = ui.pressed;
         var y = y0;
 
-        y = self.drawCookies(ui, cfg, x, y, col_w);
+        y = self.drawLinks(ui, cfg, x, y, col_w);
         y += theme.block_gap;
         y = self.drawHomepage(ui, cfg, x, y, col_w, now, &press_outside);
-        y += theme.block_gap;
-        y = self.drawPrivacy(ui, cfg, x, y, col_w);
 
         // A click anywhere but on the field gives the focus up.
         if (press_outside and self.focus.active()) self.blur();
@@ -123,23 +128,28 @@ pub const Page = struct {
         return y;
     }
 
-    /// Cookies: cleared on close (the default) or kept between launches.
-    fn drawCookies(self: *Page, ui: *Ui, cfg: *config.Config, x: f32, y: f32, col_w: f32) f32 {
-        _ = self;
+    /// Links: where a link ⌘- or ⌃-clicked in a command's output, a Markdown
+    /// preview, a notebook or a file opens.
+    fn drawLinks(self: *Page, ui: *Ui, cfg: *config.Config, x: f32, y: f32, col_w: f32) f32 {
         const dl = ui.dl;
         const card: Rect = .{ .x = x, .y = y, .w = col_w, .h = card_head + 2 * row_h + card_pad };
         dl.shape(card, theme.block_radius, theme.bg_block, theme.block_border, theme.line);
-        _ = dl.textCentered(theme.font_ui_medium, card.x + card_pad, card.y + 28, "Cookies", theme.text);
-        _ = dl.textEllipsis(theme.font_hint, card.x + card_pad, card.y + 52, "Whether sites keep cookies and other data past this session.", card.w - 2 * card_pad, theme.text_3);
+        _ = dl.textCentered(theme.font_ui_medium, card.x + card_pad, card.y + 28, "Links", theme.text);
+        _ = dl.textEllipsis(theme.font_hint, card.x + card_pad, card.y + 52, "Where a link opens when you ⌃-click or ⌘-click it in a command's output, a Markdown preview, a notebook or a file.", card.w - 2 * card_pad, theme.text_3);
 
         var ry = card.y + card_head;
-        if (radioRow(ui, Ui.id("settings.browser.cookies", 0), card, ry, "Remove after close", "Cookies and site data are dropped when tt quits.", !cfg.browser.keep_cookies)) {
-            cfg.browser.keep_cookies = false;
+        if (radioRow(ui, Ui.id("settings.browser.links", 0), card, ry, "Inside tt", "A new website tab, next to the one you are in.", cfg.browser.open_links == .tt)) {
+            cfg.browser.open_links = .tt;
             cfg.touch();
         }
         ry += row_h;
-        if (radioRow(ui, Ui.id("settings.browser.cookies", 1), card, ry, "Keep them stored", "Cookies and site data stay between launches.", cfg.browser.keep_cookies)) {
-            cfg.browser.keep_cookies = true;
+        var detail_buf: [96]u8 = undefined;
+        const detail = if (self.browser_name.len > 0)
+            std.fmt.bufPrint(&detail_buf, "Your default browser, {s}.", .{self.browser_name}) catch ""
+        else
+            "The browser macOS opens web links with.";
+        if (radioRow(ui, Ui.id("settings.browser.links", 1), card, ry, "In the default browser", detail, cfg.browser.open_links == .browser)) {
+            cfg.browser.open_links = .browser;
             cfg.touch();
         }
         return card.bottom();
@@ -187,24 +197,53 @@ pub const Page = struct {
         }
         return card.bottom();
     }
-
-    /// Privacy: the Do Not Track request header.
-    fn drawPrivacy(self: *Page, ui: *Ui, cfg: *config.Config, x: f32, y: f32, col_w: f32) f32 {
-        _ = self;
-        const dl = ui.dl;
-        const card: Rect = .{ .x = x, .y = y, .w = col_w, .h = card_head + row_h + card_pad };
-        dl.shape(card, theme.block_radius, theme.bg_block, theme.block_border, theme.line);
-        _ = dl.textCentered(theme.font_ui_medium, card.x + card_pad, card.y + 28, "Privacy", theme.text);
-        _ = dl.textEllipsis(theme.font_hint, card.x + card_pad, card.y + 52, "What tt asks of the sites you visit.", card.w - 2 * card_pad, theme.text_3);
-
-        const ry = card.y + card_head;
-        if (switchRow(ui, Ui.id("settings.browser.dnt", 0), card, ry, "Request Do Not Track", "Sends the DNT header; sites may still ignore it.", cfg.browser.do_not_track)) {
-            cfg.browser.do_not_track = !cfg.browser.do_not_track;
-            cfg.touch();
-        }
-        return card.bottom();
-    }
 };
+
+/// Settings › Browser › Privacy: the Cookies and Do Not Track cards. It
+/// holds no text field, so it keeps no state of its own.
+pub fn drawPrivacyPage(ui: *Ui, x: f32, y0: f32, col_w: f32) f32 {
+    const cfg = config.get();
+    var y = drawCookies(ui, cfg, x, y0, col_w);
+    y += theme.block_gap;
+    return drawPrivacy(ui, cfg, x, y, col_w);
+}
+
+/// Cookies: cleared on close (the default) or kept between launches.
+fn drawCookies(ui: *Ui, cfg: *config.Config, x: f32, y: f32, col_w: f32) f32 {
+    const dl = ui.dl;
+    const card: Rect = .{ .x = x, .y = y, .w = col_w, .h = card_head + 2 * row_h + card_pad };
+    dl.shape(card, theme.block_radius, theme.bg_block, theme.block_border, theme.line);
+    _ = dl.textCentered(theme.font_ui_medium, card.x + card_pad, card.y + 28, "Cookies", theme.text);
+    _ = dl.textEllipsis(theme.font_hint, card.x + card_pad, card.y + 52, "Whether sites keep cookies and other data past this session.", card.w - 2 * card_pad, theme.text_3);
+
+    var ry = card.y + card_head;
+    if (radioRow(ui, Ui.id("settings.browser.cookies", 0), card, ry, "Remove after close", "Cookies and site data are dropped when tt quits.", !cfg.browser.keep_cookies)) {
+        cfg.browser.keep_cookies = false;
+        cfg.touch();
+    }
+    ry += row_h;
+    if (radioRow(ui, Ui.id("settings.browser.cookies", 1), card, ry, "Keep them stored", "Cookies and site data stay between launches.", cfg.browser.keep_cookies)) {
+        cfg.browser.keep_cookies = true;
+        cfg.touch();
+    }
+    return card.bottom();
+}
+
+/// Privacy: the Do Not Track request header.
+fn drawPrivacy(ui: *Ui, cfg: *config.Config, x: f32, y: f32, col_w: f32) f32 {
+    const dl = ui.dl;
+    const card: Rect = .{ .x = x, .y = y, .w = col_w, .h = card_head + row_h + card_pad };
+    dl.shape(card, theme.block_radius, theme.bg_block, theme.block_border, theme.line);
+    _ = dl.textCentered(theme.font_ui_medium, card.x + card_pad, card.y + 28, "Privacy", theme.text);
+    _ = dl.textEllipsis(theme.font_hint, card.x + card_pad, card.y + 52, "What tt asks of the sites you visit.", card.w - 2 * card_pad, theme.text_3);
+
+    const ry = card.y + card_head;
+    if (switchRow(ui, Ui.id("settings.browser.dnt", 0), card, ry, "Request Do Not Track", "Sends the DNT header; sites may still ignore it.", cfg.browser.do_not_track)) {
+        cfg.browser.do_not_track = !cfg.browser.do_not_track;
+        cfg.touch();
+    }
+    return card.bottom();
+}
 
 /// A pick-one row: a ring with a dot when selected, the label, and a dim
 /// detail at the right. True when clicked.

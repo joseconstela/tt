@@ -14,6 +14,7 @@ const tabbar_mod = @import("ui/tabbar.zig");
 const palette_mod = @import("ui/palette.zig");
 const overlay_mod = @import("ui/overlay.zig");
 const desktop = @import("desktop.zig");
+const links = @import("links.zig");
 const paths = @import("paths.zig");
 const tab_mod = @import("tabs/tab.zig");
 const TerminalTab = @import("tabs/terminal_tab.zig").TerminalTab;
@@ -33,6 +34,8 @@ const sys = @import("sys.zig");
 const filetype = @import("filetype.zig");
 const config = @import("config.zig");
 const appearance = @import("appearance.zig");
+const camera_controller = @import("physical/camera_controller.zig");
+const voice_controller = @import("physical/voice_controller.zig");
 
 pub const LaunchOptions = struct {
     width: f32 = 1440,
@@ -151,6 +154,12 @@ pub const App = struct {
     /// The mode the theme was last put in; a change (the general setting,
     /// the window moving to a display with its own) applies at once.
     applied_mode: ?config.Mode = null,
+    /// Hands a link to the system's default browser (headless scripts print
+    /// it instead: nothing leaves the run).
+    open_external: *const fn ([]const u8) bool = desktop.openUrl,
+    /// The default browser's name for the link bubble, looked up once.
+    browser_name: [64]u8 = undefined,
+    browser_name_len: ?usize = null,
 
     pub fn create(gpa: std.mem.Allocator, opts: LaunchOptions, layer: objc.id, setClipboard: *const fn ([]const u8) void) !*App {
         const self = try gpa.create(App);
@@ -159,7 +168,8 @@ pub const App = struct {
         // The settings first: the theme has to be right before anything draws.
         config.init(gpa);
         appearance.applyAccent(config.get().accent);
-        theme.setScheme(appearance.resolve(appearance.effectiveMode()));
+        _ = appearance.apply(appearance.effectiveMode());
+        theme.setCompact(config.get().compact);
 
         var cwd_buf: [4096]u8 = undefined;
         const cwd_ok = std.c.getcwd(&cwd_buf, cwd_buf.len) != null;
@@ -197,6 +207,7 @@ pub const App = struct {
             .raw_height = opts.height,
             .raw_scale = opts.scale,
         };
+        self.sidebar.width = theme.sidebar_default_w;
         self.text.setScale(opts.scale);
         self.dl = draw.DrawList.init(gpa, &self.text);
         self.ui = ui_mod.Ui.init(gpa, &self.dl, &self.text);
@@ -223,6 +234,8 @@ pub const App = struct {
     }
 
     pub fn destroy(self: *App) void {
+        camera_controller.get().shutdown();
+        voice_controller.get().shutdown();
         self.workspace.save(&self.tabs, &self.projects);
         self.workspace.deinit();
         self.tabs.deinit();
@@ -307,6 +320,9 @@ pub const App = struct {
                 }
             }
         }
+        // After the tabs: the Settings page asks for the camera's preview in its tick.
+        if (camera_controller.get().tick(now)) self.invalidate();
+        if (voice_controller.get().tick(now)) self.invalidate();
         self.serveRequests();
         self.keepShowingSomething();
         // A menu or box about a tab that has since closed itself has nothing left to act on.
@@ -319,14 +335,26 @@ pub const App = struct {
         // switches between light and dark (polled, it is a defaults read).
         const cfg = config.get();
         const mode = appearance.effectiveMode();
-        if (mode != self.applied_mode or now - self.appearance_checked >= 2) {
+        const changed = if (self.applied_mode) |m| !m.eql(mode) else true;
+        if (changed or now - self.appearance_checked >= 2) {
             self.applied_mode = mode;
             self.appearance_checked = now;
             if (appearance.apply(mode)) self.invalidate();
         }
+        if (theme.compact != cfg.compact) self.applyCompact(cfg.compact);
         cfg.saveIfDue(now);
         self.workspace.saveIfChanged(&self.tabs, &self.projects, now);
         return self.dirty > 0;
+    }
+
+    /// Compact mode on or off (Settings › Mode): the spacing tokens switch,
+    /// and a sidebar still at the old default width takes the new default.
+    fn applyCompact(self: *App, on: bool) void {
+        const old_default = theme.sidebar_default_w;
+        theme.setCompact(on);
+        if (self.sidebar.width == old_default) self.sidebar.width = theme.sidebar_default_w;
+        self.sidebar.width = @max(self.sidebar.width, theme.sidebar_min_w);
+        self.invalidate();
     }
 
     pub fn buildFrame(self: *App) void {
@@ -413,14 +441,16 @@ pub const App = struct {
         if (pv.toggle_files) self.perform(.toggle_files);
         if (pv.file_drop) |target| self.openDroppedAt(target);
         if (ui.edit_menu) |m| self.openEditMenu(m);
+        self.serveLink(content);
         if (pv.changed) self.invalidate();
         // The drag is over once the pane view has let go of it.
         if (self.panes.drag == null) self.file_drag.clearRetainingCapacity();
 
         if (self.chrome.fake_lights) {
             const colors = [_]draw.Color{ draw.Color.hex(0xFF5F57), draw.Color.hex(0xFEBC2E), draw.Color.hex(0x28C840) };
-            // Same geometry AppKit reports for the real buttons (x=19/42/65, 14pt).
-            for (colors, 0..) |c, i| self.dl.circle(26 + @as(f32, @floatFromInt(i)) * 23, 26, 7, c);
+            // Same geometry AppKit reports for the real buttons (x=19/42/65, 14pt),
+            // centred on the band like AppKit centres them in the titlebar.
+            for (colors, 0..) |c, i| self.dl.circle(26 + @as(f32, @floatFromInt(i)) * 23, theme.header_h / 2, 7, c);
         }
 
         // The tab menu / boxes and the palette float over everything and are
@@ -430,6 +460,70 @@ pub const App = struct {
             if (self.overlay.draw(ui, self.width, self.height)) |out| self.applyOverlay(out);
         }
         if (self.palette.draw(ui, self.width, self.height)) |pick| self.executePick(pick);
+    }
+
+    /// A link under the pointer (`Ui.link`): the pointing hand while ⌘ or ⌃
+    /// is held, where it goes in a bubble at the bottom of the view showing
+    /// it (the way browsers show it), and a ⌘- or ⌃-click opens it.
+    fn serveLink(self: *App, content: draw.Rect) void {
+        const ui = &self.ui;
+        const found = ui.hoveredLink();
+        if (found.len == 0) return;
+        var buf: [links.max_len + 16]u8 = undefined;
+        const url = links.resolve(found, &buf) orelse return;
+        if (ui.link_open) return self.openLink(url);
+        if (ui.linkModifier()) ui.cursor = .pointer;
+
+        var hint_buf: [96]u8 = undefined;
+        const inside = links.isWeb(url) and config.get().browser.open_links == .tt;
+        const verb = if (ui.linkModifier()) "Click" else "⌃/⌘-click";
+        const hint = if (inside)
+            std.fmt.bufPrint(&hint_buf, "{s} to open in a tt tab", .{verb}) catch ""
+        else if (links.isWeb(url))
+            std.fmt.bufPrint(&hint_buf, "{s} to open in {s}", .{ verb, self.browserName() }) catch ""
+        else
+            std.fmt.bufPrint(&hint_buf, "{s} to open", .{verb}) catch "";
+
+        const dl = ui.dl;
+        const pad: f32 = 10;
+        const hint_w = ui.text.measure(theme.font_hint, hint);
+        // The view's own bottom-left corner, so a native view in a pane
+        // next to it (a website tab) can never cover the bubble.
+        const area = blk: {
+            const a = ui.link_area.intersect(content);
+            break :blk if (a.w >= 160 and a.h >= 40) a else content;
+        };
+        const max_w = @max(160, @min(640, area.w - 24));
+        const url_w = @min(ui.text.measure(theme.font_hint, url), max_w - hint_w - 3 * pad - 8);
+        const w = pad + url_w + 12 + hint_w + pad;
+        const h: f32 = 26;
+        var r: draw.Rect = .{ .x = area.x + 8, .y = area.bottom() - h - 8, .w = w, .h = h };
+        // Out of the pointer's way, as a browser's status bubble moves.
+        if (r.inset(-8, -8).contains(ui.mx, ui.my)) r.x = area.right() - w - 8;
+        theme.dropShadow(dl, r, 7, 3, 3, 3, 0.035);
+        dl.shape(r, 7, theme.bg_panel, 1, theme.line_strong);
+        _ = dl.textEllipsis(theme.font_hint, r.x + pad, r.centerY(), url, url_w, theme.text_2);
+        _ = dl.textCentered(theme.font_hint, r.x + pad + url_w + 12, r.centerY(), hint, theme.text_3);
+    }
+
+    /// Opens a link as `browser.open_links` says: web addresses in a new
+    /// website tab or the default browser; mailto: and the like always go
+    /// to the system.
+    fn openLink(self: *App, url: []const u8) void {
+        if (links.isWeb(url) and config.get().browser.open_links == .tt) {
+            _ = self.tabs.openWith("web", .{ .url = url }) catch |err| {
+                std.log.err("could not open a website tab: {s}", .{@errorName(err)});
+            };
+        } else if (!self.open_external(url)) {
+            std.log.err("could not open {s}", .{url});
+        }
+        self.invalidate();
+    }
+
+    fn browserName(self: *App) []const u8 {
+        if (self.browser_name_len == null) self.browser_name_len = desktop.defaultBrowserName(&self.browser_name).len;
+        const n = self.browser_name_len.?;
+        return if (n > 0) self.browser_name[0..n] else "your browser";
     }
 
     fn applySidebar(self: *App, side: sidebar_mod.Result) void {
@@ -1455,10 +1549,19 @@ pub const App = struct {
 
     // ── input ───────────────────────────────────────────────────────────
     pub fn onMouseMove(self: *App, x: f32, y: f32) void {
+        // Using the Mac counts as looking at it (the away blur).
+        camera_controller.get().noteActivity(self.now);
         self.ui.mx = x;
         self.ui.my = y;
         self.ui.mouse_inside = true;
         self.invalidate();
+    }
+
+    /// ⌘ / ⌃ went down or up: a link under the pointer shows it can be followed.
+    pub fn onFlags(self: *App, mods: ui_mod.Mods) void {
+        const was = self.ui.linkModifier();
+        self.ui.mods = mods;
+        if (was != self.ui.linkModifier()) self.invalidate();
     }
 
     pub fn onMouseLeave(self: *App) void {
@@ -1467,8 +1570,13 @@ pub const App = struct {
     }
 
     pub fn onMouseDown(self: *App, x: f32, y: f32, clicks: u32, mods: ui_mod.Mods) void {
-        // ⌃-click is a secondary click, as everywhere on macOS.
-        if (mods.ctrl and !mods.cmd) return self.onRightMouseDown(x, y, mods);
+        // ⌃-click is a secondary click, as everywhere on macOS — except
+        // over a link, which it opens (`Ui.link`).
+        if (mods.ctrl and !mods.cmd) {
+            self.onRightMouseDown(x, y, mods);
+            self.ui.ctrl_click = true;
+            return;
+        }
         self.onMouseMove(x, y);
         self.ui.down = true;
         self.ui.pressed = true;
@@ -1502,6 +1610,7 @@ pub const App = struct {
     // menu / boxes while one is open, else to the files panel's commit
     // message while it has the focus, else to the active tab.
     pub fn onText(self: *App, utf8: []const u8) void {
+        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             self.palette.onText(utf8);
         } else if (self.overlay.isOpen()) {
@@ -1513,6 +1622,7 @@ pub const App = struct {
     }
 
     pub fn onMarkedText(self: *App, utf8: []const u8) void {
+        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             self.palette.onMarkedText(utf8);
         } else if (self.overlay.isOpen()) {
@@ -1524,6 +1634,7 @@ pub const App = struct {
     }
 
     pub fn onEdit(self: *App, cmd: EditCommand) void {
+        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             if (self.palette.onEdit(cmd)) |pick| self.executePick(pick);
         } else if (self.overlay.isOpen()) {
@@ -1535,6 +1646,7 @@ pub const App = struct {
     }
 
     pub fn onCtrl(self: *App, key: u8) void {
+        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             if (self.palette.onCtrl(key)) |pick| self.executePick(pick);
             self.invalidate();
@@ -1559,6 +1671,7 @@ pub const App = struct {
     }
 
     pub fn onPaste(self: *App, utf8: []const u8) void {
+        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             self.palette.onPaste(utf8);
         } else if (self.overlay.isOpen()) {

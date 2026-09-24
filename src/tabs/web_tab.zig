@@ -15,7 +15,7 @@
 //!
 //! What only the user can grant — the camera, the microphone, notifications
 //! — is asked in a bar under the address bar, and the answer kept per site
-//! (config.zig `sites`, Settings › Permissions). Notifications go to macOS's
+//! (config.zig `sites`, Settings › Browser). Notifications go to macOS's
 //! Notification Center with the site's favicon (platform/notify.zig). Links
 //! that open a new window (target=_blank, `window.open`) open a new tab that
 //! keeps its tie to the page that opened it, so sign-in popups work.
@@ -617,7 +617,7 @@ pub const WebTab = struct {
                 self.mic_state = mic;
             }
         }
-        // Settings changed (here or in Settings › Permissions): questions it
+        // Settings changed (here or in Settings › Browser): questions it
         // answers go, and the pages learn their notification permission.
         const cfg = cfg_mod.get();
         if (cfg.version != self.cfg_seen) {

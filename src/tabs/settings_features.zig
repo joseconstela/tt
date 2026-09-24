@@ -104,7 +104,7 @@ const line_h: f32 = theme.output_line_h;
 const box_rows: f32 = 5;
 const box_pad: f32 = 10;
 const row_h: f32 = 36;
-const card_pad = theme.block_pad_x;
+const card_pad: f32 = 18; // the regular block padding, in compact mode too
 /// Height of a card's title and hint lines.
 const card_head: f32 = 70;
 /// The "Prompt" label and its hint, between the picker and the box.

@@ -4,6 +4,8 @@
 //! `hitTest` (from its row layout) and reads the text back with `appendText`.
 const std = @import("std");
 const buffer_mod = @import("buffer.zig");
+const links = @import("../links.zig");
+const width = @import("width.zig");
 
 const Buffer = buffer_mod.Buffer;
 const Cell = buffer_mod.Cell;
@@ -112,6 +114,59 @@ pub fn hitTest(buf: *const Buffer, l: Rows, x: f32, rows_y: f32, cell_w: f32, ro
     return .{ .line = lo, .cell = seg_start + @as(usize, @intFromFloat(std.math.clamp(c, 0, span))) };
 }
 
+/// The cell under the pointer — not the nearest boundary, as `hitTest`
+/// gives — or null off the text (past a line's end, outside the rows).
+pub fn cellAt(buf: *const Buffer, l: Rows, x: f32, rows_y: f32, cell_w: f32, row_h: f32, mx: f32, my: f32) ?Pos {
+    if (l.starts.len == 0 or mx < x or my < rows_y) return null;
+    const rel: u32 = @intFromFloat(@floor((my - rows_y) / row_h));
+    if (rel >= l.rows) return null;
+    const row = l.first_row + rel;
+    var lo: usize = 0;
+    var hi: usize = l.starts.len;
+    while (lo + 1 < hi) {
+        const mid = (lo + hi) / 2;
+        if (l.starts[mid] <= row) lo = mid else hi = mid;
+    }
+    const cells = lineCells(buf, lo);
+    const seg_start = @min(cells.len, @as(usize, row - l.starts[lo]) * l.cols);
+    const seg_end = @min(cells.len, seg_start + l.cols);
+    const col = (mx - x) / cell_w;
+    var at: f32 = 0;
+    for (cells[seg_start..seg_end], seg_start..) |c, i| {
+        const w: f32 = @floatFromInt(@max(1, width.cellWidth(c.cp)));
+        if (col < at + w) return .{ .line = lo, .cell = i };
+        at += w;
+    }
+    return null;
+}
+
+fn cellCp(c: Cell) u21 {
+    return c.cp;
+}
+
+/// A link in a buffer: its line, its cells there, and the address.
+pub const Link = struct {
+    line: usize,
+    span: links.Span,
+    url: []const u8,
+
+    pub fn covers(self: Link, line: usize, cell: usize) bool {
+        return line == self.line and self.span.contains(cell);
+    }
+};
+
+/// The link under the pointer (see `cellAt`), its address written into
+/// `out`. A long address wrapped over several rows is one link.
+pub fn linkUnder(buf: *const Buffer, l: Rows, x: f32, rows_y: f32, cell_w: f32, row_h: f32, mx: f32, my: f32, out: []u8) ?Link {
+    const pos = cellAt(buf, l, x, rows_y, cell_w, row_h, mx, my) orelse return null;
+    const cells = lineCells(buf, pos.line);
+    const span = links.spanAt(Cell, cells, pos.cell, cellCp) orelse return null;
+    if (span.end - span.start > out.len) return null;
+    // Addresses are ASCII (`links.spanAt` stops at anything else).
+    for (cells[span.start..span.end], 0..) |c, i| out[i] = @intCast(c.cp);
+    return .{ .line = pos.line, .span = span, .url = out[0 .. span.end - span.start] };
+}
+
 /// Appends the text between two ordered positions, a newline between
 /// lines; the blanks a program padded a line with are not content.
 pub fn appendText(buf: *const Buffer, r: [2]Pos, out: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
@@ -177,4 +232,23 @@ test "selection: words, lines, drags and the text they cover" {
     try std.testing.expectEqual(Pos{ .line = 0, .cell = 10 }, p);
     const below = hitTest(&buf, l, 100, 50, 10, 20, 0, 500);
     try std.testing.expectEqual(Pos{ .line = 1, .cell = 4 }, below);
+}
+
+test "selection: the link under the pointer, across a wrapped row" {
+    const gpa = std.testing.allocator;
+    var buf = Buffer.init(gpa);
+    defer buf.deinit();
+    buf.write("see https://ziglang.org/learn now");
+    // Rows of 16 cells: "see https://zigl" / "ang.org/learn no" / "w".
+    const starts = [_]u32{0};
+    const l: Rows = .{ .starts = &starts, .first_row = 0, .rows = 3, .cols = 16 };
+    var out: [128]u8 = undefined;
+    // Over "ang" on the second row: the whole address.
+    const lk = linkUnder(&buf, l, 0, 0, 10, 20, 15, 25, &out).?;
+    try std.testing.expectEqualStrings("https://ziglang.org/learn", lk.url);
+    try std.testing.expect(lk.covers(0, 4) and lk.covers(0, 28) and !lk.covers(0, 29));
+    // Over "see", past the text, below the rows: nothing.
+    try std.testing.expect(linkUnder(&buf, l, 0, 0, 10, 20, 15, 5, &out) == null);
+    try std.testing.expect(linkUnder(&buf, l, 0, 0, 10, 20, 150, 45, &out) == null);
+    try std.testing.expect(linkUnder(&buf, l, 0, 0, 10, 20, 15, 65, &out) == null);
 }

@@ -21,6 +21,8 @@ pub const Icon = enum(u8) {
     document,
     // Settings pages.
     sun,
+    /// Settings › Mode: rows pressed together.
+    compact,
     drop,
     cloud,
     plug,
@@ -34,6 +36,8 @@ pub const Icon = enum(u8) {
     // Website permissions (camera, microphone).
     camera,
     mic,
+    // Settings › Physical interactions.
+    eye,
     // Git panel.
     check,
     minus,
@@ -71,6 +75,7 @@ fn pathData(icon: Icon) []const u8 {
         .image => "M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z M3 17l5-5 4 4 3-3 6 6 M15 9.5a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0-3 0",
         .document => "M7 3h7l5 5v13H7z M14 3v5h5 M10 13h6M10 16.5h6",
         .sun => "M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4l1.4-1.4M17 7l1.4-1.4 M12 8a4 4 0 1 0 0 8a4 4 0 1 0 0-8",
+        .compact => "M4 4h16 M4 20h16 M4 12h16 M12 6.5v3l-2-2M12 9.5l2-2 M12 17.5v-3l-2 2M12 14.5l2 2",
         .drop => "M12 3.5c0 0 6 6.5 6 11a6 6 0 0 1-12 0c0-4.5 6-11 6-11z",
         .cloud => "M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z",
         .plug => "M9 3v4M15 3v4 M6 7h12v3a6 6 0 0 1-12 0z M12 16v5",
@@ -82,6 +87,7 @@ fn pathData(icon: Icon) []const u8 {
         .lock => "M6 11h12v9H6z M9 11V7.5a3 3 0 0 1 6 0V11",
         .camera => "M4.5 7h9a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z M15.5 10.5L21 7.5v9l-5.5-3",
         .mic => "M9 6a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0z M5.5 11a6.5 6.5 0 0 0 13 0 M12 17.5V21 M9 21h6",
+        .eye => "M2.5 12C5.5 7.3 8.6 5.5 12 5.5C15.4 5.5 18.5 7.3 21.5 12C18.5 16.7 15.4 18.5 12 18.5C8.6 18.5 5.5 16.7 2.5 12z M9 12a3 3 0 1 0 6 0a3 3 0 1 0-6 0",
         .check => "M5 12.5l4.5 4.5L19 7",
         .minus => "M5 12h14",
         .undo => "M9 14L4 9l5-5 M4 9h10a6 6 0 0 1 0 12h-3",
