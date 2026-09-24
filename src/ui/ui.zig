@@ -18,6 +18,19 @@ pub const Mods = struct {
     cmd: bool = false,
 };
 
+/// A text surface was right-clicked: the app opens the edit menu (Cut /
+/// Copy / Paste) with its top-left corner at (x, y), the rows that do not
+/// apply greyed out. What the rows act on is whatever has the keyboard,
+/// so the surface takes the focus when it asks.
+pub const EditMenu = struct {
+    x: f32,
+    y: f32,
+    /// Something is selected: Copy, and Cut when the text is editable.
+    has_selection: bool,
+    /// The text can change: Cut and Paste.
+    editable: bool,
+};
+
 pub const ButtonState = struct {
     hover: bool = false,
     held: bool = false,
@@ -58,6 +71,9 @@ pub const Ui = struct {
     interactive: std.ArrayList(Rect) = .empty,
     /// Set by widgets that animate; asks for another frame.
     wants_frame: bool = false,
+    /// Set by a text surface that took a secondary click this frame (see
+    /// `EditMenu`); the app opens the menu once the frame is drawn.
+    edit_menu: ?EditMenu = null,
 
     pub fn init(gpa: std.mem.Allocator, dl: *draw.DrawList, text: *text_mod.TextEngine) Ui {
         return .{ .gpa = gpa, .dl = dl, .text = text };
@@ -71,6 +87,7 @@ pub const Ui = struct {
         self.now = now;
         self.cursor = .arrow;
         self.wants_frame = false;
+        self.edit_menu = null;
         self.interactive.clearRetainingCapacity();
     }
 
@@ -100,6 +117,11 @@ pub const Ui = struct {
         if (!self.right_pressed or !self.mouseIn(r)) return false;
         self.right_pressed = false;
         return true;
+    }
+
+    /// Asks for the edit menu at the pointer (see `EditMenu`).
+    pub fn askEditMenu(self: *Ui, has_selection: bool, editable: bool) void {
+        self.edit_menu = .{ .x = self.mx, .y = self.my, .has_selection = has_selection, .editable = editable };
     }
 
     /// Core press/release behaviour shared by every clickable thing.

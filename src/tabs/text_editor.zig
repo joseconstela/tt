@@ -2,7 +2,8 @@
 //! `Document` drawn as mono text with syntax colours and line numbers, plus
 //! a caret, a selection and IME composition. Keyboard input arrives as
 //! `EditCommand`s (the user's own Cocoa key bindings), the mouse places the
-//! caret and drags selections, and the view follows the caret after keys.
+//! caret and drags selections, a right-click asks for the edit menu (Cut /
+//! Copy / Paste), and the view follows the caret after keys.
 //!
 //! Lines are not wrapped: long lines scroll horizontally, as in a code
 //! editor, with draggable bars on both axes and a drag past an edge pulling
@@ -310,6 +311,20 @@ pub const TextEditor = struct {
         }
     }
 
+    /// The line under a point of the body (clamped to the text).
+    fn lineAt(self: *const TextEditor, my: f32, body: Rect) usize {
+        const rel_y = @max(0, my - body.y - self.pad_top + self.scroll);
+        return @min(self.doc.lineCount() - 1, @as(usize, @intFromFloat(@floor(rel_y / line_h))));
+    }
+
+    /// The byte offset nearest a point of the body, with the text starting
+    /// at `text_x0` in cells `cell` wide.
+    fn offsetAt(self: *const TextEditor, mx: f32, my: f32, body: Rect, text_x0: f32, cell: f32) usize {
+        const rel_x = @max(0, mx - text_x0 + self.scroll_x);
+        const col: usize = @intFromFloat(@floor(rel_x / cell + 0.5));
+        return self.offsetAtCol(self.lineAt(my, body), col);
+    }
+
     // ── drawing ─────────────────────────────────────────────────────────
     pub fn draw(self: *TextEditor, ui: *Ui, body: Rect, focused: bool) void {
         const dl = ui.dl;
@@ -362,11 +377,8 @@ pub const TextEditor = struct {
             }
         }
         if (d.started or d.dragging) {
-            const rel_y = @max(0, ui.my - body.y - self.pad_top + self.scroll);
-            const line: usize = @min(n - 1, @as(usize, @intFromFloat(@floor(rel_y / line_h))));
-            const rel_x = @max(0, ui.mx - text_x0 + self.scroll_x);
-            const col: usize = @intFromFloat(@floor(rel_x / cell + 0.5));
-            const off = self.offsetAtCol(line, col);
+            const line = self.lineAt(ui.my, body);
+            const off = self.offsetAt(ui.mx, ui.my, body, text_x0, cell);
             if (d.started) {
                 if (ui.click_count >= 3) {
                     doc.selectLine(line);
@@ -379,6 +391,16 @@ pub const TextEditor = struct {
                 e.setCursor(off, true);
             }
             self.follow = false;
+        }
+
+        // A right-click puts the caret there, unless it lands in the
+        // selection (what the menu then acts on), and asks for the edit menu.
+        if (ui.rightClicked(body)) {
+            const off = self.offsetAt(ui.mx, ui.my, body, text_x0, cell);
+            const in_selection = if (e.selection()) |s| off >= s[0] and off <= s[1] else false;
+            if (!in_selection) e.setCursor(off, false);
+            self.follow = false;
+            ui.askEditMenu(e.selection() != null, !self.read_only);
         }
 
         // Follow the caret after keyboard actions. The caret's line is

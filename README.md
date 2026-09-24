@@ -30,6 +30,10 @@ CoreText and WebKit are driven straight from Zig through the Objective-C runtime
 
 ## Features
 
+<p align="center">
+  <img src="docs/screenshot-workspace.jpg" alt="tt in use: a Jupyter notebook with a Plotly latency heatmap and a Python cell, a README open as Markdown source below it, a terminal where a plain-English request was answered by the agent with ls -la, and the files panel showing git status" width="920">
+</p>
+
 - **Local only (except for external AI agents).** Your shell, your files, your projects and your
   settings never leave this Mac. There is no account, no sync, no telemetry, no update check. The
   only thing that ever goes out is what you choose to send to an AI agent you configured yourself,
@@ -58,15 +62,27 @@ CoreText and WebKit are driven straight from Zig through the Objective-C runtime
   page by page. Viewers pick the file by its bytes first
   and its extension second, so a renamed PNG still opens as a picture.
 - **Notebooks.** A `.ipynb` opens as a column of cells run by a real Jupyter kernel: the Python of
-  the nearest `.venv`, else one that has `ipykernel`. Outputs are drawn natively (coloured text,
-  tracebacks, PNG figures, DataFrames as tables), `input()` works, and a `%%sh` cell is a shell
-  block. New cells are typed into the input row at the bottom (py / sh / md / ask) and ⇧↵ runs
-  them; the *ask* kind puts the notebook in front of your agent, which answers under the question
-  and can draft a cell for you to run. A Variables panel lists the kernel's names, types and
-  memory. The bar at the left edge of a cell's input or outputs folds it, as in Jupyter Lab, and
-  the fold is saved the way Jupyter saves it. Files are nbformat 4, written as Jupyter writes them.
+  the nearest `.venv`, else one that has `ipykernel`. The kernel picker in the tab's toolbar lists
+  every Python on the Mac, switches the notebook to another one (or another kernelspec) and
+  installs `ipykernel` into those that lack it; Run all, Restart, Interrupt and Clear outputs sit
+  beside it. Outputs are drawn natively (coloured text, tracebacks, PNG figures, DataFrames as
+  tables); interactive Plotly figures, HTML and SVG outputs show in a small web view inside the
+  cell, with Plotly's library bundled so they work offline. `input()` works, and a `%%sh` cell is
+  a shell block. New cells are typed into the input
+  row at the bottom (py / sh / md / ask) and ⇧↵ runs them; the *ask* kind puts the notebook in
+  front of your agent, which answers under the question and can draft a cell for you to run. A
+  failed cell offers *Fix with agent*, *Explain* and *Run again*, as a failed command does. A
+  Variables panel lists the kernel's names, types and memory. The bar at the left edge of a cell's
+  input or outputs folds it, as in Jupyter Lab, and the fold is saved the way Jupyter saves it.
+  Files are nbformat 4, written as Jupyter writes them.
 - **Websites.** A tab with an address bar and the system WebKit behind it (⌘⇧N), *Inspect
-  Element*, and a context menu that sends the selected text to the shell.
+  Element*, and a context menu that sends the selected text to the shell. Web apps work as they do
+  in Safari, video calls included (Teams, Meet …): a site that wants the camera, the microphone or
+  to show notifications asks in a bar under the address bar, and the answer is kept for that site.
+  Notifications land in Notification Center with the site's icon and bring its tab back when
+  clicked; screen sharing goes through macOS's own picker; links that open a new window open a
+  tab. The bell in the address bar, or *Settings › Permissions*, changes or removes what a site was
+  allowed.
 - **Full-screen programs.** vim, htop, less, fzf, ssh, REPLs and Claude Code take over the whole
   tab on Ghostty's terminal core and hand it back when they exit.
 - **Ask an agent (opt-in).** Pick a model under *Settings › AI* and a line the shell does not know
@@ -86,7 +102,7 @@ CoreText and WebKit are driven straight from Zig through the Objective-C runtime
 
 ## Getting started
 
-Requirements: macOS, [Zig 0.16](https://ziglang.org/download/) and the Xcode command line tools.
+Requirements: macOS, [Zig 0.16](https://ziglang.org/download/) and the Xcode command line tools (`zig build app` also needs Xcode itself, whose `actool` compiles the app icon).
 
 ```sh
 git clone git@github.com:lab34-es/tt.git
@@ -146,7 +162,7 @@ This is everything that talks to the network:
 
 - **AI agents you set up.** Anthropic, OpenAI, Google, Mistral, Ollama on localhost, or any
   OpenAI-compatible endpoint. tt contacts them only when you ask: a plain-English line in the
-  input box, *Explain* on a failed block, or an *ask* cell in a notebook. What it sends is your
+  input box, *Explain* on a failed block or cell, or an *ask* cell in a notebook. What it sends is your
   question plus the tab's transcript (recent commands, the last lines of their output, exit
   codes; for a notebook its cells, the last lines of their outputs and, unless you switch it off,
   the names and types of the kernel's variables, never their values). A fresh install has no agent
@@ -154,9 +170,14 @@ This is everything that talks to the network:
 - **Notebook kernels.** A `.ipynb` runs in a Jupyter kernel started on this Mac with the
   notebook's own Python. The Jupyter protocol between tt and that kernel runs over sockets bound
   to 127.0.0.1, as it does under Jupyter Lab; nothing leaves the machine.
-- **Website tabs.** The pages you open, through the system WebKit, as Safari would load them.
+- **Website tabs.** The pages you open, through the system WebKit, as Safari would load them. A
+  page gets the camera or the microphone only after you allow it (and macOS asks tt first); its
+  notifications go to Notification Center and nowhere else, with the site's icon fetched from the
+  site itself.
 - **Coding agents.** *Fix with agent* launches a tool that is already installed on your Mac inside
   your shell. What that tool does online is between you and it.
+- **`pip`.** *Install* in a notebook's kernel picker runs `pip install ipykernel` with the Python
+  you chose, which fetches from PyPI. Nothing is installed unless you press it.
 - **`zig build`** fetches libghostty-vt once.
 
 There is no crash reporter, no usage ping and no "check for updates".
@@ -269,3 +290,8 @@ Early and moving fast: version 0.1.0, macOS only. Settings › AI › MCPs is a 
 
 Built on [libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation and
 [Spline Sans](https://github.com/SorkinType/SplineSans) for type.
+
+## License
+
+MIT, see [LICENSE](LICENSE). That file also lists the third-party software tt bundles or uses,
+with their licenses.

@@ -16,13 +16,18 @@
 //! a py / sh / md / ask switch): ⇧↵ runs what was typed as a new cell.
 //! In a cell, ⇧↵ runs it and moves on; ↑ and ↓ cross cell boundaries.
 //!
-//! The band shows Run all · Restart · Clear outputs · Variables (the
-//! inspector: the kernel's variables, its state and memory, the agent's
-//! access to the variable schema). The context line says which kernel is
-//! up ("py 3.12 · idle"). Saving writes nbformat 4 the way Jupyter does
-//! (notebook/ipynb.zig); outputs go into the file unless
-//! `notebooks.strip_outputs` is on, and into the workspace file either
-//! way, so a relaunch shows the results again.
+//! A toolbar at the top of the tab holds the kernel picker — which Python
+//! runs the notebook, the other kernelspecs that Python knows, and the
+//! Pythons ipykernel can be installed into from here — and Run all ·
+//! Restart · Interrupt · Clear outputs · Variables (the inspector: the
+//! kernel's variables, its state and memory, the agent's access to the
+//! variable schema). The band's context line says which kernel is up
+//! ("py 3.12 · idle"). A failed cell offers Fix with agent · Explain · Run
+//! again, as a failed shell block does (Settings › AI › Features picks the
+//! agents and says whether notebooks get the two buttons). Saving writes
+//! nbformat 4 the way Jupyter does (notebook/ipynb.zig); outputs go into
+//! the file unless `notebooks.strip_outputs` is on, and into the workspace
+//! file either way, so a relaunch shows the results again.
 const std = @import("std");
 const tab_mod = @import("tab.zig");
 const viewer = @import("viewer.zig");
@@ -40,9 +45,13 @@ const sys = @import("../sys.zig");
 const records = @import("../records.zig");
 const config = @import("../config.zig");
 const agent = @import("../agent.zig");
+const coding_agents = @import("../coding_agents.zig");
+const settings_features = @import("settings_features.zig");
+const wrap = @import("../ui/wrap.zig");
 const ipynb = @import("../notebook/ipynb.zig");
 const bridge = @import("../notebook/bridge.zig");
 const buffer_mod = @import("../term/buffer.zig");
+const selection = @import("../term/selection.zig");
 const Parser = @import("../term/parser.zig").Parser;
 const TextEditor = @import("text_editor.zig").TextEditor;
 const MarkdownView = @import("markdown_view.zig").MarkdownView;
@@ -68,8 +77,23 @@ const shown_rows: u32 = 200;
 const table_row_h: f32 = 26;
 const table_col_max: f32 = 280;
 const image_max_h: f32 = 640;
+/// Height a web output (a Plotly figure, an HTML repr) gets when its figure
+/// does not ask for one.
+const default_web_h: f32 = 460;
 const inspector_w: f32 = 320;
 const inspector_head_h: f32 = 44;
+/// The toolbar at the top of the tab (the kernel picker and the actions).
+const toolbar_h: f32 = 44;
+/// The kernel picker's menu.
+const menu_w: f32 = 500;
+const menu_row_h: f32 = 34;
+const menu_head_h: f32 = 28;
+const menu_pad: f32 = 6;
+/// The explanation under a failed cell: its label row and its lines.
+const explain_label_h: f32 = 24;
+const explain_line_h: f32 = 21;
+/// The action row under a failed cell: gap, 34pt buttons, gap.
+const actions_row_h: f32 = 14 + 34 + 12;
 const input_rows_max: usize = 8;
 const input_hint_h: f32 = 24;
 const max_file_bytes: usize = 64 * 1024 * 1024;
@@ -86,6 +110,18 @@ var next_salt: usize = 1 << 20;
 fn salt() usize {
     next_salt += 1;
     return next_salt;
+}
+
+/// The vendored Plotly library is written next to the bridge once per run, so
+/// a figure's page can load it as a sibling over file://.
+var plotly_written = false;
+
+fn ensurePlotly(gpa: std.mem.Allocator, dir: []const u8) void {
+    if (plotly_written) return;
+    const path = std.fmt.allocPrint(gpa, "{s}/plotly.min.js", .{dir}) catch return;
+    defer gpa.free(path);
+    sys.writeFile(gpa, path, @embedFile("plotly_js"), false) catch return;
+    plotly_written = true;
 }
 
 const Kind = enum {
@@ -128,6 +164,15 @@ const Kind = enum {
 };
 
 const RunState = enum { idle, queued, running, done, failed, aborted };
+/// How "Explain" on a failed cell is going.
+const ExplainState = enum { none, running, done, failed };
+
+const note_no_explain_agent = "No agent explains failures yet: pick one under Settings › AI › Features › Explain.";
+const note_no_explanation = "The agent sent no explanation.";
+const note_fix_off = "Fix with agent is off (Settings › AI › Features).";
+const note_fix_none = "No coding agent found on this Mac: Settings › AI › Agents says how to install one.";
+const note_fix_unknown = "The coding agent chosen under Settings › AI › Features is not one tt knows.";
+const note_fix_busy = "The shell is busy: the agent starts once it is free.";
 
 // ── outputs ──────────────────────────────────────────────────────────────
 /// A DataFrame's table, as the bridge extracted it from the HTML repr.
@@ -164,7 +209,7 @@ const Table = struct {
     }
 };
 
-const OutKind = enum { text, err, picture, table, note };
+const OutKind = enum { text, err, picture, table, web, note };
 
 /// One output of a cell, ready to draw: text (a stream, a value's repr, a
 /// traceback) goes through the block buffer, a PNG becomes a texture, a
@@ -181,6 +226,15 @@ const Out = struct {
     native_h: u32 = 0,
     table: ?Table = null,
     note: []const u8 = "",
+    /// A `.web` output: the page source, the file it is written to, and the
+    /// live web view showing it (created lazily on the first draw, so a
+    /// headless run needs none). `web_host` is kept for the teardown.
+    web_html: []u8 = &.{},
+    web_path: []u8 = &.{},
+    web_view: ?*anyopaque = null,
+    web_host: ?*const tab_mod.Host = null,
+    web_loaded: bool = false,
+    web_h: f32 = default_web_h,
     row_starts: std.ArrayList(u32) = .empty,
     total_rows: u32 = 0,
     cache_cols: u32 = 0,
@@ -221,6 +275,13 @@ const Out = struct {
         gpa.free(self.png);
         if (self.tex.valid()) if (textures) |t| t.release(&self.tex);
         if (self.table) |*t| t.deinit(gpa);
+        if (self.web_view) |v| if (self.web_host) |h| {
+            h.detach(v);
+            h.destroyWebView(v);
+        };
+        if (self.web_path.len > 0) sys.deleteFile(gpa, self.web_path);
+        gpa.free(self.web_path);
+        gpa.free(self.web_html);
         self.row_starts.deinit(gpa);
     }
 
@@ -276,6 +337,36 @@ const Out = struct {
                 return;
             }
         }
+        // Rich views shown in a small web view, preferred over a plain-text
+        // fallback the same output may also carry (as Jupyter does): an
+        // interactive Plotly figure, then arbitrary HTML (a folium map, an
+        // IPython.display.HTML), then an SVG. DataFrames returned above as a
+        // native table, so their HTML repr never reaches here.
+        if (data.object.get("application/vnd.plotly.v1+json")) |fig| {
+            if (self.plotlyHtml(gpa, fig)) |html| {
+                self.web_html = html;
+                self.web_h = plotlyHeight(fig) orelse default_web_h;
+                self.kind = .web;
+                return;
+            }
+        }
+        if (data.object.get("text/html")) |v| {
+            if (multiline(gpa, v)) |html| {
+                self.web_html = html;
+                self.kind = .web;
+                return;
+            }
+        }
+        if (data.object.get("image/svg+xml")) |v| {
+            if (multiline(gpa, v)) |svg| {
+                defer gpa.free(svg);
+                if (std.mem.concat(gpa, u8, &.{ svg_pre, svg, svg_post })) |wrapped| {
+                    self.web_html = wrapped;
+                    self.kind = .web;
+                    return;
+                } else |_| {}
+            }
+        }
         const text_keys = [_][]const u8{ "text/plain", "text/markdown", "text/latex", "application/json" };
         for (text_keys) |key| {
             if (data.object.get(key)) |v| if (multiline(gpa, v)) |text| {
@@ -285,13 +376,18 @@ const Out = struct {
                 return;
             };
         }
-        if (data.object.get("text/html") != null) {
-            self.note = "HTML output — open the notebook in Jupyter to see it.";
-        } else if (data.object.get("image/svg+xml") != null) {
-            self.note = "SVG output — open the notebook in Jupyter to see it.";
-        } else if (data.object.count() > 0) {
-            self.note = "Output of a kind this viewer cannot show.";
-        }
+        if (data.object.count() > 0) self.note = "Output of a kind this viewer cannot show.";
+    }
+
+    /// Wraps a Plotly figure (the `application/vnd.plotly.v1+json` value) in a
+    /// page that draws it with the vendored Plotly library sitting next to it.
+    /// Caller owns the returned HTML.
+    fn plotlyHtml(_: *Out, gpa: std.mem.Allocator, fig: std.json.Value) ?[]u8 {
+        const raw = std.json.Stringify.valueAlloc(gpa, fig, .{}) catch return null;
+        defer gpa.free(raw);
+        const safe = escapeForScript(gpa, raw) catch return null;
+        defer gpa.free(safe);
+        return std.mem.concat(gpa, u8, &.{ plotly_pre, safe, plotly_post }) catch null;
     }
 
     // ── layout ──────────────────────────────────────────────────────────
@@ -339,6 +435,7 @@ const Out = struct {
                 }
             },
             .table => self.h = self.table.?.height(),
+            .web => self.h = std.math.clamp(self.web_h, line_h, image_max_h),
             .note => self.h = line_h,
         }
         return self.h;
@@ -382,6 +479,7 @@ const Out = struct {
                 }
             },
             .picture => try out.appendSlice(arena, "[an image]\n"),
+            .web => try out.appendSlice(arena, "[an interactive view]\n"),
             .table => {
                 const t = &self.table.?;
                 for (t.columns, 0..) |c, i| {
@@ -405,6 +503,52 @@ const Out = struct {
         return out.toOwnedSlice(arena);
     }
 };
+
+// The page a Plotly figure is drawn in: the figure JSON goes between these,
+// and the vendored `plotly.min.js` (written next to the page) draws it. Split
+// so the JSON can be concatenated in without escaping the template's braces.
+const plotly_pre =
+    \\<!DOCTYPE html><html><head><meta charset="utf-8">
+    \\<script src="plotly.min.js" charset="utf-8"></script>
+    \\<style>html,body{margin:0;padding:0;overflow:hidden;background:#fff}#tt-plot{width:100vw;height:100vh}</style>
+    \\</head><body><div id="tt-plot"></div><script>var __fig=
+;
+const plotly_post =
+    \\;Plotly.newPlot('tt-plot',__fig.data||[],__fig.layout||{},Object.assign({responsive:true,displaylogo:false},__fig.config||{}));</script></body></html>
+;
+const svg_pre =
+    \\<!DOCTYPE html><html><head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:#fff}svg{max-width:100%;height:auto}</style></head><body>
+;
+const svg_post =
+    \\</body></html>
+;
+
+/// Escapes `</` so a string inside embedded JSON cannot close the `<script>`
+/// it is written into. Caller owns the result.
+fn escapeForScript(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '<' and i + 1 < s.len and s[i + 1] == '/') {
+            try out.appendSlice(gpa, "<\\/");
+            i += 1;
+        } else try out.append(gpa, s[i]);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// A Plotly figure's own pixel height from its layout, if it set one.
+fn plotlyHeight(fig: std.json.Value) ?f32 {
+    if (fig != .object) return null;
+    const layout = fig.object.get("layout") orelse return null;
+    if (layout != .object) return null;
+    return switch (layout.object.get("height") orelse return null) {
+        .integer => |n| @floatFromInt(n),
+        .float => |f| @floatCast(f),
+        else => null,
+    };
+}
 
 /// A string, or a list of strings joined (nbformat's multiline strings).
 fn multiline(gpa: std.mem.Allocator, v: std.json.Value) ?[]u8 {
@@ -533,12 +677,17 @@ const Cell = struct {
     /// the input shows as its first line, the outputs as one summary line.
     input_hidden: bool = false,
     outputs_hidden: bool = false,
+    /// The agent's answer to "Explain" on this cell, and how it is going.
+    explanation: std.ArrayList(u8) = .empty,
+    explain_state: ExplainState = .none,
     salt: usize,
     /// From the last layout.
     h: f32 = 0,
     src_h: f32 = 0,
     /// The outputs block with its separator and padding (0 = none).
     out_h: f32 = 0,
+    /// The explanation and the action row under a failed cell (0 = none).
+    actions_h: f32 = 0,
 
     fn create(gpa: std.mem.Allocator, id: []const u8, kind: Kind, source: []const u8) !*Cell {
         const self = try gpa.create(Cell);
@@ -572,10 +721,22 @@ const Cell = struct {
             gpa.free(i.prompt);
             i.ed.deinit();
         }
+        self.explanation.deinit(gpa);
         gpa.free(self.magic);
         gpa.free(self.metadata);
         gpa.free(self.id);
         gpa.destroy(self);
+    }
+
+    /// Forgets the explanation (the cell runs again, its outputs go).
+    fn clearExplanation(self: *Cell) void {
+        self.explanation.clearRetainingCapacity();
+        self.explain_state = .none;
+    }
+
+    /// A code cell that failed: an error, or a shell cell's exit status.
+    fn failed(self: *const Cell) bool {
+        return self.kind.runs() and (self.state == .failed or self.exit_code != null);
     }
 
     fn clearOutputs(self: *Cell, gpa: std.mem.Allocator, textures: ?*texture_mod.Textures) void {
@@ -669,6 +830,27 @@ fn metadataWith(gpa: std.mem.Allocator, metadata: []const u8, h: Hidden) ![]u8 {
 pub const NotebookTab = struct {
     pub const kind_label = "Notebook";
 
+    pub fn fromTab(t: tab_mod.Tab) ?*NotebookTab {
+        if (!std.mem.eql(u8, t.kind, "notebook")) return null;
+        return @ptrCast(@alignCast(t.ptr));
+    }
+
+    /// For the selftest: brings the first cell with a web output into view
+    /// and counts the web outputs, and those with a live web view.
+    pub fn selftestWeb(self: *NotebookTab) struct { outputs: usize, live: usize } {
+        var outputs: usize = 0;
+        var live: usize = 0;
+        for (self.cells.items, 0..) |c, i| {
+            for (c.outputs.items) |*o| {
+                if (o.kind != .web) continue;
+                if (outputs == 0) self.reveal = i;
+                outputs += 1;
+                if (o.web_view != null) live += 1;
+            }
+        }
+        return .{ .outputs = outputs, .live = live };
+    }
+
     gpa: std.mem.Allocator,
     env: *tab_mod.Env,
     file_path: []u8,
@@ -694,6 +876,16 @@ pub const NotebookTab = struct {
 
     /// Which cell has the keyboard; null = the input row at the bottom.
     focus_cell: ?usize = 0,
+    /// Text selected in an output, as in the terminal's blocks: output
+    /// `sel_out` of the cell whose salt is `sel_cell` (0 = none), and the
+    /// span. A table is selected whole (`sel_all`, by a right-click).
+    sel_cell: usize = 0,
+    sel_out: usize = 0,
+    sel: selection.Selection = .{},
+    sel_all: bool = false,
+    /// An output took this frame's right-click (else the right-click, on
+    /// a cell's source or the input row, drops the output selection).
+    sel_hit: bool = false,
     /// The input row: what a new cell is made of.
     input: TextEditor,
     input_kind: Kind = .py,
@@ -710,7 +902,24 @@ pub const NotebookTab = struct {
 
     // The kernel.
     kernel: ?*bridge.Kernel = null,
+    /// Every Python found for this notebook, best first, and which of
+    /// them have jupyter_client (parallel).
     interps: std.ArrayList([]u8) = .empty,
+    interp_ok: std.ArrayList(bool) = .empty,
+    /// The interpreter the user picked in the toolbar; null = the best one
+    /// that works. Kept across relaunches.
+    pinned_interp: ?[]u8 = null,
+    /// What the running kernel was given to try, owned here for its life.
+    launch_list: std.ArrayList([]u8) = .empty,
+    /// The kernelspecs the bridge's Python knows.
+    specs: []bridge.Spec = &.{},
+    /// The toolbar's kernel menu.
+    menu_open: bool = false,
+    menu_scroll: f32 = 0,
+    /// An ipykernel install under way, and what the last one said.
+    install: ?*bridge.Install = null,
+    install_note: []u8 = &.{},
+    install_failed_for: []u8 = &.{},
     script: []const u8 = "",
     kernel_version: []u8 = &.{},
     kernel_display: []u8 = &.{},
@@ -725,6 +934,12 @@ pub const NotebookTab = struct {
     // The agent (ask cells).
     ask_req: ?*agent.Request = null,
     ask_cell: []u8 = &.{},
+    // The agents behind a failed cell's Explain and Fix with agent.
+    explain_req: ?*agent.Request = null,
+    explain_cell: []u8 = &.{},
+    /// Why "Fix with agent" did nothing, beside that cell's buttons.
+    fix_note_cell: []u8 = &.{},
+    fix_note: []const u8 = "",
 
     pub fn accepts(file_path: []const u8, head: []const u8) bool {
         if (!filetype.hasExtension(file_path, &.{"ipynb"})) return false;
@@ -753,13 +968,24 @@ pub const NotebookTab = struct {
     pub fn deinit(self: *NotebookTab) void {
         if (self.ask_req) |r| r.release();
         self.gpa.free(self.ask_cell);
+        if (self.explain_req) |r| r.release();
+        self.gpa.free(self.explain_cell);
+        self.gpa.free(self.fix_note_cell);
         if (self.kernel) |k| k.destroy();
+        if (self.install) |job| job.destroy();
+        self.gpa.free(self.install_note);
+        self.gpa.free(self.install_failed_for);
         for (self.events.items) |*e| e.deinit(self.gpa);
         self.events.deinit(self.gpa);
         self.clearCells();
         self.cells.deinit(self.gpa);
         for (self.interps.items) |p| self.gpa.free(p);
         self.interps.deinit(self.gpa);
+        self.interp_ok.deinit(self.gpa);
+        self.freeLaunchList();
+        self.launch_list.deinit(self.gpa);
+        if (self.pinned_interp) |p| self.gpa.free(p);
+        bridge.freeSpecs(self.gpa, self.specs);
         self.freeVars();
         self.gpa.free(self.kernel_version);
         self.gpa.free(self.kernel_display);
@@ -1002,21 +1228,27 @@ pub const NotebookTab = struct {
     }
 
     // ── across relaunches ───────────────────────────────────────────────
-    /// After the file record: the focused cell, the scroll, the inspector
-    /// and the input row's kind; then one `cell` record per cell with
-    /// results or folds (id, count, how long it ran in ms, fold flags,
-    /// outputs as JSON), within a budget.
+    /// After the file record: the focused cell, the scroll, the inspector,
+    /// the input row's kind and the interpreter picked in the toolbar
+    /// ("-" for none); then one `cell` record per cell with results, folds
+    /// or an explanation (id, count, how long it ran in ms, flags — `i`/`o`
+    /// folds, `e`/`x` an explanation that finished / failed — outputs as
+    /// JSON, then the explanation), within a budget.
     fn keptFields(self: *const NotebookTab, buf: []u8) []const u8 {
         const focus: i64 = if (self.focus_cell) |f| @intCast(f) else -1;
-        return std.fmt.bufPrint(buf, "{d}\t{d}\t{d}\t{s}", .{ focus, @as(i64, @intFromFloat(self.scroll)), @as(u8, if (self.inspector) 1 else 0), @tagName(self.input_kind) }) catch "";
+        return std.fmt.bufPrint(buf, "{d}\t{d}\t{d}\t{s}\t{s}", .{ focus, @as(i64, @intFromFloat(self.scroll)), @as(u8, if (self.inspector) 1 else 0), @tagName(self.input_kind), self.pinned_interp orelse "-" }) catch "";
+    }
+
+    fn explanationSettled(c: *const Cell) bool {
+        return (c.explain_state == .done or c.explain_state == .failed) and c.explanation.items.len > 0;
     }
 
     pub fn save(self: *NotebookTab, out: *std.ArrayList(u8)) bool {
-        var buf: [96]u8 = undefined;
+        var buf: [1200]u8 = undefined;
         if (!viewer.keep(out, self.gpa, self.file_path, self.keptFields(&buf))) return false;
         var budget: usize = max_kept_bytes;
         for (self.cells.items) |c| {
-            if (c.outputs.items.len == 0 and c.count == null and !c.input_hidden and !c.outputs_hidden) continue;
+            if (c.outputs.items.len == 0 and c.count == null and !c.input_hidden and !c.outputs_hidden and !explanationSettled(c)) continue;
             var srcs: std.ArrayList(ipynb.Output) = .empty;
             defer srcs.deinit(self.gpa);
             for (c.outputs.items) |o| srcs.append(self.gpa, o.src) catch return true;
@@ -1028,19 +1260,28 @@ pub const NotebookTab = struct {
             records.escape(out, self.gpa, c.id) catch return true;
             if (c.count) |n| out.print(self.gpa, "\t{d}", .{n}) catch return true else out.appendSlice(self.gpa, "\t-") catch return true;
             const ms: i64 = @intFromFloat(@max(0, c.duration(self.now)) * 1000);
-            out.print(self.gpa, "\t{d}\t{s}{s}{s}\t", .{ ms, if (c.input_hidden) "i" else "", if (c.outputs_hidden) "o" else "", if (!c.input_hidden and !c.outputs_hidden) "-" else "" }) catch return true;
+            const settled = explanationSettled(c);
+            const explain_flag: []const u8 = if (!settled) "" else if (c.explain_state == .done) "e" else "x";
+            const no_flags = !c.input_hidden and !c.outputs_hidden and !settled;
+            out.print(self.gpa, "\t{d}\t{s}{s}{s}{s}\t", .{ ms, if (c.input_hidden) "i" else "", if (c.outputs_hidden) "o" else "", explain_flag, if (no_flags) "-" else "" }) catch return true;
             records.escape(out, self.gpa, json) catch return true;
+            if (settled and c.explanation.items.len <= budget) {
+                budget -= c.explanation.items.len;
+                out.append(self.gpa, '\t') catch return true;
+                records.escape(out, self.gpa, c.explanation.items) catch return true;
+            }
             out.append(self.gpa, '\n') catch return true;
         }
         return true;
     }
 
     pub fn saveVersion(self: *NotebookTab) u64 {
-        var buf: [96]u8 = undefined;
+        var buf: [1200]u8 = undefined;
         var h = std.hash.Wyhash.init(viewer.keptVersion(self.file_path, self.keptFields(&buf)));
         for (self.cells.items) |c| {
             h.update(c.id);
-            h.update(&[_]u8{ @intFromBool(c.input_hidden), @intFromBool(c.outputs_hidden) });
+            h.update(&[_]u8{ @intFromBool(c.input_hidden), @intFromBool(c.outputs_hidden), @intFromBool(explanationSettled(c)) });
+            if (explanationSettled(c)) h.update(c.explanation.items);
             if (c.count) |n| h.update(std.mem.asBytes(&n));
             for (c.outputs.items) |o| {
                 h.update(std.mem.asBytes(&o.buf.version));
@@ -1059,6 +1300,10 @@ pub const NotebookTab = struct {
         if (k.field(1)) |s| self.scroll = @floatFromInt(std.fmt.parseInt(i64, s, 10) catch 0);
         if (k.field(2)) |i| self.inspector = std.mem.eql(u8, i, "1");
         if (k.field(3)) |kind| self.input_kind = std.meta.stringToEnum(Kind, kind) orelse .py;
+        if (k.field(4)) |interp| if (!std.mem.eql(u8, interp, "-") and interp.len > 1 and interp[0] == '/') {
+            if (self.pinned_interp) |p| self.gpa.free(p);
+            self.pinned_interp = self.gpa.dupe(u8, interp) catch null;
+        };
         var id_buf: std.ArrayList(u8) = .empty;
         defer id_buf.deinit(self.gpa);
         var json_buf: std.ArrayList(u8) = .empty;
@@ -1074,7 +1319,18 @@ pub const NotebookTab = struct {
             const flags = f.next() orelse continue;
             cell.input_hidden = std.mem.indexOfScalar(u8, flags, 'i') != null;
             cell.outputs_hidden = std.mem.indexOfScalar(u8, flags, 'o') != null;
-            const json = records.unescape(&json_buf, self.gpa, f.rest()) catch continue;
+            const json_raw = f.next() orelse continue;
+            const explanation_raw = f.rest();
+            if (explanation_raw.len > 0 and (std.mem.indexOfScalar(u8, flags, 'e') != null or std.mem.indexOfScalar(u8, flags, 'x') != null)) {
+                var ebuf: std.ArrayList(u8) = .empty;
+                defer ebuf.deinit(self.gpa);
+                if (records.unescape(&ebuf, self.gpa, explanation_raw)) |text| {
+                    cell.explanation.clearRetainingCapacity();
+                    cell.explanation.appendSlice(self.gpa, text) catch {};
+                    cell.explain_state = if (std.mem.indexOfScalar(u8, flags, 'e') != null) .done else .failed;
+                } else |_| {}
+            }
+            const json = records.unescape(&json_buf, self.gpa, json_raw) catch continue;
             var outs: std.ArrayList(ipynb.Output) = .empty;
             defer outs.deinit(self.gpa);
             ipynb.parseOutputs(self.gpa, json, &outs) catch continue;
@@ -1119,6 +1375,7 @@ pub const NotebookTab = struct {
         if (i >= self.cells.items.len) return;
         const cell = self.cells.orderedRemove(i);
         if (std.mem.eql(u8, cell.id, self.ask_cell)) self.stopAsk();
+        if (std.mem.eql(u8, cell.id, self.explain_cell)) self.stopExplain();
         cell.destroy(self.gpa, self.env.textures);
         self.dirty = true;
         if (self.focus_cell) |f| {
@@ -1171,13 +1428,161 @@ pub const NotebookTab = struct {
         if (self.kernel != null) return;
         if (self.env.integration_dir.len == 0) return;
         if (self.script.len == 0) self.script = bridge.scriptPath(self.gpa, self.env.integration_dir) catch return;
-        if (self.interps.items.len == 0) bridge.interpreters(self.gpa, sys.dirname(self.file_path), &self.interps) catch {};
+        if (self.interps.items.len == 0) self.refreshInterpreters();
+        // The picked interpreter alone, else every candidate best first.
+        self.freeLaunchList();
+        if (self.pinned_interp) |p| {
+            self.launch_list.append(self.gpa, self.gpa.dupe(u8, p) catch return) catch return;
+        } else for (self.interps.items) |p| {
+            self.launch_list.append(self.gpa, self.gpa.dupe(u8, p) catch return) catch return;
+        }
         self.kernel = bridge.Kernel.create(self.gpa, .{
             .script = self.script,
             .cwd = sys.dirname(self.file_path),
             .kernel_name = if (self.kernel_name.len > 0) self.kernel_name else "python3",
-            .interpreters = self.interps.items,
+            .interpreters = self.launch_list.items,
         }) catch null;
+    }
+
+    fn freeLaunchList(self: *NotebookTab) void {
+        for (self.launch_list.items) |p| self.gpa.free(p);
+        self.launch_list.clearRetainingCapacity();
+    }
+
+    /// Looks for the Pythons again and which of them have Jupyter.
+    fn refreshInterpreters(self: *NotebookTab) void {
+        for (self.interps.items) |p| self.gpa.free(p);
+        self.interps.clearRetainingCapacity();
+        self.interp_ok.clearRetainingCapacity();
+        bridge.interpreters(self.gpa, sys.dirname(self.file_path), &self.interps) catch {};
+        for (self.interps.items) |p| self.interp_ok.append(self.gpa, bridge.hasJupyter(self.gpa, p)) catch {};
+    }
+
+    /// Stops the kernel, if any, and starts one afresh with the current
+    /// choices (interpreter, kernelspec).
+    fn relaunchKernel(self: *NotebookTab) void {
+        if (self.kernel) |k| {
+            k.destroy();
+            self.kernel = null;
+        }
+        for (self.cells.items) |c| if (c.running()) {
+            c.state = .aborted;
+            c.t_end = self.now;
+        };
+        self.freeVars();
+        self.memory_mb = 0;
+        for ([_]*[]u8{ &self.kernel_version, &self.kernel_display, &self.kernel_language, &self.kernel_interpreter, &self.no_jupyter_python }) |slot| {
+            self.gpa.free(slot.*);
+            slot.* = &.{};
+        }
+        bridge.freeSpecs(self.gpa, self.specs);
+        self.specs = &.{};
+        self.ensureKernel();
+    }
+
+    /// The toolbar's pick: run the notebook with this Python from now on.
+    fn pickInterpreter(self: *NotebookTab, python: []const u8) void {
+        const owned = self.gpa.dupe(u8, python) catch return;
+        if (self.pinned_interp) |p| self.gpa.free(p);
+        self.pinned_interp = owned;
+        self.relaunchKernel();
+    }
+
+    /// The toolbar's pick: start this kernelspec (the file remembers it).
+    fn pickSpec(self: *NotebookTab, spec: bridge.Spec) void {
+        const owned = self.gpa.dupe(u8, spec.name) catch return;
+        self.gpa.free(self.kernel_name);
+        self.kernel_name = owned;
+        self.setKernelspecMetadata(spec);
+        self.dirty = true;
+        self.relaunchKernel();
+    }
+
+    /// `metadata.kernelspec` = the picked spec, the rest of the notebook's
+    /// metadata untouched — what Jupyter writes when a kernel is chosen.
+    fn setKernelspecMetadata(self: *NotebookTab, spec: bridge.Spec) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var root: std.json.Value = if (self.nb_metadata.len == 0) .{ .object = .empty } else std.json.parseFromSliceLeaky(std.json.Value, a, self.nb_metadata, .{}) catch .{ .object = .empty };
+        if (root != .object) root = .{ .object = .empty };
+        var ks: std.json.Value = .{ .object = .empty };
+        ks.object.put(a, "display_name", .{ .string = spec.display_name }) catch return;
+        ks.object.put(a, "language", .{ .string = spec.language }) catch return;
+        ks.object.put(a, "name", .{ .string = spec.name }) catch return;
+        root.object.put(a, "kernelspec", ks) catch return;
+        const text = std.json.Stringify.valueAlloc(self.gpa, root, .{}) catch return;
+        self.gpa.free(self.nb_metadata);
+        self.nb_metadata = text;
+    }
+
+    /// The interpreter the kernel runs with (or is being started with).
+    fn currentInterpreter(self: *const NotebookTab) []const u8 {
+        if (self.kernel) |k| return k.interpreter();
+        return self.pinned_interp orelse "";
+    }
+
+    fn samePython(a: []const u8, b: []const u8) bool {
+        if (std.mem.eql(u8, a, b)) return true;
+        if (a.len == 0 or b.len == 0) return false;
+        var ra: [1024]u8 = undefined;
+        var rb: [1024]u8 = undefined;
+        return std.mem.eql(u8, realPath(a, &ra), realPath(b, &rb));
+    }
+
+    fn realPath(p: []const u8, buf: *[1024]u8) []const u8 {
+        var z: [1024]u8 = undefined;
+        const pz = std.fmt.bufPrintZ(&z, "{s}", .{p}) catch return p;
+        const r = std.c.realpath(pz.ptr, buf) orelse return p;
+        return std.mem.span(r);
+    }
+
+    // ── installing ipykernel ────────────────────────────────────────────
+    /// Starts `pip install ipykernel` for `python` in the background; the
+    /// kernel menu shows how it goes, and the notebook moves to that
+    /// Python once it is done.
+    fn startInstall(self: *NotebookTab, python: []const u8) void {
+        if (self.install != null) return;
+        self.setInstallNote("", "");
+        self.install = bridge.Install.start(self.gpa, python, sys.dirname(self.file_path)) catch {
+            self.setInstallNote(python, "pip could not be started.");
+            return;
+        };
+    }
+
+    fn setInstallNote(self: *NotebookTab, python: []const u8, note: []const u8) void {
+        self.gpa.free(self.install_note);
+        self.install_note = self.gpa.dupe(u8, note) catch &.{};
+        self.gpa.free(self.install_failed_for);
+        self.install_failed_for = self.gpa.dupe(u8, python) catch &.{};
+    }
+
+    fn pollInstall(self: *NotebookTab) bool {
+        const job = self.install orelse return false;
+        var changed = job.poll();
+        switch (job.state) {
+            .running => {},
+            .ok => {
+                const python = self.gpa.dupe(u8, job.python) catch return changed;
+                defer self.gpa.free(python);
+                job.destroy();
+                self.install = null;
+                self.setInstallNote("", "");
+                self.refreshInterpreters();
+                self.pickInterpreter(python);
+                changed = true;
+            },
+            .failed => {
+                var buf: [400]u8 = undefined;
+                const last = job.lastLine();
+                const why = if (last.len > 0) std.fmt.bufPrint(&buf, "Failed: {s}", .{last[0..@min(last.len, 300)]}) catch "Failed." else "Failed.";
+                self.setInstallNote(job.python, why);
+                job.destroy();
+                self.install = null;
+                changed = true;
+            },
+        }
+        return changed;
     }
 
     fn runCell(self: *NotebookTab, i: usize) void {
@@ -1187,7 +1592,10 @@ pub const NotebookTab = struct {
         self.ensureKernel();
         const k = self.kernel orelse return;
         if (k.phase == .failed) return;
+        if (self.sel_cell == cell.salt) self.sel_cell = 0;
         cell.clearOutputs(self.gpa, self.env.textures);
+        cell.clearExplanation();
+        if (std.mem.eql(u8, cell.id, self.explain_cell)) self.stopExplain();
         cell.count = null;
         cell.exit_code = null;
         cell.state = .queued;
@@ -1222,13 +1630,16 @@ pub const NotebookTab = struct {
     }
 
     fn clearAllOutputs(self: *NotebookTab) void {
+        self.sel_cell = 0;
         for (self.cells.items) |c| {
             if (c.kind == .ask) continue;
             c.clearOutputs(self.gpa, self.env.textures);
+            c.clearExplanation();
             c.count = null;
             c.exit_code = null;
             if (!c.running()) c.state = .idle;
         }
+        self.stopExplain();
         self.dirty = true;
     }
 
@@ -1266,6 +1677,11 @@ pub const NotebookTab = struct {
                     self.no_jupyter_python = f.python;
                     f.python = &.{};
                 }
+            },
+            .specs => |*list| {
+                bridge.freeSpecs(self.gpa, self.specs);
+                self.specs = list.*;
+                list.* = &.{};
             },
             .status => |s| if (s.busy and s.cell.len > 0) {
                 if (self.cellById(s.cell)) |c| if (c.state == .queued) {
@@ -1620,6 +2036,210 @@ pub const NotebookTab = struct {
         return std.mem.indexOf(u8, c.metadata, key) != null;
     }
 
+    // ── explain a failed cell ───────────────────────────────────────────
+    // "Explain" under a failed cell asks the agent chosen under Settings ›
+    // AI › Features › Explain why it failed. The answer streams into the
+    // cell's `explanation`, shown above the buttons and kept in the
+    // workspace file; a corrected cell the agent proposes is added under
+    // the failed one for the user to run.
+
+    fn explainCell(self: *NotebookTab, c: *Cell) void {
+        if (self.explain_req != null) return; // one at a time
+        c.explanation.clearRetainingCapacity();
+        c.explain_state = .running;
+        const cfg = config.get();
+        const name = cfg.features.explain_agent orelse return self.explainFailed(c, note_no_explain_agent);
+        const a = cfg.findAgentByName(name) orelse return self.explainFailed(c, "The agent chosen for Explain under Settings › AI › Features is no longer set up.");
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const system = self.explainSystemPrompt(arena) catch "";
+        const report = self.failureReport(arena, c) catch return self.explainFailed(c, "Out of memory.");
+        const messages = [_]agent.Message{.{ .role = .user, .text = report }};
+        var prepared = agent.prepare(self.gpa, a, system, &messages, .{ .tools = true, .tool = .notebook_cell }) catch |err| {
+            const why = switch (err) {
+                error.NoModel => "The agent has no model set (Settings › AI › APIs).",
+                error.NoApiKey => "The agent needs an API key (Settings › AI › APIs).",
+                error.NoBaseUrl => "The agent has no base URL (Settings › AI › APIs).",
+                error.OutOfMemory => "Out of memory.",
+            };
+            return self.explainFailed(c, why);
+        };
+        defer prepared.deinit(self.gpa);
+        const req = agent.Request.start(&prepared) catch return self.explainFailed(c, "Out of memory.");
+        self.explain_req = req;
+        self.gpa.free(self.explain_cell);
+        self.explain_cell = self.gpa.dupe(u8, c.id) catch &.{};
+    }
+
+    fn explainFailed(self: *NotebookTab, c: *Cell, why: []const u8) void {
+        c.explain_state = .failed;
+        if (c.explanation.items.len == 0) c.explanation.appendSlice(self.gpa, why) catch {};
+    }
+
+    fn stopExplain(self: *NotebookTab) void {
+        if (self.explain_req) |r| r.release();
+        self.explain_req = null;
+        self.gpa.free(self.explain_cell);
+        self.explain_cell = &.{};
+    }
+
+    /// The prompt from Settings › AI › Features › Explain (the notebook
+    /// default when blank), then where the user is and how to answer.
+    fn explainSystemPrompt(self: *NotebookTab, arena: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(arena, settings_features.promptForNotebook(.explain));
+        try out.print(arena, "\n\nContext: the user is in a Jupyter notebook, {s} in {s}, run by ", .{ sys.basename(self.file_path), sys.dirname(self.file_path) });
+        if (self.kernel_display.len > 0) {
+            try out.appendSlice(arena, self.kernel_display);
+            if (self.kernel_version.len > 0) try out.print(arena, " ({s} {s})", .{ self.kernel_language, self.kernel_version });
+        } else try out.appendSlice(arena, "Python 3 (ipykernel)");
+        try out.appendSlice(arena, ". The message carries the cell that failed — its source, what it printed and the error (a traceback, or a %%sh cell's exit status) — with the cells run just before it for context. When corrected code would fix it, call propose_command with the complete source of the corrected cell: it is added to the notebook under the failed cell for the user to review and run, so never assume it ran. Answer in plain text, briefly: no Markdown headings or tables, a few short lines.");
+        return out.toOwnedSlice(arena);
+    }
+
+    /// The failed cell as the agents read it: up to three code cells run
+    /// before it (for context), then the failure itself.
+    fn failureReport(self: *NotebookTab, arena: std.mem.Allocator, failed: *Cell) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var earlier: std.ArrayList([]const u8) = .empty;
+        var budget: usize = max_context_bytes / 2;
+        var i = self.indexOfCell(failed) orelse self.cells.items.len;
+        while (i > 0 and earlier.items.len < 3) {
+            i -= 1;
+            const other = self.cells.items[i];
+            if (!other.kind.runs() or other.state == .idle) continue;
+            const t = try self.cellTranscript(arena, other);
+            if (t.len > budget) break;
+            budget -= t.len;
+            try earlier.append(arena, t);
+        }
+        if (earlier.items.len > 0) {
+            try out.appendSlice(arena, "Cells run just before, oldest first:\n");
+            var k = earlier.items.len;
+            while (k > 0) {
+                k -= 1;
+                try out.appendSlice(arena, earlier.items[k]);
+            }
+            try out.append(arena, '\n');
+        }
+        try out.appendSlice(arena, "This cell failed:\n");
+        try out.appendSlice(arena, try self.cellTranscript(arena, failed));
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Moves what the explain agent sent into its cell; true when anything changed.
+    fn pollExplain(self: *NotebookTab) bool {
+        const req = self.explain_req orelse return false;
+        const cell = self.cellById(self.explain_cell) orelse {
+            self.stopExplain();
+            return false;
+        };
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(self.gpa);
+        var proposals: std.ArrayList([]u8) = .empty;
+        defer {
+            for (proposals.items) |p| self.gpa.free(p);
+            proposals.deinit(self.gpa);
+        }
+        var err: std.ArrayList(u8) = .empty;
+        defer err.deinit(self.gpa);
+        const outcome = req.take(&text, &proposals, &err, self.gpa);
+        var changed = false;
+        if (text.items.len > 0) {
+            for (text.items) |ch| switch (ch) {
+                '\r' => {},
+                '\t' => cell.explanation.appendSlice(self.gpa, "    ") catch break,
+                else => if (ch >= 0x20 or ch == '\n') cell.explanation.append(self.gpa, ch) catch break,
+            };
+            changed = true;
+        }
+        if (proposals.items.len > 0) {
+            var at = (self.indexOfCell(cell) orelse self.cells.items.len - 1) + 1;
+            while (at < self.cells.items.len and proposedBy(self.cells.items[at], cell.id)) at += 1;
+            for (proposals.items) |code| {
+                const kind: Kind = if (ipynb.shellMagic(code) != null) .sh else .py;
+                const body = if (kind == .sh) ipynb.afterFirstLine(code) else code;
+                if (self.addCell(at, kind, body)) |added| {
+                    if (kind == .sh) {
+                        self.gpa.free(added.magic);
+                        added.magic = self.gpa.dupe(u8, ipynb.shellMagic(code).?) catch &.{};
+                    }
+                    self.gpa.free(added.metadata);
+                    added.metadata = std.fmt.allocPrint(self.gpa, "{{\"tt\":{{\"from\":\"{s}\"}}}}", .{cell.id}) catch &.{};
+                    at += 1;
+                }
+            }
+            if (cell.explanation.items.len > 0 and cell.explanation.items[cell.explanation.items.len - 1] != '\n') cell.explanation.append(self.gpa, '\n') catch {};
+            cell.explanation.appendSlice(self.gpa, if (proposals.items.len == 1) "→ A corrected cell was added below." else "→ Corrected cells were added below.") catch {};
+            changed = true;
+        }
+        switch (outcome) {
+            .running => {},
+            .done => {
+                cell.explain_state = .done;
+                if (cell.explanation.items.len == 0) self.explainFailed(cell, note_no_explanation);
+                self.stopExplain();
+                changed = true;
+            },
+            .failed => {
+                self.explainFailed(cell, if (err.items.len > 0) err.items else "The agent could not answer.");
+                self.stopExplain();
+                changed = true;
+            },
+        }
+        return changed;
+    }
+
+    // ── fix with a coding agent ─────────────────────────────────────────
+    // "Fix with agent" under a failed cell starts the coding agent chosen
+    // under Settings › AI › Features in a shell of this row (an idle one,
+    // else a new one), with the notebook's path and the failure as its
+    // task. The notebook is saved first, so the agent edits what is on
+    // screen; its edit comes back through the reload on disk change.
+
+    fn fixCell(self: *NotebookTab, c: *Cell) void {
+        const cfg = config.get();
+        const f = &cfg.features;
+        if (f.fixOff()) return self.noteFix(c, note_fix_off);
+        const scan = coding_agents.get();
+        const k: *const coding_agents.Known = blk: {
+            if (f.fixAuto()) {
+                scan.rescan();
+                const found = scan.first() orelse return self.noteFix(c, note_fix_none);
+                break :blk found.known;
+            }
+            break :blk coding_agents.byId(f.fix_agent) orelse return self.noteFix(c, note_fix_unknown);
+        };
+        if (self.modified() and self.writable and self.file_state == .ok) _ = self.saveFile();
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var task: std.ArrayList(u8) = .empty;
+        task.appendSlice(arena, settings_features.promptForNotebook(.fix)) catch return;
+        task.print(arena, "\n\nThe notebook is {s} (Jupyter nbformat 4, saved as it is on screen), run by ", .{self.file_path}) catch return;
+        if (self.kernel_display.len > 0) {
+            task.appendSlice(arena, self.kernel_display) catch return;
+            if (self.kernel_version.len > 0) task.print(arena, " ({s} {s})", .{ self.kernel_language, self.kernel_version }) catch return;
+        } else task.appendSlice(arena, "Python 3 (ipykernel)") catch return;
+        const index = self.indexOfCell(c) orelse 0;
+        task.print(arena, " in the directory {s}. Cell {d} of {d} (id \"{s}\") failed; what follows is its source, what it printed and the error, with the cells run just before it for context:\n\n", .{ sys.dirname(self.file_path), index + 1, self.cells.items.len, c.id }) catch return;
+        task.appendSlice(arena, self.failureReport(arena, c) catch return) catch return;
+        task.appendSlice(arena, "\n\nFix it in the notebook file: edit that cell's source (keep its id and the other cells as they are) and, when the cause lies outside the notebook, fix that instead. Say in a line what was wrong.") catch return;
+        const cmd = coding_agents.launchCommand(self.gpa, k, task.items) catch return;
+        defer self.gpa.free(cmd);
+        self.env.runInShell(cmd);
+        self.noteFix(c, "");
+    }
+
+    fn noteFix(self: *NotebookTab, c: *Cell, why: []const u8) void {
+        self.gpa.free(self.fix_note_cell);
+        self.fix_note_cell = self.gpa.dupe(u8, c.id) catch &.{};
+        self.fix_note = why;
+    }
+
     // ── tab interface ───────────────────────────────────────────────────
     pub fn title(self: *NotebookTab, _: []u8) []const u8 {
         return sys.basename(self.file_path);
@@ -1640,7 +2260,7 @@ pub const NotebookTab = struct {
     }
 
     pub fn status(self: *NotebookTab) tab_mod.Status {
-        if (self.anyRunning() or self.ask_req != null) return .running;
+        if (self.anyRunning() or self.ask_req != null or self.explain_req != null) return .running;
         if (self.modified()) return .attention;
         return .none;
     }
@@ -1722,6 +2342,8 @@ pub const NotebookTab = struct {
             }
         }
         if (self.pollAsk()) dirty = true;
+        if (self.pollExplain()) dirty = true;
+        if (self.pollInstall()) dirty = true;
         if (self.focusedEditor()) |ed| {
             if (ed.tick(now, active)) dirty = true;
         }
@@ -1732,7 +2354,7 @@ pub const NotebookTab = struct {
         } else if (now - self.saved_at < saved_flash + 0.1 and now - self.saved_at > saved_flash) {
             dirty = true;
         }
-        if (active and (self.anyRunning() or self.ask_req != null) and now - self.last_anim > 0.25) {
+        if (active and (self.anyRunning() or self.ask_req != null or self.explain_req != null or self.install != null) and now - self.last_anim > 0.25) {
             self.last_anim = now;
             dirty = true;
         }
@@ -1784,6 +2406,10 @@ pub const NotebookTab = struct {
     }
 
     pub fn onEdit(self: *NotebookTab, cmd: EditCommand) void {
+        if (self.menu_open and cmd == .cancel) {
+            self.menu_open = false;
+            return;
+        }
         if (self.focus_cell) |i| {
             if (i >= self.cells.items.len) {
                 self.focus_cell = null;
@@ -1862,16 +2488,62 @@ pub const NotebookTab = struct {
     }
 
     pub fn onCtrl(self: *NotebookTab, key: u8) void {
-        if (key == 'c' and self.anyRunning()) self.interrupt();
+        if (key != 'c') return;
+        if (self.anyRunning()) self.interrupt();
+        if (self.explain_req) |r| {
+            r.cancel();
+            if (self.cellById(self.explain_cell)) |c| self.explainFailed(c, "Stopped.");
+            self.stopExplain();
+        }
     }
 
     pub fn copy(self: *NotebookTab, out: *std.ArrayList(u8), cut: bool) bool {
+        // Outputs are read-only: a cut leaves them be.
+        if (self.selectedOutput()) |o| return !cut and self.copyOutput(o, out);
         const ed = self.focusedEditor() orelse return false;
         return ed.copy(out, cut);
     }
 
+    /// The output holding the output selection, if it is still there.
+    fn selectedOutput(self: *NotebookTab) ?*Out {
+        if (self.sel_cell == 0) return null;
+        for (self.cells.items) |c| {
+            if (c.salt != self.sel_cell) continue;
+            return if (self.sel_out < c.outputs.items.len) &c.outputs.items[self.sel_out] else null;
+        }
+        return null;
+    }
+
+    /// The selected text of an output; a table selected whole comes as
+    /// tab-separated lines (what spreadsheets paste as cells).
+    fn copyOutput(self: *NotebookTab, o: *Out, out: *std.ArrayList(u8)) bool {
+        if (self.sel_all) {
+            if (o.kind != .table) return false;
+            const text = o.plainText(self.gpa, std.math.maxInt(usize)) catch return false;
+            defer self.gpa.free(text);
+            out.appendSlice(self.gpa, text) catch return false;
+            return true;
+        }
+        if (o.kind != .text and o.kind != .err) return false;
+        const range = self.sel.range() orelse return false;
+        selection.appendText(&o.buf, range, out, self.gpa) catch return false;
+        return out.items.len > 0;
+    }
+
+    /// The output selection moves to output `index` of the cell with
+    /// `cell_salt`. The editor with the keyboard lets its own selection
+    /// go, so a copy takes the output's.
+    fn selectOutput(self: *NotebookTab, cell_salt: usize, index: usize) void {
+        self.sel_cell = cell_salt;
+        self.sel_out = index;
+        self.sel_all = false;
+        self.sel = .{};
+        if (self.focusedEditor()) |ed| ed.doc.editor.anchor = null;
+    }
+
     pub fn paste(self: *NotebookTab, utf8: []const u8) void {
         const ed = self.focusedEditor() orelse return;
+        self.sel_cell = 0;
         self.unfoldFocused();
         ed.paste(utf8);
         if (self.focusedCell()) |c| if (c.view) |*v| {
@@ -1924,46 +2596,6 @@ pub const NotebookTab = struct {
         }
     }
 
-    // ── the band: Run all · Restart · Clear outputs · Variables ─────────
-    pub fn strip(self: *NotebookTab, ui: *Ui, room: Rect) f32 {
-        if (self.file_state != .ok) return 0;
-        const Item = struct { label: []const u8, w: f32 = 0, show: bool = false };
-        var items = [_]Item{
-            .{ .label = "Run all" },
-            .{ .label = "Restart" },
-            .{ .label = "Clear outputs" },
-            .{ .label = if (self.inspector) "Hide variables" else "Variables" },
-        };
-        for (&items) |*it| it.w = ui.text.measure(theme.font_hint, it.label) + 18;
-        // What fits, most useful first.
-        const priority = [_]usize{ 0, 3, 1, 2 };
-        var used: f32 = 0;
-        for (priority) |p| {
-            if (used + items[p].w + 4 > room.w) continue;
-            items[p].show = true;
-            used += items[p].w + 4;
-        }
-        if (used == 0) return 0;
-        var x = room.right() - used + 4;
-        const h: f32 = 24;
-        const y = room.y + (room.h - h) / 2;
-        for (items, 0..) |it, i| {
-            if (!it.show) continue;
-            const r: Rect = .{ .x = x, .y = y, .w = it.w, .h = h };
-            const color = if (i == 0) theme.text else theme.text_2;
-            if (field.textButton(ui, Ui.id("notebook.strip", self.input.salt * 8 + i), r, it.label, color)) {
-                switch (i) {
-                    0 => self.runAll(),
-                    1 => self.restartKernel(),
-                    2 => self.clearAllOutputs(),
-                    else => self.inspector = !self.inspector,
-                }
-            }
-            x += it.w + 4;
-        }
-        return used;
-    }
-
     // ── drawing ─────────────────────────────────────────────────────────
     pub fn draw(self: *NotebookTab, ui: *Ui, rect: Rect, focused: bool) void {
         self.now = ui.now;
@@ -1976,12 +2608,34 @@ pub const NotebookTab = struct {
         }
         if (focused and !self.was_focused) self.ensureKernel();
         self.was_focused = focused;
+
+        // A press anywhere drops the output selection (a press on output
+        // text starts a new one later in this frame), and so does text
+        // selected in the editor that has the keyboard. Not a press on a
+        // menu over the window: the edit menu's Copy acts on the selection.
+        if (ui.pressed and ui.mouse_inside) self.sel_cell = 0;
+        if (self.focusedEditor()) |ed| if (ed.doc.editor.selection() != null) {
+            self.sel_cell = 0;
+        };
+        const right_press = ui.right_pressed and ui.mouse_inside;
+        self.sel_hit = false;
         if (self.kernel == null) self.ensureKernel();
 
-        var area = body;
-        if (self.inspector and body.w > inspector_w + 360) {
+        // The kernel menu is modal within the tab: while it is open nothing
+        // under it reacts (a press outside it closes it), like the app's
+        // own menus.
+        const mouse_inside = ui.mouse_inside;
+        if (self.menu_open) ui.mouse_inside = false;
+
+        // The toolbar, above everything else in the tab.
+        const bar: Rect = .{ .x = body.x, .y = body.y, .w = body.w, .h = toolbar_h };
+        self.drawToolbar(ui, bar);
+        const below: Rect = .{ .x = body.x, .y = body.y + toolbar_h, .w = body.w, .h = @max(0, body.h - toolbar_h) };
+
+        var area = below;
+        if (self.inspector and below.w > inspector_w + 360) {
             area.w -= inspector_w;
-            const panel: Rect = .{ .x = body.right() - inspector_w, .y = body.y, .w = inspector_w, .h = body.h };
+            const panel: Rect = .{ .x = below.right() - inspector_w, .y = below.y, .w = inspector_w, .h = below.h };
             dl.rect(.{ .x = panel.x, .y = panel.y, .w = 1, .h = panel.h }, theme.line);
             self.drawInspector(ui, panel);
         }
@@ -1992,6 +2646,259 @@ pub const NotebookTab = struct {
         const cells_area: Rect = .{ .x = area.x, .y = area.y, .w = area.w, .h = @max(0, input_rect.y - cell_gap - area.y) };
         self.drawCells(ui, cells_area, focused);
         self.drawInput(ui, input_rect, focused and self.focus_cell == null);
+        if (right_press and !self.sel_hit) self.sel_cell = 0;
+
+        ui.mouse_inside = mouse_inside;
+        if (self.menu_open) self.drawKernelMenu(ui, bar, body);
+    }
+
+    // ── the toolbar ─────────────────────────────────────────────────────
+    /// The kernel picker at the left, then Run all · Restart · Interrupt ·
+    /// Clear outputs; Variables at the right. What an install is saying
+    /// sits in between.
+    fn drawToolbar(self: *NotebookTab, ui: *Ui, bar: Rect) void {
+        const dl = ui.dl;
+        dl.rect(.{ .x = bar.x, .y = bar.bottom() - 1, .w = bar.w, .h = 1 }, theme.line);
+        const cy = bar.centerY();
+        var x = bar.x + side_pad;
+
+        // The kernel button: state dot, name, chevron.
+        var kbuf: [200]u8 = undefined;
+        const label = self.kernelButtonLabel(&kbuf);
+        const lw = @min(ui.text.measure(theme.font_side_medium, label), @max(80, bar.w * 0.4));
+        const kb: Rect = .{ .x = x, .y = cy - 14, .w = 22 + lw + 8 + 20, .h = 28 };
+        const kst = ui.button(Ui.id("notebook.kernel", self.input.salt), kb);
+        dl.shape(kb, 7, if (kst.hover or self.menu_open) theme.hover else theme.bg_block, 1, theme.line_strong);
+        dl.circle(kb.x + 12, cy, 3.5, self.kernelDotColor());
+        _ = dl.textEllipsis(theme.font_side_medium, kb.x + 22, cy, label, lw + 2, theme.text);
+        dl.icon(.chevron_down, kb.right() - 20, cy - 6, 12, theme.text_2);
+        if (kst.clicked) {
+            self.menu_open = true;
+            self.menu_scroll = 0;
+        }
+        x = kb.right() + 12;
+
+        // Variables at the right end.
+        var right = bar.right() - side_pad;
+        {
+            const vlabel: []const u8 = if (self.inspector) "Hide variables" else "Variables";
+            const w = ui.text.measure(theme.font_side, vlabel) + 20;
+            const vr: Rect = .{ .x = right - w, .y = cy - 14, .w = w, .h = 28 };
+            const st = ui.button(Ui.id("notebook.tool", self.input.salt * 8 + 7), vr);
+            if (self.inspector) dl.rrect(vr, 6, theme.accent.alpha(0.16)) else ui.feedback(vr, 6, st);
+            _ = dl.textCentered(theme.font_side, vr.x + 10, cy, vlabel, if (self.inspector or st.hover) theme.text else theme.text_2);
+            if (st.clicked) self.inspector = !self.inspector;
+            right = vr.x - 12;
+        }
+
+        // The actions.
+        const Action = enum { run_all, restart, interrupt, clear };
+        const items = [_]struct { a: Action, label: []const u8 }{
+            .{ .a = .run_all, .label = "Run all" },
+            .{ .a = .restart, .label = "Restart" },
+            .{ .a = .interrupt, .label = "Interrupt" },
+            .{ .a = .clear, .label = "Clear outputs" },
+        };
+        const running = self.anyRunning();
+        for (items, 0..) |it, i| {
+            const w = ui.text.measure(theme.font_side, it.label) + 20;
+            if (x + w > right) break;
+            const r: Rect = .{ .x = x, .y = cy - 14, .w = w, .h = 28 };
+            const enabled = it.a != .interrupt or running;
+            const st = if (enabled) ui.button(Ui.id("notebook.tool", self.input.salt * 8 + i), r) else ui_mod.ButtonState{};
+            ui.feedback(r, 6, st);
+            const color = if (!enabled) theme.text_3 else if (st.hover or it.a == .run_all) theme.text else theme.text_2;
+            _ = dl.textCentered(theme.font_side, r.x + 10, cy, it.label, color);
+            if (st.clicked) switch (it.a) {
+                .run_all => self.runAll(),
+                .restart => self.restartKernel(),
+                .interrupt => self.interrupt(),
+                .clear => self.clearAllOutputs(),
+            };
+            x = r.right() + 4;
+        }
+
+        // An install under way, or how the last one ended.
+        var nbuf: [420]u8 = undefined;
+        const note: []const u8 = if (self.install) |job| blk: {
+            var vbuf: [16]u8 = undefined;
+            const last = job.lastLine();
+            break :blk std.fmt.bufPrint(&nbuf, "Installing ipykernel for Python {s}{s}{s}", .{ bridge.versionLabel(job.python, &vbuf), if (last.len > 0) " · " else "…", last[0..@min(last.len, 300)] }) catch "Installing ipykernel…";
+        } else if (self.install_note.len > 0) self.install_note else "";
+        if (note.len > 0 and right - x > 80) {
+            const color = if (self.install != null) theme.teal else theme.red;
+            _ = dl.textEllipsis(theme.font_hint, x + 10, cy, note, right - x - 10, color);
+        }
+    }
+
+    /// "Python 3.12 · .venv", "R", "Starting kernel…", "No kernel".
+    fn kernelButtonLabel(self: *const NotebookTab, buf: []u8) []const u8 {
+        const k = self.kernel orelse return "Kernel";
+        switch (k.phase) {
+            .off, .launching, .starting => return "Starting kernel…",
+            .restarting => return "Restarting kernel…",
+            .dead => return "Kernel died",
+            .failed => return "No kernel",
+            .ready => {},
+        }
+        var vbuf: [48]u8 = undefined;
+        const hint = bridge.envHint(k.interpreter());
+        if (std.mem.eql(u8, self.kernel_language, "python") or self.kernel_language.len == 0) {
+            const lang = self.shortLanguage(&vbuf);
+            const version = if (std.mem.startsWith(u8, lang, "py ")) lang[3..] else lang;
+            return std.fmt.bufPrint(buf, "Python {s}{s}{s}", .{ version, if (hint.len > 0) " · " else "", hint }) catch "Python";
+        }
+        const name = if (self.kernel_display.len > 0) self.kernel_display else self.kernel_language;
+        return std.fmt.bufPrint(buf, "{s}{s}{s}", .{ name, if (hint.len > 0) " · " else "", hint }) catch name;
+    }
+
+    fn kernelDotColor(self: *const NotebookTab) Color {
+        const k = self.kernel orelse return theme.text_3;
+        return switch (k.phase) {
+            .ready => if (k.busy or self.anyRunning()) theme.accent else theme.teal,
+            .failed, .dead => theme.red,
+            else => theme.text_3,
+        };
+    }
+
+    // ── the kernel menu ─────────────────────────────────────────────────
+    /// Under the kernel button: the Pythons that can run the notebook (the
+    /// one in use ticked), the other kernelspecs that Python knows, and the
+    /// Pythons that lack ipykernel, each with an install that runs from
+    /// here. A press outside closes it, Escape too.
+    fn drawKernelMenu(self: *NotebookTab, ui: *Ui, bar: Rect, body: Rect) void {
+        const dl = ui.dl;
+        const RowKind = enum { head, interp, spec, install, empty };
+        const Row = struct { kind: RowKind, index: usize = 0, text: []const u8 = "" };
+        var rows: [200]Row = undefined;
+        var n: usize = 0;
+        const add = struct {
+            fn f(list: *[200]Row, count: *usize, row: Row) void {
+                if (count.* < list.len) {
+                    list[count.*] = row;
+                    count.* += 1;
+                }
+            }
+        }.f;
+
+        add(&rows, &n, .{ .kind = .head, .text = "PYTHON" });
+        var any_ok = false;
+        var any_missing = false;
+        for (self.interps.items, 0..) |_, i| {
+            const ok = i < self.interp_ok.items.len and self.interp_ok.items[i];
+            if (ok) {
+                add(&rows, &n, .{ .kind = .interp, .index = i });
+                any_ok = true;
+            } else any_missing = true;
+        }
+        if (!any_ok) add(&rows, &n, .{ .kind = .empty, .text = if (self.interps.items.len == 0) "No Python 3 was found on this Mac." else "None of these Pythons has ipykernel yet: install it below." });
+        if (self.specs.len > 1) {
+            add(&rows, &n, .{ .kind = .head, .text = "KERNEL" });
+            for (self.specs, 0..) |_, j| add(&rows, &n, .{ .kind = .spec, .index = j });
+        }
+        if (any_missing) {
+            add(&rows, &n, .{ .kind = .head, .text = "INSTALL IPYKERNEL INTO" });
+            for (self.interps.items, 0..) |_, i| {
+                const ok = i < self.interp_ok.items.len and self.interp_ok.items[i];
+                if (!ok) add(&rows, &n, .{ .kind = .install, .index = i });
+            }
+        }
+
+        var content_h: f32 = 0;
+        for (rows[0..n]) |row| content_h += if (row.kind == .head) menu_head_h else menu_row_h;
+        const w = @min(menu_w, @max(240, body.w - 2 * side_pad));
+        const top = bar.bottom() + 4;
+        const inner_h = @min(content_h, @max(menu_row_h, body.bottom() - 12 - top - 2 * menu_pad));
+        const panel: Rect = .{ .x = bar.x + side_pad, .y = top, .w = w, .h = inner_h + 2 * menu_pad };
+        ui.interactive.append(ui.gpa, panel) catch {};
+        if (ui.pressed and !panel.contains(ui.mx, ui.my)) {
+            self.menu_open = false;
+            return;
+        }
+        theme.dropShadow(dl, panel, 8, 3, 5, 8, 0.08);
+        dl.shape(panel, 8, theme.bg_panel, 1, theme.line_strong);
+        const max_scroll = @max(0, content_h - inner_h);
+        self.menu_scroll = std.math.clamp(self.menu_scroll - ui.takeScroll(panel), 0, max_scroll);
+        const inner: Rect = .{ .x = panel.x, .y = panel.y + menu_pad, .w = panel.w, .h = inner_h };
+        dl.pushClip(inner);
+        defer dl.popClip();
+
+        const current = self.currentInterpreter();
+        var y = inner.y - self.menu_scroll;
+        var vbuf: [16]u8 = undefined;
+        var lbuf: [160]u8 = undefined;
+        var abbrev: [512]u8 = undefined;
+        for (rows[0..n], 0..) |row, ri| {
+            const h: f32 = if (row.kind == .head) menu_head_h else menu_row_h;
+            const r: Rect = .{ .x = panel.x + menu_pad, .y = y, .w = panel.w - 2 * menu_pad, .h = h };
+            y += h;
+            if (r.bottom() <= inner.y or r.y >= inner.bottom()) continue;
+            const cy = r.centerY();
+            switch (row.kind) {
+                .head => {
+                    if (ri > 0) dl.rect(.{ .x = r.x + 4, .y = r.y + 3, .w = r.w - 8, .h = 1 }, theme.line);
+                    _ = dl.textCentered(theme.font_group, r.x + 12, cy + 3, row.text, theme.text_3);
+                },
+                .empty => _ = dl.textEllipsis(theme.font_hint, r.x + 30, cy, row.text, r.w - 40, theme.text_3),
+                .interp, .install => {
+                    const python = self.interps.items[row.index];
+                    const version = bridge.versionLabel(python, &vbuf);
+                    const hint = bridge.envHint(python);
+                    const label = std.fmt.bufPrint(&lbuf, "Python{s}{s}{s}{s}", .{ if (version.len > 0) " " else "", version, if (hint.len > 0) " · " else "", hint }) catch "Python";
+                    const st = ui.button(Ui.id("notebook.menu", self.input.salt * 256 + ri), r);
+                    ui.feedback(r, 6, st);
+                    const is_current = row.kind == .interp and samePython(python, current);
+                    if (is_current) dl.icon(.check, r.x + 9, cy - 7, 14, theme.accent);
+                    const lw = dl.textCentered(theme.font_ui, r.x + 30, cy, label, theme.text);
+                    // The path, dim; an install row says what it would do (or
+                    // is doing) at the far right.
+                    var right_x = r.right() - 12;
+                    if (row.kind == .install) {
+                        var dbuf: [420]u8 = undefined;
+                        var action: []const u8 = if (st.hover) "Install here" else "Install";
+                        var action_color = theme.accent;
+                        if (self.install) |job| {
+                            if (std.mem.eql(u8, job.python, python)) {
+                                const last = job.lastLine();
+                                action = std.fmt.bufPrint(&dbuf, "Installing…{s}{s}", .{ if (last.len > 0) " " else "", last[0..@min(last.len, 300)] }) catch "Installing…";
+                                action_color = theme.teal;
+                            } else {
+                                action = "";
+                            }
+                        } else if (self.install_note.len > 0 and std.mem.eql(u8, self.install_failed_for, python)) {
+                            action = self.install_note;
+                            action_color = theme.red;
+                        }
+                        if (action.len > 0) right_x -= dl.textRightEllipsis(theme.font_hint, right_x, cy, action, @max(60, (r.w - 30 - lw - 36) * 0.6), action_color) + 14;
+                    }
+                    const room = right_x - (r.x + 30 + lw + 12);
+                    if (room > 40) _ = dl.textRightEllipsis(theme.font_hint, right_x, cy, sys.abbreviateHome(python, &abbrev), room, theme.text_3);
+                    if (st.clicked) {
+                        if (row.kind == .interp) {
+                            self.menu_open = false;
+                            if (!is_current) self.pickInterpreter(python);
+                        } else if (self.install == null) {
+                            self.startInstall(python);
+                        }
+                    }
+                },
+                .spec => {
+                    const spec = self.specs[row.index];
+                    const st = ui.button(Ui.id("notebook.menu", self.input.salt * 256 + ri), r);
+                    ui.feedback(r, 6, st);
+                    const is_current = std.mem.eql(u8, spec.name, if (self.kernel_name.len > 0) self.kernel_name else "python3");
+                    if (is_current) dl.icon(.check, r.x + 9, cy - 7, 14, theme.accent);
+                    const lw = dl.textCentered(theme.font_ui, r.x + 30, cy, spec.display_name, theme.text);
+                    const room = r.w - 30 - lw - 24 - 12;
+                    if (room > 40) _ = dl.textRightEllipsis(theme.font_row_mono, r.right() - 12, cy, spec.name, room, theme.text_3);
+                    if (st.clicked) {
+                        self.menu_open = false;
+                        if (!is_current) self.pickSpec(spec);
+                    }
+                },
+            }
+        }
+        if (max_scroll > 0) sidebar.drawScrollbarAxis(ui, Ui.id("notebook.menu.bar", self.input.salt), .vertical, inner, self.menu_scroll, content_h);
     }
 
     fn inputHeight(self: *NotebookTab, ui: *Ui) f32 {
@@ -2020,6 +2927,17 @@ pub const NotebookTab = struct {
             h += oh;
         }
         if (cell.input != null) h += 1 + out_pad + line_h + 8 + out_pad;
+        cell.actions_h = 0;
+        if (cell.failed()) {
+            var ah: f32 = 0;
+            if (cell.explain_state != .none) {
+                const lines: f32 = @floatFromInt(if (cell.explanation.items.len == 0) 1 else wrap.wrapParagraphCount(ui, theme.font_ui, cell.explanation.items, inner_w));
+                ah += 8 + explain_label_h + lines * explain_line_h;
+            }
+            ah += actions_row_h;
+            cell.actions_h = ah;
+            h += ah;
+        }
         cell.h = h;
         return h;
     }
@@ -2069,7 +2987,8 @@ pub const NotebookTab = struct {
             const r: Rect = .{ .x = card_x, .y = y, .w = card_w, .h = c.h };
             const gap: Rect = .{ .x = card_x, .y = r.bottom(), .w = card_w, .h = cell_gap };
             if (r.bottom() > area.y and r.y < area.bottom()) {
-                if (ui.pressed and ui.mouseIn(r) and self.focus_cell != i) self.focus_cell = i;
+                // A press, or a right-click (the edit menu acts on what has the keyboard).
+                if ((ui.pressed or ui.right_pressed) and ui.mouseIn(r) and self.focus_cell != i) self.focus_cell = i;
                 const is_focused = focused and self.focus_cell == i;
                 if (is_focused and (c.ed.follow or (if (c.view) |v| v.follow else false))) follow_caret = true;
                 self.drawCell(ui, c, i, r, area, is_focused);
@@ -2117,8 +3036,14 @@ pub const NotebookTab = struct {
         _ = dl.textEllipsis(theme.font_hint, px, r.y + 44, hint, r.w - 2 * theme.block_pad_x, theme.text_2);
         const by = r.y + 58;
         var x = px;
+        const b0: Rect = .{ .x = x, .y = by, .w = ui.text.measure(theme.font_hint, "Choose a kernel") + 18, .h = 22 };
+        if (field.textButton(ui, Ui.id("notebook.choose", self.input.salt), b0, "Choose a kernel", theme.accent)) {
+            self.menu_open = true;
+            self.menu_scroll = 0;
+        }
+        x += b0.w + 10;
         const b1: Rect = .{ .x = x, .y = by, .w = ui.text.measure(theme.font_hint, "Install in a shell") + 18, .h = 22 };
-        if (field.textButton(ui, Ui.id("notebook.install", self.input.salt), b1, "Install in a shell", theme.accent)) {
+        if (field.textButton(ui, Ui.id("notebook.install", self.input.salt), b1, "Install in a shell", theme.text_2)) {
             const cmd = std.fmt.bufPrint(&hint_buf, "{s} -m pip install ipykernel", .{python}) catch "python3 -m pip install ipykernel";
             self.env.sendToShell(cmd);
         }
@@ -2152,10 +3077,11 @@ pub const NotebookTab = struct {
         const border_w: f32 = if (c.state == .running or failed or is_focused) 1 else theme.block_border;
         dl.shape(r, theme.block_radius, theme.bg_block, border_w, border_color);
 
-        // The gutter: kind, count.
+        // The gutter: the kind (a click cycles it), flush with the card's
+        // top edge, and the run count under it.
         {
             const gx = r.x - gutter_gap;
-            const gy = r.y + src_pad + line_h / 2;
+            const gy = r.y + 8;
             const label = c.kind.label();
             const lw = ui.text.measure(theme.font_kbd, label);
             const lr: Rect = .{ .x = gx - lw - 6, .y = gy - 10, .w = lw + 12, .h = 20 };
@@ -2257,8 +3183,8 @@ pub const NotebookTab = struct {
                 self.drawFoldedOutputs(ui, c, px, y, inner_w);
                 y += line_h + out_pad;
             } else {
-                for (c.outputs.items) |*o| {
-                    self.drawOut(ui, o, px, y, inner_w, area);
+                for (c.outputs.items, 0..) |*o, k| {
+                    self.drawOut(ui, o, c.salt, k, px, y, inner_w, area);
                     y += o.h + out_gap;
                 }
                 y += out_pad - out_gap;
@@ -2273,6 +3199,65 @@ pub const NotebookTab = struct {
             dl.shape(box, 6, theme.bg_inset, 1, theme.accent);
             inp.ed.draw(ui, .{ .x = box.x - theme.block_pad_x + 8, .y = box.y, .w = box.w + theme.block_pad_x - 8, .h = box.h }, is_focused);
             _ = dl.textRight(theme.font_hint, r.right() - theme.block_pad_x, y + 4 + line_h / 2, "↵ Send", theme.text_3);
+            y += 1 + out_pad + line_h + 8 + out_pad;
+        }
+        if (c.actions_h > 0) self.drawCellActions(ui, c, i, px, y, inner_w, r);
+    }
+
+    /// Under a failed cell: the agent's explanation when there is one,
+    /// then Fix with agent · Explain · Run again (the two agent buttons
+    /// only when Settings › AI › Features gives them to notebooks).
+    fn drawCellActions(self: *NotebookTab, ui: *Ui, c: *Cell, i: usize, px: f32, y0: f32, inner_w: f32, r: Rect) void {
+        const dl = ui.dl;
+        var y = y0;
+        if (c.explain_state != .none) {
+            y += 8;
+            const label: []const u8 = switch (c.explain_state) {
+                .none => "",
+                .running => "Explaining…",
+                .done => "Explanation",
+                .failed => if (c.explanation.items.len > 0 and !std.mem.startsWith(u8, c.explanation.items, "No agent") and !std.mem.startsWith(u8, c.explanation.items, "The agent") and !std.mem.startsWith(u8, c.explanation.items, "Stopped")) "Explanation · stopped" else "Could not explain",
+            };
+            const color = switch (c.explain_state) {
+                .running => theme.teal,
+                .failed => theme.red,
+                else => theme.text_3,
+            };
+            const cy = y + explain_label_h / 2;
+            dl.icon(.sparkle, px, cy - 7, 14, if (c.explain_state == .failed) theme.red else theme.accent);
+            _ = dl.textCentered(theme.font_hint, px + 20, cy, label, color);
+            y += explain_label_h;
+            if (c.explanation.items.len == 0) {
+                _ = dl.textCentered(theme.font_ui, px, y + explain_line_h / 2, if (c.explain_state == .running) "Thinking…" else "", theme.text_3);
+                y += explain_line_h;
+            } else {
+                y = wrap.drawWrappedParagraphs(ui, theme.font_ui, c.explanation.items, px, y, inner_w, explain_line_h, if (c.explain_state == .failed and c.explanation.items.len < 200) theme.text_3 else theme.text_2);
+            }
+        }
+        const by = y + 14;
+        var bx = px;
+        const f = &config.get().features;
+        if (f.fix_notebooks) {
+            const b = actionButton(ui, Ui.id("notebook.fix", c.salt), bx, by, "Fix with agent", .primary);
+            bx = b.right + 10;
+            if (b.clicked) self.fixCell(c);
+        }
+        if (f.explain_notebooks) {
+            const label: []const u8 = switch (c.explain_state) {
+                .none => "Explain",
+                .running => "Explaining…",
+                .done, .failed => "Explain again",
+            };
+            const b = actionButton(ui, Ui.id("notebook.explain", c.salt), bx, by, label, .outline);
+            bx = b.right + 10;
+            if (b.clicked) self.explainCell(c);
+        }
+        const rb = actionButton(ui, Ui.id("notebook.rerun", c.salt), bx, by, "Run again", .outline);
+        bx = rb.right + 14;
+        if (rb.clicked) self.runCell(i);
+        const right = r.right() - theme.block_pad_x;
+        if (self.fix_note.len > 0 and std.mem.eql(u8, self.fix_note_cell, c.id) and right - bx > 60) {
+            _ = dl.textEllipsis(theme.font_hint, bx, by + 17, self.fix_note, right - bx, theme.text_3);
         }
     }
 
@@ -2327,6 +3312,7 @@ pub const NotebookTab = struct {
             .text => lines += o.buf.lineCount(),
             .err => errors += 1,
             .picture => pictures += 1,
+            .web => pictures += 1,
             .table => tables += 1,
             .note => lines += 1,
         };
@@ -2383,14 +3369,16 @@ pub const NotebookTab = struct {
         return std.fmt.bufPrint(buf, "{d}m {d}s", .{ m, s }) catch "";
     }
 
-    fn drawOut(self: *NotebookTab, ui: *Ui, o: *Out, x: f32, y: f32, w: f32, area: Rect) void {
+    /// Draws output `index` of the cell with `cell_salt` (which output the
+    /// selection is in).
+    fn drawOut(self: *NotebookTab, ui: *Ui, o: *Out, cell_salt: usize, index: usize, x: f32, y: f32, w: f32, area: Rect) void {
         const dl = ui.dl;
         switch (o.kind) {
             .text, .err => {
                 const cell_w = ui.text.cellAdvance(theme.font_output);
                 const cols: u32 = @intFromFloat(@max(10, @floor(w / cell_w)));
                 if (o.kind == .err) dl.rrect(.{ .x = x - 8, .y = y - 4, .w = w + 16, .h = o.h + 8 }, 8, theme.bg_inset);
-                _ = self.drawRows(ui, o, x, y, area, cols);
+                _ = self.drawRows(ui, o, cell_salt, index, x, y, area, cols);
             },
             .picture => {
                 if (o.tex_state == .ready) {
@@ -2407,13 +3395,79 @@ pub const NotebookTab = struct {
                     _ = dl.textCentered(theme.font_hint, x, y + line_h / 2, if (o.tex_state == .failed) "An image that could not be decoded." else "An image (shown in a window).", theme.text_3);
                 }
             },
-            .table => self.drawTable(ui, &o.table.?, x, y, w),
+            .table => {
+                // A right-click selects the table whole, for the edit menu's Copy.
+                const t = &o.table.?;
+                var tw: f32 = 0;
+                for (t.widths) |cw| tw += cw;
+                const tr: Rect = .{ .x = x, .y = y, .w = if (tw > 0) @min(w, tw) else w, .h = o.h };
+                if (ui.rightClicked(tr)) {
+                    self.selectOutput(cell_salt, index);
+                    self.sel_all = true;
+                    self.sel_hit = true;
+                    ui.askEditMenu(true, false);
+                }
+                if (self.sel_all and self.sel_cell == cell_salt and self.sel_out == index) {
+                    dl.rrect(.{ .x = tr.x - 6, .y = tr.y - 2, .w = tr.w + 6, .h = tr.h + 4 }, 6, theme.selection());
+                }
+                self.drawTable(ui, t, x, y, w);
+            },
+            .web => self.drawWeb(ui, o, x, y, w, area),
             .note => _ = dl.textEllipsis(theme.font_hint, x, y + line_h / 2, o.note, w, theme.text_3),
         }
     }
 
-    fn drawRows(self: *NotebookTab, ui: *Ui, o: *Out, x: f32, y0: f32, area: Rect, cols: u32) f32 {
-        _ = self;
+    /// A `.web` output: a live web view (Plotly, HTML) hung over the Metal
+    /// layer, made on the first draw and placed/clipped to the visible slice
+    /// of its rect each frame so it scrolls with the notebook.
+    fn drawWeb(self: *NotebookTab, ui: *Ui, o: *Out, x: f32, y: f32, w: f32, area: Rect) void {
+        const dl = ui.dl;
+        // A card behind it: seen while the page loads, and the whole story on
+        // a headless run (no window, so no web view).
+        dl.rrect(.{ .x = x, .y = y, .w = w, .h = o.h }, 8, theme.bg_inset);
+        const host = self.env.host orelse {
+            _ = dl.textCentered(theme.font_hint, x + w / 2, y + o.h / 2, "An interactive view (shown in the app).", theme.text_3);
+            return;
+        };
+        if (o.web_view == null) {
+            const view = host.createWebView() orelse {
+                _ = dl.textCentered(theme.font_hint, x + w / 2, y + o.h / 2, "An interactive view this Mac could not open.", theme.text_3);
+                return;
+            };
+            o.web_view = view;
+            o.web_host = host;
+            host.attach(view);
+            self.loadWeb(o);
+        }
+        if (!o.web_loaded) _ = dl.textCentered(theme.font_hint, x + w / 2, y + o.h / 2, "Loading…", theme.text_3);
+        // Place the view at its full size, clipped to the part inside the
+        // scroll viewport; when none is visible, leave it unplaced so the host
+        // hides it.
+        const content: Rect = .{ .x = x, .y = y, .w = w, .h = o.h };
+        const top = @max(content.y, area.y);
+        const bottom = @min(content.bottom(), area.bottom());
+        if (bottom <= top) return;
+        host.placeClipped(o.web_view.?, content, .{ .x = content.x, .y = top, .w = content.w, .h = bottom - top });
+    }
+
+    /// Writes a web output's page (and the Plotly library beside it, once) to
+    /// the integration dir and loads it into the output's view.
+    fn loadWeb(self: *NotebookTab, o: *Out) void {
+        const host = o.web_host orelse return;
+        const view = o.web_view orelse return;
+        const dir = self.env.integration_dir;
+        if (std.mem.indexOf(u8, o.web_html, "plotly.min.js") != null) ensurePlotly(self.gpa, dir);
+        const page = std.fmt.allocPrint(self.gpa, "{s}/tt-nb-{d}.html", .{ dir, salt() }) catch return;
+        sys.writeFile(self.gpa, page, o.web_html, false) catch {
+            self.gpa.free(page);
+            return;
+        };
+        o.web_path = page;
+        host.loadHtmlFile(view, page, dir);
+        o.web_loaded = true;
+    }
+
+    fn drawRows(self: *NotebookTab, ui: *Ui, o: *Out, cell_salt: usize, index: usize, x: f32, y0: f32, area: Rect, cols: u32) f32 {
         const dl = ui.dl;
         var y = y0;
         if (o.first_row > 0) {
@@ -2423,6 +3477,37 @@ pub const NotebookTab = struct {
             y += line_h;
         }
         if (o.row_starts.items.len == 0) return y;
+
+        // Mouse text selection, as in the terminal's blocks (drag;
+        // double-click = word, triple-click = line). A right-click outside
+        // the selection selects the word under the pointer, then asks for
+        // the edit menu.
+        const mine = self.sel_cell == cell_salt and self.sel_out == index and !self.sel_all;
+        {
+            const cell_w = ui.text.cellAdvance(theme.font_output);
+            const layout: selection.Rows = .{ .starts = o.row_starts.items, .first_row = o.first_row, .rows = o.rows, .cols = cols };
+            const rows_rect: Rect = .{ .x = x - 6, .y = y, .w = @as(f32, @floatFromInt(cols)) * cell_w + 12, .h = @as(f32, @floatFromInt(@max(1, o.rows))) * line_h };
+            const d = ui.drag(Ui.id("notebook.out", cell_salt *% 64 +% index), rows_rect);
+            if (d.hover or d.dragging) ui.cursor = .ibeam;
+            if (d.started or d.dragging) {
+                const pos = selection.hitTest(&o.buf, layout, x, y, cell_w, line_h, ui.mx, ui.my);
+                if (d.started) {
+                    self.selectOutput(cell_salt, index);
+                    self.sel.press(&o.buf, pos, ui.click_count);
+                } else if (mine) self.sel.dragTo(pos);
+            }
+            if (ui.rightClicked(rows_rect)) {
+                const pos = selection.hitTest(&o.buf, layout, x, y, cell_w, line_h, ui.mx, ui.my);
+                if (!mine or !self.sel.contains(pos)) {
+                    self.selectOutput(cell_salt, index);
+                    self.sel.selectWord(&o.buf, pos);
+                }
+                self.sel_hit = true;
+                ui.askEditMenu(self.sel.range() != null, false);
+            }
+        }
+        const sel: ?[2]selection.Pos = if (self.sel_cell == cell_salt and self.sel_out == index and !self.sel_all) self.sel.range() else null;
+
         var row = o.first_row;
         const end_row = o.first_row + o.rows;
         if (y < area.y) {
@@ -2457,8 +3542,15 @@ pub const NotebookTab = struct {
             const baseline_px = @round(ui.text.baselineForCenter(theme.font_output, y + line_h / 2) * scale);
             const x_px = @round(x * scale);
             var col: f32 = 0;
-            for (cells[from..to]) |cell| {
+            for (cells[from..to], from..) |cell, cell_idx| {
                 const st = o.buf.style(cell.style);
+                if (sel) |span| {
+                    const here: selection.Pos = .{ .line = line_idx, .cell = cell_idx };
+                    if (!here.before(span[0]) and here.before(span[1])) {
+                        const sw: f32 = @floatFromInt(@max(1, gfx_text.cellWidth(cell.cp)));
+                        dl.rect(.{ .x = (x_px + col * cell_px) / scale, .y = y, .w = sw * cell_px / scale, .h = line_h }, theme.selection());
+                    }
+                }
                 var fg = resolve(st.fg, if (st.bold) theme.text else theme.text_2, .fg);
                 var bg: ?Color = if (st.bg != buffer_mod.color_default) resolve(st.bg, theme.bg_block, .bg) else null;
                 if (st.inverse) {
@@ -2535,7 +3627,7 @@ pub const NotebookTab = struct {
         const busy = self.ask_req != null and self.input_kind == .ask;
         const border_color = if (!focused) theme.line_strong else if (busy) theme.teal.alpha(0.75) else theme.accent;
         dl.shape(r, theme.block_radius, theme.bg_inset, 1, border_color);
-        if (ui.pressed and ui.mouseIn(r)) self.focus_cell = null;
+        if ((ui.pressed or ui.right_pressed) and ui.mouseIn(r)) self.focus_cell = null;
 
         // The kind switch, at the top left.
         const kinds = [_]Kind{ .py, .sh, .md, .ask };
@@ -2698,6 +3790,32 @@ pub const NotebookTab = struct {
     }
 };
 
+// ── the action row's buttons ─────────────────────────────────────────────
+const ButtonKind = enum { primary, outline };
+const ButtonResult = struct { right: f32, clicked: bool };
+
+/// A 34pt button at (x, y), as under a failed shell block; returns its
+/// right edge and whether it was clicked.
+fn actionButton(ui: *Ui, wid: u64, x: f32, y: f32, label: []const u8, kind: ButtonKind) ButtonResult {
+    const font = if (kind == .primary) ui_mod.Font.semibold(13.5) else ui_mod.Font.sans(13.5);
+    const pad: f32 = if (kind == .primary) 16 else 14;
+    const w = ui.text.measure(font, label) + 2 * pad;
+    const r: Rect = .{ .x = x, .y = y, .w = w, .h = 34 };
+    const st = ui.button(wid, r);
+    switch (kind) {
+        .primary => {
+            ui.dl.rrect(r, 8, if (st.held) theme.accent.alpha(0.8) else if (st.hover) Color.mix(theme.accent, theme.text, 0.18) else theme.accent);
+            _ = ui.dl.textCentered(font, r.x + pad, r.centerY(), label, theme.on_accent);
+        },
+        .outline => {
+            ui.feedback(r, 8, st);
+            ui.dl.border(r, 8, 1, theme.line_strong);
+            _ = ui.dl.textCentered(font, r.x + pad, r.centerY(), label, theme.text);
+        },
+    }
+    return .{ .right = r.right(), .clicked = st.clicked };
+}
+
 // ── colours of styled output ─────────────────────────────────────────────
 fn resolve(spec: buffer_mod.ColorSpec, default: Color, role: theme.InkRole) Color {
     return switch (spec >> 24) {
@@ -2764,7 +3882,7 @@ test "notebook: text outputs keep their lines and colours" {
     try std.testing.expectEqual(@as(usize, 4), o.buf.lineCount());
 }
 
-test "notebook: a mime bundle picks the picture, the table, else the text" {
+test "notebook: a mime bundle picks the picture, the table, a web view, else the text" {
     const gpa = std.testing.allocator;
     var pic = Out.init(gpa, .{ .kind = .display_data, .data = try gpa.dupe(u8, "{\"image/png\":\"aGVsbG8=\\n\",\"text/plain\":\"<Figure>\"}") });
     defer pic.deinit(gpa, null);
@@ -2783,7 +3901,31 @@ test "notebook: a mime bundle picks the picture, the table, else the text" {
     try std.testing.expectEqual(OutKind.text, txt.kind);
     try std.testing.expectEqual(@as(usize, 2), txt.buf.lineCount());
 
-    var html = Out.init(gpa, .{ .kind = .display_data, .data = try gpa.dupe(u8, "{\"text/html\":\"<b>x</b>\"}") });
+    // HTML goes to a web view, ahead of the plain-text fallback beside it.
+    var html = Out.init(gpa, .{ .kind = .display_data, .data = try gpa.dupe(u8, "{\"text/plain\":\"<IPython.core.display.HTML object>\",\"text/html\":\"<b>x</b>\"}") });
     defer html.deinit(gpa, null);
-    try std.testing.expectEqual(OutKind.note, html.kind);
+    try std.testing.expectEqual(OutKind.web, html.kind);
+    try std.testing.expectEqualStrings("<b>x</b>", html.web_html);
+
+    // A Plotly figure: a page that loads the library beside it and draws the
+    // figure, at the height its layout asks for.
+    var fig = Out.init(gpa, .{ .kind = .display_data, .data = try gpa.dupe(u8, "{\"application/vnd.plotly.v1+json\":{\"data\":[{\"type\":\"scatter\",\"name\":\"</script>\"}],\"layout\":{\"height\":520}}}") });
+    defer fig.deinit(gpa, null);
+    try std.testing.expectEqual(OutKind.web, fig.kind);
+    try std.testing.expectEqual(@as(f32, 520), fig.web_h);
+    try std.testing.expect(std.mem.indexOf(u8, fig.web_html, "<script src=\"plotly.min.js\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fig.web_html, "\"type\":\"scatter\"") != null);
+    // A string in the figure cannot end the <script> the figure sits in.
+    try std.testing.expect(std.mem.indexOf(u8, fig.web_html, "<\\/script>") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, fig.web_html, "</script>"));
+
+    var svg = Out.init(gpa, .{ .kind = .display_data, .data = try gpa.dupe(u8, "{\"image/svg+xml\":[\"<svg>\",\"</svg>\"]}") });
+    defer svg.deinit(gpa, null);
+    try std.testing.expectEqual(OutKind.web, svg.kind);
+    try std.testing.expectEqual(default_web_h, svg.web_h);
+    try std.testing.expect(std.mem.indexOf(u8, svg.web_html, "<body><svg></svg></body>") != null);
+
+    var other = Out.init(gpa, .{ .kind = .display_data, .data = try gpa.dupe(u8, "{\"application/x-unknown\":{}}") });
+    defer other.deinit(gpa, null);
+    try std.testing.expectEqual(OutKind.note, other.kind);
 }

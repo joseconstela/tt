@@ -10,6 +10,9 @@ const frameworks = [_][]const u8{
     "CoreText",
     "ImageIO",
     "WebKit",
+    // Website tabs: camera and microphone access, desktop notifications.
+    "AVFoundation",
+    "UserNotifications",
 };
 
 const info_plist =
@@ -27,6 +30,12 @@ const info_plist =
     \\  <key>LSMinimumSystemVersion</key><string>13.0</string>
     \\  <key>NSHighResolutionCapable</key><true/>
     \\  <key>NSPrincipalClass</key><string>NSApplication</string>
+    \\  <!-- App icon from icon.icon: the Assets.car entry (macOS 26+) and the icns fallback. -->
+    \\  <key>CFBundleIconName</key><string>icon</string>
+    \\  <key>CFBundleIconFile</key><string>icon</string>
+    \\  <!-- Website tabs (video calls): macOS shows these when it asks. -->
+    \\  <key>NSCameraUsageDescription</key><string>Websites open in tt, such as video calls, can use the camera when you allow them.</string>
+    \\  <key>NSMicrophoneUsageDescription</key><string>Websites open in tt, such as video calls, can use the microphone when you allow them.</string>
     \\  <key>NSAppTransportSecurity</key>
     \\  <dict>
     \\    <key>NSAllowsArbitraryLoadsInWebContent</key><true/>
@@ -58,6 +67,10 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("zsh_integration", .{ .root_source_file = b.path("assets/shell/tt.zsh") });
     // The Jupyter bridge that notebook tabs start with the notebook's Python.
     mod.addAnonymousImport("jupyter_bridge", .{ .root_source_file = b.path("assets/notebook/tt_jupyter.py") });
+    // Plotly's library, vendored so interactive figures render in a notebook's
+    // cell outputs without reaching a CDN (tt stays local only). Written next
+    // to the bridge at runtime and loaded by the output web views.
+    mod.addAnonymousImport("plotly_js", .{ .root_source_file = b.path("assets/notebook/plotly.min.js") });
 
     // Full-screen programs (vim, htop, Claude Code …) run on libghostty-vt,
     // Ghostty's terminal emulation core, pinned to a commit in build.zig.zon.
@@ -84,8 +97,40 @@ pub fn build(b: *std.Build) void {
     const wf = b.addWriteFiles();
     const plist = wf.add("Info.plist", info_plist);
     const install_plist = b.addInstallFile(plist, "tt.app/Contents/Info.plist");
-    app_step.dependOn(&install_bin.step);
-    app_step.dependOn(&install_plist.step);
+    // The linker signs only the binary; macOS files camera, microphone and
+    // notification permissions under the app's signed identity, which needs
+    // the whole bundle (its Info.plist) sealed: sign it again, ad hoc.
+    const sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-" });
+    sign.addArg(b.getInstallPath(.prefix, "tt.app"));
+    sign.step.dependOn(&install_bin.step);
+    sign.step.dependOn(&install_plist.step);
+    app_step.dependOn(&sign.step);
+
+    // The app icon: icon.icon (an Icon Composer file) compiled by Xcode's
+    // actool into Resources/Assets.car (the layered icon macOS 26 renders)
+    // plus icon.icns for older macOS. Run hashes a directory argument by path
+    // only, so the icon's files are listed as inputs to rebuild on edits.
+    const actool = b.addSystemCommand(&.{ "xcrun", "actool" });
+    actool.addDirectoryArg(b.path("icon.icon"));
+    actool.addFileInput(b.path("icon.icon/icon.json"));
+    actool.addFileInput(b.path("icon.icon/Assets/Image.png"));
+    actool.addArg("--compile");
+    const icon_dir = actool.addOutputDirectoryArg("Resources");
+    actool.addArgs(&.{
+        "--app-icon",                  "icon",
+        "--platform",                  "macosx",
+        "--target-device",             "mac",
+        "--minimum-deployment-target", "13.0",
+        "--output-format",             "human-readable-text",
+        "--output-partial-info-plist",
+    });
+    _ = actool.addOutputFileArg("icon-partial.plist");
+    const install_icon = b.addInstallDirectory(.{
+        .source_dir = icon_dir,
+        .install_dir = .{ .custom = "tt.app/Contents" },
+        .install_subdir = "Resources",
+    });
+    app_step.dependOn(&install_icon.step);
 
     // `zig build test` — pure-Zig logic (terminal parser, buffers, editor …)
     const test_mod = b.createModule(.{

@@ -124,6 +124,12 @@ pub fn mkdir(gpa: std.mem.Allocator, path: []const u8) void {
     _ = c.mkdir(path_z.ptr, 0o700);
 }
 
+pub fn deleteFile(gpa: std.mem.Allocator, path: []const u8) void {
+    const path_z = gpa.dupeZ(u8, path) catch return;
+    defer gpa.free(path_z);
+    _ = c.unlink(path_z.ptr);
+}
+
 // ── the files panel's operations ────────────────────────────────────────
 const EEXIST: c_int = 17;
 

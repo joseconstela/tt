@@ -1,8 +1,10 @@
 //! Settings › AI › Features: what the agents are used for. One card per
 //! feature — Unrecognised commands, Explain, Fix with agent — and each card
 //! holds both halves of its setting: which agent does the job, and, in the
-//! same card, the prompt that agent is told first. Everything lives in
-//! `config.features` and is written as it changes.
+//! same card, the prompt that agent is told first. Explain and Fix with
+//! agent also say whether a failed notebook cell gets the button (it does
+//! unless switched off here). Everything lives in `config.features` and is
+//! written as it changes.
 const std = @import("std");
 const ui_mod = @import("../ui/ui.zig");
 const theme = @import("../ui/theme.zig");
@@ -38,16 +40,16 @@ pub const Feature = enum {
     pub fn hint(self: Feature) []const u8 {
         return switch (self) {
             .fallback => "When the shell does not know a command, the line goes to this agent instead.",
-            .explain => "Explain, on a failed command, asks this agent why it failed. The answer stays under the error.",
-            .fix => "Fix with agent, on a failed command, hands the failure to this coding agent. AI › Agents lists the installed ones.",
+            .explain => "Explain, on a failed command or notebook cell, asks this agent why it failed. The answer stays under the error.",
+            .fix => "Fix with agent, on a failed command or notebook cell, hands the failure to this coding agent. AI › Agents lists the installed ones.",
         };
     }
 
     pub fn promptHint(self: Feature) []const u8 {
         return switch (self) {
             .fallback => "What the agent is told before the line you typed. Blank uses the default.",
-            .explain => "What the agent is told before the failed command and its output. Blank uses the default.",
-            .fix => "What the coding agent is asked, before the failed command and its output. Blank uses the default.",
+            .explain => "What the agent is told before the failed command and its output. Blank uses the default (a notebook cell has its own).",
+            .fix => "What the coding agent is asked, before the failed command and its output. Blank uses the default (a notebook cell has its own).",
         };
     }
 
@@ -73,11 +75,27 @@ pub const Feature = enum {
 pub const fallback_default_prompt = "The user typed a line their shell does not recognise. Work out what they meant and propose the command that does it; keep any explanation to a line or two.";
 pub const explain_default_prompt = "A command the user ran in their terminal failed. Explain in a few short lines why it failed and what to do about it. If a corrected command would fix it, propose it.";
 pub const fix_default_prompt = "A command I ran in my terminal failed. Find out why and fix it.";
+/// The same two features on a failed notebook cell: the user's prompt when
+/// they wrote one, else a default that speaks of cells, not commands.
+pub const notebook_explain_default_prompt = "A cell in the user's Jupyter notebook failed. Explain in a few short lines why it failed and what to do about it. If a corrected cell would fix it, propose it.";
+pub const notebook_fix_default_prompt = "A cell in my Jupyter notebook failed. Find out why and fix it.";
 
 /// The prompt a feature uses: its own, or the default when blank.
 pub fn promptFor(feature: Feature) []const u8 {
     const own = feature.promptSlot(config.get()).*;
     return if (std.mem.trim(u8, own, " \t\r\n").len == 0) feature.defaultPrompt() else own;
+}
+
+/// The prompt a feature uses from a notebook: the user's own, else the
+/// notebook default.
+pub fn promptForNotebook(feature: Feature) []const u8 {
+    const own = feature.promptSlot(config.get()).*;
+    if (std.mem.trim(u8, own, " \t\r\n").len > 0) return own;
+    return switch (feature) {
+        .explain => notebook_explain_default_prompt,
+        .fix => notebook_fix_default_prompt,
+        .fallback => fallback_default_prompt,
+    };
 }
 
 const font = theme.font_ui;
@@ -576,6 +594,17 @@ pub const Page = struct {
             .explain => drawApiPicker(ui, feature, card, ry, &config.get().features.explain_agent),
             .fix => drawFixPicker(ui, card, ry),
         };
+        // Whether a failed notebook cell gets the button too.
+        if (feature != .fallback) {
+            const cfg = config.get();
+            const slot: *bool = if (feature == .explain) &cfg.features.explain_notebooks else &cfg.features.fix_notebooks;
+            const detail: []const u8 = if (feature == .explain) "Under a failed cell, beside Run again." else "Under a failed cell; the agent starts in a shell of the row.";
+            if (switchRow(ui, Ui.id("settings.features.notebooks", @intFromEnum(feature)), card, ry, "Also in notebooks", detail, slot.*)) {
+                slot.* = !slot.*;
+                cfg.touch();
+            }
+            ry += row_h;
+        }
         if (note) |n| {
             _ = dl.textCentered(theme.font_hint, card.x + card_pad + 10, ry + 10, n, theme.text_3);
             ry += note_h;
@@ -591,20 +620,21 @@ pub const Page = struct {
         return card.bottom();
     }
 
-    /// How many picker rows a feature's card shows this frame.
+    /// How many picker rows a feature's card shows this frame (the
+    /// notebook switch of Explain and Fix counts as one).
     fn pickerRows(feature: Feature) usize {
         const cfg = config.get();
         switch (feature) {
             .fallback, .explain => {
                 const current = if (feature == .fallback) cfg.features.command_fallback_agent else cfg.features.explain_agent;
                 const missing = if (current) |name| cfg.findAgentByName(name) == null else false;
-                return 1 + cfg.agents.items.len + @intFromBool(missing);
+                return 1 + cfg.agents.items.len + @intFromBool(missing) + @intFromBool(feature == .explain);
             },
             .fix => {
                 const scan = coding_agents.get();
                 const f = &cfg.features;
                 const missing = !f.fixAuto() and !f.fixOff() and scan.find(f.fix_agent) == null;
-                return 2 + scan.found.items.len + @intFromBool(missing);
+                return 3 + scan.found.items.len + @intFromBool(missing);
             },
         }
     }
@@ -698,6 +728,23 @@ pub const Page = struct {
         return ry;
     }
 };
+
+/// An on/off row: the label and a dim detail, a switch at the right.
+/// True when clicked.
+fn switchRow(ui: *Ui, wid: u64, card: Rect, y: f32, label: []const u8, detail: []const u8, on: bool) bool {
+    const dl = ui.dl;
+    const r: Rect = .{ .x = card.x + 8, .y = y, .w = card.w - 16, .h = row_h };
+    const st = ui.button(wid, r);
+    ui.feedback(r, 6, st);
+    const cy = r.centerY();
+    const toggle: Rect = .{ .x = r.right() - 12 - 36, .y = cy - 10, .w = 36, .h = 20 };
+    dl.rrect(toggle, 10, if (on) theme.accent else theme.line_strong);
+    const knob_x = if (on) toggle.right() - 18 else toggle.x + 2;
+    dl.rrect(.{ .x = knob_x, .y = toggle.y + 2, .w = 16, .h = 16 }, 8, if (on) theme.on_accent else theme.text_2);
+    const lw = dl.textCentered(font, r.x + 38, cy, label, theme.text);
+    _ = dl.textEllipsis(theme.font_hint, r.x + 38 + lw + 12, cy, detail, toggle.x - 12 - (r.x + 38 + lw + 12), theme.text_3);
+    return st.clicked;
+}
 
 /// A pick-one row: a ring with a dot when selected, the label, and a dim
 /// detail at the right. True when clicked.

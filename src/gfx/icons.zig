@@ -31,6 +31,9 @@ pub const Icon = enum(u8) {
     arrow_right,
     reload,
     lock,
+    // Website permissions (camera, microphone).
+    camera,
+    mic,
     // Git panel.
     check,
     minus,
@@ -77,6 +80,8 @@ fn pathData(icon: Icon) []const u8 {
         .arrow_right => "M5 12h14 M13 6l6 6-6 6",
         .reload => "M20.5 12a8.5 8.5 0 1 1-2.5-6 M20.5 3.5V9h-5.5",
         .lock => "M6 11h12v9H6z M9 11V7.5a3 3 0 0 1 6 0V11",
+        .camera => "M4.5 7h9a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z M15.5 10.5L21 7.5v9l-5.5-3",
+        .mic => "M9 6a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0z M5.5 11a6.5 6.5 0 0 0 13 0 M12 17.5V21 M9 21h6",
         .check => "M5 12.5l4.5 4.5L19 7",
         .minus => "M5 12h14",
         .undo => "M9 14L4 9l5-5 M4 9h10a6 6 0 0 1 0 12h-3",

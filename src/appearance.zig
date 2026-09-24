@@ -111,6 +111,7 @@ pub fn resolve(mode: config.Mode) theme.Scheme {
         .dark => .dark,
         .light => .light,
         .eink => .eink,
+        .eink_color => .eink_color,
         .system => if (systemIsDark()) .dark else .light,
     };
 }

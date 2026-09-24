@@ -857,6 +857,16 @@ pub const MarkdownView = struct {
             self.follow = false;
         }
 
+        // A right-click puts the caret there, unless it lands in the
+        // selection (what the menu then acts on), and asks for the edit menu.
+        if (ui.rightClicked(body)) {
+            const off = self.hitTest(text, doc, body, cx0, reveal_before, ui.mx, ui.my).off;
+            const in_selection = if (e.selection()) |s| off >= s[0] and off <= s[1] else false;
+            if (!in_selection) e.setCursor(off, false);
+            self.follow = false;
+            ui.askEditMenu(e.selection() != null, !ed.read_only);
+        }
+
         if (self.follow) {
             self.follow = false;
             if (caret_top < self.scroll + 4) self.scroll = @max(0, caret_top - 8);

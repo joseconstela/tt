@@ -3,9 +3,10 @@
 //! alert-like boxes they lead to (rename, close confirmation, the icon
 //! picker, the name box for a new file). At most one is open; while it is,
 //! the workspace under it is inert and keyboard input comes here (the app
-//! routes it, see `App`). Two menus have a submenu: the files menu's
-//! "Open with", whose rows the app hands over when it opens the menu, and
-//! the tab menu's "Split & Move" (the four sides).
+//! routes it, see `App`). The edit menu (Cut / Copy / Paste) is what a
+//! text surface shows on a right-click. Two menus have a submenu: the
+//! files menu's "Open with", whose rows the app hands over when it opens
+//! the menu, and the tab menu's "Split & Move" (the four sides).
 const std = @import("std");
 const draw = @import("../gfx/draw.zig");
 const gfx_text = @import("../gfx/text.zig");
@@ -24,9 +25,20 @@ const Font = ui_mod.Font;
 pub const Mode = enum { none, menu, rename, confirm, icons, list };
 
 /// What an open menu or box is about: a tab (by uid), a sidebar project
-/// or resource (by id), the default project (no id), or a path of the
-/// files panel (the panel remembers which).
-pub const Subject = enum { tab, project, default_project, resource, file };
+/// or resource (by id), the default project (no id), a path of the files
+/// panel (the panel remembers which), or the text that has the keyboard
+/// (the edit menu).
+pub const Subject = enum { tab, project, default_project, resource, file, edit };
+
+/// A row of the edit menu, carried out on whatever has the keyboard.
+pub const EditAction = enum { cut, copy, paste };
+
+/// Which rows of the edit menu apply; the others are greyed out.
+pub const EditMenuOpts = struct {
+    cut: bool = false,
+    copy: bool = false,
+    paste: bool = false,
+};
 
 /// What a confirm box leads to when it is accepted (`close_others` and
 /// `close_right` are the tab menu's "Close Others" / "Close to the Right").
@@ -133,9 +145,11 @@ pub const Outcome = union(enum) {
     delete_file: void,
     /// The delete box accepted.
     delete_confirmed: void,
+    /// Edit menu → "Cut" / "Copy" / "Paste".
+    edit: EditAction,
 };
 
-const MenuItem = enum { rename, split_beside, split_move, close, close_others, close_right, tab_copy_path, tab_copy_rel, new_shells, set_icon, remove, new_file, new_folder, open_external, open_with, reveal, copy_path, copy_abs_path, delete };
+const MenuItem = enum { rename, split_beside, split_move, close, close_others, close_right, tab_copy_path, tab_copy_rel, new_shells, set_icon, remove, new_file, new_folder, open_external, open_with, reveal, copy_path, copy_abs_path, delete, cut, copy, paste };
 const MenuEntry = struct {
     item: MenuItem,
     label: []const u8,
@@ -208,6 +222,12 @@ const root_menu = [_]MenuEntry{
     .{ .item = .reveal, .label = "Reveal in Finder" },
     .{ .item = .copy_abs_path, .label = "Copy absolute path", .sep_before = true },
 };
+/// A text surface's menu; `openEditMenu` greys out the rows that do not apply.
+const edit_menu_all = [_]MenuEntry{
+    .{ .item = .cut, .label = "Cut", .kbd = "⌘X" },
+    .{ .item = .copy, .label = "Copy", .kbd = "⌘C" },
+    .{ .item = .paste, .label = "Paste", .kbd = "⌘V" },
+};
 
 // Metrics (points), in the palette's idiom.
 const menu_w: f32 = 176;
@@ -249,6 +269,8 @@ pub const Overlay = struct {
     /// A tab's menu, as built for the tab it is about (see `openTabMenu`).
     tab_rows: [tab_menu_all.len]MenuEntry = undefined,
     tab_rows_len: usize = 0,
+    /// The edit menu, as built for what was right-clicked (see `openEditMenu`).
+    edit_rows: [edit_menu_all.len]MenuEntry = edit_menu_all,
     /// Whether the tab a menu or rename box is about shows a document
     /// (the rename box then says the file keeps its name).
     tab_document: bool = false,
@@ -362,6 +384,23 @@ pub const Overlay = struct {
         var sides: [split_sides.len]SubItem = undefined;
         for (split_labels, 0..) |label, i| sides[i] = .{ .label = label, .value = @tagName(split_sides[i]) };
         self.setSubRows(&sides);
+    }
+
+    /// The edit menu with its top-left corner at (x, y): Cut, Copy and
+    /// Paste, the ones that do not apply greyed out. The pick is carried
+    /// out on whatever has the keyboard.
+    pub fn openEditMenu(self: *Overlay, x: f32, y: f32, opts: EditMenuOpts) void {
+        self.openMenu(.edit, 0, x, y);
+        self.clearSub();
+        for (edit_menu_all, 0..) |m, i| {
+            var row = m;
+            row.disabled = switch (m.item) {
+                .cut => !opts.cut,
+                .copy => !opts.copy,
+                else => !opts.paste,
+            };
+            self.edit_rows[i] = row;
+        }
     }
 
     /// The submenu's rows (copied).
@@ -486,6 +525,7 @@ pub const Overlay = struct {
                 .folder => &folder_menu,
                 .root => &root_menu,
             },
+            .edit => &self.edit_rows,
         };
     }
 
@@ -726,6 +766,8 @@ pub const Overlay = struct {
                 .project, .default_project => .{ .rename_project = id },
                 .resource => .{ .rename_resource = id },
                 .file => .{ .name_file = .rename },
+                // The edit menu has no rename row.
+                .edit => unreachable,
             },
             .split_beside => .{ .split_beside = .{ .uid = id, .side = .right } },
             // The row unfolds the submenu; it is never picked itself.
@@ -747,6 +789,9 @@ pub const Overlay = struct {
             .copy_path => .{ .copy_path = .{ .absolute = false } },
             .copy_abs_path => .{ .copy_path = .{ .absolute = true } },
             .delete => .delete_file,
+            .cut => .{ .edit = .cut },
+            .copy => .{ .edit = .copy },
+            .paste => .{ .edit = .paste },
         };
     }
 
@@ -758,6 +803,8 @@ pub const Overlay = struct {
             .project, .default_project => .{ .project_renamed = .{ .id = self.id, .name = name } },
             .resource => .{ .resource_renamed = .{ .id = self.id, .name = name } },
             .file => .{ .file_named = .{ .kind = self.name_kind, .name = name } },
+            // No rename box is opened about the edit menu.
+            .edit => unreachable,
         };
     }
 
@@ -895,6 +942,7 @@ pub const Overlay = struct {
                 // Greyed out: the pointer passes over it, folding the submenu.
                 if (moved and ui.mouseIn(r) and self.sub_open) self.foldSub();
                 _ = dl.textCentered(theme.font_ui, r.x + 10, r.centerY(), m.label, theme.text_3);
+                if (m.kbd.len > 0) _ = dl.textRight(theme.font_kbd, r.right() - 10, r.centerY(), m.kbd, theme.text_3.alpha(0.6));
                 continue;
             }
             const st = ui.button(Ui.id("overlay.menu", i), r);
@@ -1060,6 +1108,7 @@ pub const Overlay = struct {
                 .new_file => .{ "New file", self.reason_buf[0..self.reason_len], "Create" },
                 .new_folder => .{ "New folder", self.reason_buf[0..self.reason_len], "Create" },
             },
+            .edit => unreachable,
         };
         _ = dl.textCentered(font_title, x, y + title_h / 2, title, theme.text);
         y += title_h + 8;
@@ -1280,6 +1329,21 @@ test "overlay: a tab's menu has the rows that apply to it" {
     o.openTabMenu(7, 0, 0, .{});
     try std.testing.expectEqual(Side.top, o.pickSub(2).split_tab.side);
     try std.testing.expect(!o.isOpen());
+
+    // The edit menu: the rows that do not apply are greyed out and skipped.
+    o.openEditMenu(40, 60, .{ .copy = true });
+    const edit = o.items();
+    try std.testing.expectEqual(@as(usize, 3), edit.len);
+    try std.testing.expect(edit[0].disabled and !edit[1].disabled and edit[2].disabled);
+    try std.testing.expect(o.aboutTab() == null);
+    _ = o.onEdit(.move_down);
+    try std.testing.expectEqual(@as(?usize, 1), o.highlighted);
+    _ = o.onEdit(.move_down);
+    try std.testing.expectEqual(@as(?usize, 1), o.highlighted);
+    try std.testing.expectEqual(EditAction.copy, o.onEdit(.insert_newline).?.edit);
+    try std.testing.expect(!o.isOpen());
+    o.openEditMenu(0, 0, .{ .cut = true, .copy = true, .paste = true });
+    try std.testing.expectEqual(EditAction.paste, o.pickMenu(2).edit);
 
     // The confirmations that "Close Others" / "Close to the Right" lead to.
     o.openConfirmAction(.close_others, 7, "Close the other tabs?", "", "Close");

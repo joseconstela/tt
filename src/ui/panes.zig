@@ -83,10 +83,13 @@ pub const PaneView = struct {
             parts[i] = .{ .strip = strip, .body = body, .first = along_top and pr.rect.x <= content.x + 0.5 };
         }
 
-        // A press on a pane's strip or content focuses it (unless a divider took the press).
-        if (ui.pressed and !divider_held) {
+        // A press on a pane's strip or content focuses it (unless a divider
+        // took the press), and so does a right-click on its content: the
+        // edit menu acts on what has the keyboard.
+        if ((ui.pressed and !divider_held) or ui.right_pressed) {
             for (geo.panes[0..geo.n], 0..) |pr, i| {
-                if (!ui.mouseIn(parts[i].strip) and !ui.mouseIn(parts[i].body)) continue;
+                const hit = if (ui.pressed) ui.mouseIn(parts[i].strip) or ui.mouseIn(parts[i].body) else ui.mouseIn(parts[i].body);
+                if (!hit) continue;
                 if (l.focused != pr.pane.id) {
                     l.focused = pr.pane.id;
                     res.changed = true;

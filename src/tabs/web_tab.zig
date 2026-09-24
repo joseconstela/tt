@@ -12,6 +12,13 @@
 //! The app runs JavaScript of its own in every page and hears back from it
 //! (web_bridge.zig); the first use is the context menu, which offers what
 //! the app can do with the text selected in the page (web_menu.zig).
+//!
+//! What only the user can grant — the camera, the microphone, notifications
+//! — is asked in a bar under the address bar, and the answer kept per site
+//! (config.zig `sites`, Settings › Permissions). Notifications go to macOS's
+//! Notification Center with the site's favicon (platform/notify.zig). Links
+//! that open a new window (target=_blank, `window.open`) open a new tab that
+//! keeps its tie to the page that opened it, so sign-in popups work.
 const std = @import("std");
 const records = @import("../records.zig");
 const tab_mod = @import("tab.zig");
@@ -22,6 +29,8 @@ const icons = @import("../gfx/icons.zig");
 const objc = @import("../objc.zig");
 const web_bridge = @import("web_bridge.zig");
 const web_menu = @import("web_menu.zig");
+const cfg_mod = @import("../config.zig");
+const notify = @import("../platform/notify.zig");
 const Editor = @import("../input/editor.zig").Editor;
 const EditCommand = @import("../events.zig").EditCommand;
 
@@ -39,9 +48,69 @@ pub const bar_h: f32 = 44;
 /// Where something typed that is not an address goes.
 const search_url = "https://duckduckgo.com/?q=";
 const placeholder = "Search or enter a website address";
+/// The ask bar under the address bar (points).
+pub const prompt_h: f32 = 46;
 /// WebKit's own user agent lacks the Safari token, and some sites serve
-/// their fallback pages without it.
-const ua_suffix = "Version/17.4 Safari/605.1.15";
+/// their fallback pages without it (or turn the browser away as too old):
+/// the Safari installed on this Mac is named, else a recent one.
+const ua_fallback_version = "18.0";
+
+/// Something the page asked that waits for the user: the first one is on
+/// show in the bar under the address bar.
+pub const Prompt = struct {
+    /// Who asks: "https://teams.microsoft.com".
+    origin: []u8,
+    camera: bool = false,
+    microphone: bool = false,
+    notifications: bool = false,
+    /// WebKit's decision handler (a copied block) for the camera and the
+    /// microphone; it must be called exactly once.
+    decide: ?*anyopaque = null,
+
+    fn has(self: Prompt, f: cfg_mod.SiteFeature) bool {
+        return switch (f) {
+            .camera => self.camera,
+            .microphone => self.microphone,
+            .notifications => self.notifications,
+        };
+    }
+
+    /// What the settings say to everything it asks: any "block" blocks,
+    /// all "allow" allows, else it is the user's to answer.
+    fn verdict(self: Prompt) cfg_mod.Permission {
+        const cfg = cfg_mod.get();
+        var all_allow = true;
+        for ([_]cfg_mod.SiteFeature{ .camera, .microphone, .notifications }) |f| {
+            if (!self.has(f)) continue;
+            switch (cfg.permissionFor(self.origin, f)) {
+                .block => return .block,
+                .ask => all_allow = false,
+                .allow => {},
+            }
+        }
+        return if (all_allow) .allow else .ask;
+    }
+
+    /// "wants to use your camera and microphone." and the like.
+    pub fn question(self: Prompt) []const u8 {
+        if (self.notifications) return "wants to show notifications.";
+        if (self.camera and self.microphone) return "wants to use your camera and microphone.";
+        if (self.camera) return "wants to use your camera.";
+        return "wants to use your microphone.";
+    }
+
+    fn icon(self: Prompt) icons.Icon {
+        if (self.notifications) return .bell;
+        return if (self.camera) .camera else .mic;
+    }
+};
+
+/// The tab serials notifications carry (notify.zig), so a click finds its
+/// tab again — never reused, unlike tab objects' addresses.
+var next_serial: u32 = 1;
+/// The services the website tabs share, for a notification clicked after
+/// its tab closed (the site opens again in a new tab).
+var shared_env: ?*tab_mod.Env = null;
 
 pub const WebTab = struct {
     pub const kind_label = "Website";
@@ -83,12 +152,47 @@ pub const WebTab = struct {
     /// Horizontal scroll of the address text while editing, so the caret stays in view.
     scroll_x: f32 = 0,
     scheme_seen: theme.Scheme = .dark,
+    /// Page zoom (⌘+/⌘−/⌘0 while this tab is focused). 1 = 100%. Applied to
+    /// the web view; re-applied when the view is (re)created.
+    page_zoom: f64 = 1,
+
+    /// This tab among all website tabs of the run (see `next_serial`).
+    serial: u32 = 0,
+    /// What the page asked that waits for the user; the first is on show.
+    prompts: std.ArrayList(Prompt) = .empty,
+    /// The camera and the microphone as the page uses them
+    /// (WKMediaCaptureState: 0 none, 1 active, 2 muted).
+    camera_state: NSInteger = 0,
+    mic_state: NSInteger = 0,
+    /// The config version last looked at, and the notification permissions
+    /// the page's scripts were made with (a hash of their JSON).
+    cfg_seen: u64 = 0,
+    notify_hash: u64 = 0,
+    /// The bar about the site's notifications is open (the bell in the
+    /// address field): what was answered, Block / Allow, Remove.
+    site_bar: bool = false,
+    /// The tab whose page opened this one (`serial`; 0 = none), and whether
+    /// this tab was in front at its last tick: a popup that closes itself
+    /// while in front hands the front back to its opener, as browsers do.
+    opener: u32 = 0,
+    in_front: bool = false,
 
     pub fn create(env: *tab_mod.Env, args: tab_mod.OpenArgs) anyerror!tab_mod.Tab {
         const self = try env.gpa.create(WebTab);
         errdefer env.gpa.destroy(self);
-        self.* = .{ .gpa = env.gpa, .env = env, .editor = Editor.init(env.gpa) };
+        self.* = .{ .gpa = env.gpa, .env = env, .editor = Editor.init(env.gpa), .serial = next_serial };
+        next_serial += 1;
         self.link();
+        shared_env = env;
+        notify.on_click = notificationClicked;
+        self.cfg_seen = cfg_mod.get().version;
+        self.notify_hash = notifyStatesHash();
+        if (args.web_view) |v| {
+            // A new window's page, already loading: nothing to navigate.
+            self.opener = takeOpener(v);
+            self.adoptView(v);
+            return tab_mod.Tab.from(WebTab, self);
+        }
         if (env.host != null) self.createView();
         var scratch: std.ArrayList(u8) = .empty;
         defer scratch.deinit(env.gpa);
@@ -96,6 +200,9 @@ pub const WebTab = struct {
             self.navigate(u, true);
         } else if (keptUrl(&scratch, env.gpa, args.saved)) |u| {
             // Kept from the last run: comes back quietly, without the keyboard.
+            self.navigate(u, false);
+        } else if (homepage()) |u| {
+            // A fresh tab opens the configured homepage, quietly.
             self.navigate(u, false);
         } else {
             self.focusBar(true);
@@ -105,6 +212,9 @@ pub const WebTab = struct {
 
     pub fn deinit(self: *WebTab) void {
         self.unlink();
+        // Questions nobody answered: WebKit must still hear a no.
+        for (self.prompts.items) |*p| freePrompt(self.gpa, p, false);
+        self.prompts.deinit(self.gpa);
         if (self.view) |v| {
             if (self.env.host) |h| h.detach(v);
             msg(void, v, "stopLoading", .{});
@@ -153,28 +263,175 @@ pub const WebTab = struct {
         web_bridge.eval(v, js);
     }
 
+    /// Runs JavaScript in the page's own world (where the Notification
+    /// shim lives); nothing without a web view.
+    pub fn evalPage(self: *WebTab, js: []const u8) void {
+        const v = self.view orelse return;
+        web_bridge.evalPage(v, js);
+    }
+
+    // ── asking the user ─────────────────────────────────────────────────
+    /// A question from `origin`: settled at once when the settings already
+    /// answer it, else queued for the bar. Takes `decide` (a copied block).
+    pub fn ask(self: *WebTab, origin: []const u8, what: struct { camera: bool = false, microphone: bool = false, notifications: bool = false }, decide: ?*anyopaque) void {
+        const owned = self.gpa.dupe(u8, origin) catch {
+            if (decide) |d| decideMedia(d, false);
+            return;
+        };
+        var p: Prompt = .{ .origin = owned, .camera = what.camera, .microphone = what.microphone, .notifications = what.notifications, .decide = decide };
+        switch (p.verdict()) {
+            .allow => return self.settle(&p, true),
+            .block => return self.settle(&p, false),
+            .ask => {},
+        }
+        // The page asking again for what is already waiting: one bar.
+        for (self.prompts.items) |*q| {
+            if (q.notifications and p.notifications and std.mem.eql(u8, q.origin, p.origin)) {
+                self.gpa.free(p.origin);
+                return;
+            }
+        }
+        self.prompts.append(self.gpa, p) catch self.settle(&p, false);
+    }
+
+    /// The user's answer to the question on show. `remember` keeps it for
+    /// the site ("Allow" / "Block"); "Not now" does not.
+    pub fn answer(self: *WebTab, allow: bool, remember: bool) void {
+        if (self.prompts.items.len == 0) return;
+        var p = self.prompts.orderedRemove(0);
+        if (remember) {
+            const cfg = cfg_mod.get();
+            for ([_]cfg_mod.SiteFeature{ .camera, .microphone, .notifications }) |f| {
+                if (p.has(f)) cfg.setSitePermission(p.origin, f, if (allow) .allow else .block);
+            }
+            cfg.save();
+        }
+        if (p.notifications and !remember) {
+            // Dismissed: the page's permission stays "default".
+            self.evalPage("window.__ttNotifications && __ttNotifications.answer('default')");
+            freePrompt(self.gpa, &p, false);
+        } else self.settle(&p, allow);
+        // The answer may settle other questions from the same site.
+        self.settleQueued();
+    }
+
+    /// Tells the page (or WebKit) the outcome and lets the prompt go.
+    fn settle(self: *WebTab, p: *Prompt, allow: bool) void {
+        if (p.notifications) {
+            self.evalPage(if (allow) "window.__ttNotifications && __ttNotifications.answer('granted')" else "window.__ttNotifications && __ttNotifications.answer('denied')");
+            if (allow) notify.requestAuth();
+        }
+        freePrompt(self.gpa, p, allow);
+    }
+
+    /// Questions the settings answer by now (an answer for the same site,
+    /// a change in Settings) leave the queue.
+    fn settleQueued(self: *WebTab) void {
+        var i: usize = 0;
+        while (i < self.prompts.items.len) {
+            switch (self.prompts.items[i].verdict()) {
+                .ask => i += 1,
+                else => |v| {
+                    var p = self.prompts.orderedRemove(i);
+                    self.settle(&p, v == .allow);
+                },
+            }
+        }
+    }
+
+    // ── notifications (the `notifications` bridge) ─────────────────────
+    /// What the page's Notification shim posted; `origin` is WebKit's word
+    /// for who posted it.
+    pub fn onNotifyMessage(self: *WebTab, m: web_bridge.notifications.Message, origin: []const u8) void {
+        const allowed = cfg_mod.get().permissionFor(origin, .notifications);
+        if (std.mem.eql(u8, m.op, "request")) {
+            self.ask(origin, .{ .notifications = true }, null);
+        } else if (std.mem.eql(u8, m.op, "show")) {
+            if (allowed != .allow) return;
+            notify.show(.{
+                .tab = self.serial,
+                .nid = m.id,
+                .origin = origin,
+                .title = m.title,
+                .body = m.body,
+                .tag = m.tag,
+                .silent = m.silent,
+                .icons = m.icons,
+            });
+        } else if (std.mem.eql(u8, m.op, "close")) {
+            notify.remove(self.serial, m.id, origin, m.tag);
+        }
+    }
+
+    /// The Notification shim's permissions changed in the settings: pages
+    /// loaded from now on start with the new ones, the page on show is told.
+    fn syncNotifyStates(self: *WebTab) void {
+        const h = notifyStatesHash();
+        if (h == self.notify_hash) return;
+        self.notify_hash = h;
+        const v = self.view orelse return;
+        web_bridge.refreshScripts(v);
+        var js: std.ArrayList(u8) = .empty;
+        defer js.deinit(self.gpa);
+        js.appendSlice(self.gpa, "window.__ttNotifications && __ttNotifications.states(") catch return;
+        web_bridge.notifications.states(self.gpa, cfg_mod.get(), &js) catch return;
+        js.appendSlice(self.gpa, ")") catch return;
+        self.evalPage(js.items);
+    }
+    /// Pushes `page_zoom` to the web view. Prefers `pageZoom` (reflows the page
+    /// like a browser's ⌘+) and falls back to `magnification` where it is missing.
+    fn applyZoom(self: *WebTab) void {
+        const v = self.view orelse return;
+        if (msg(bool, v, "respondsToSelector:", .{objc.sel("setPageZoom:")})) {
+            msg(void, v, "setPageZoom:", .{self.page_zoom});
+        } else {
+            msg(void, v, "setMagnification:", .{self.page_zoom});
+        }
+    }
+
+    fn zoomBy(self: *WebTab, delta: f64) void {
+        self.page_zoom = std.math.clamp(self.page_zoom + delta, 0.5, 3.0);
+        self.applyZoom();
+    }
+
     // ── the web view ────────────────────────────────────────────────────
     fn createView(self: *WebTab) void {
         const config = objc.new("WKWebViewConfiguration");
         defer objc.release(config);
-        msg(void, config, "setApplicationNameForUserAgent:", .{objc.nsString(ua_suffix)});
+        msg(void, config, "setApplicationNameForUserAgent:", .{objc.nsString(userAgentSuffix())});
+        // Cookies: kept between launches, or a private in-memory store that
+        // is gone when the app closes (the default). Settings › Browser.
+        const wds = objc.class("WKWebsiteDataStore");
+        const store = if (cfg_mod.get().browser.keep_cookies)
+            msg(id, wds, "defaultDataStore", .{})
+        else
+            msg(id, wds, "nonPersistentDataStore", .{});
+        msg(void, config, "setWebsiteDataStore:", .{store});
         web_bridge.install(config);
         // "Inspect Element" in the page's context menu.
         const prefs = msg(id, config, "preferences", .{});
         const yes = msg(id, objc.class("NSNumber"), "numberWithBool:", .{true});
         msg(void, prefs, "setValue:forKey:", .{ yes, objc.nsString("developerExtrasEnabled") });
+        enableCapture(prefs);
 
         const view = msg(id, msg(id, webViewClass(), "alloc", .{}), "initWithFrame:configuration:", .{ CGRect.make(0, 0, 200, 200), config });
+        self.adoptView(view.?);
+    }
+
+    /// Makes `view` this tab's page (it arrives retained): ours, or one
+    /// WebKit made for a new window with the opener's configuration.
+    fn adoptView(self: *WebTab, view: *anyopaque) void {
         self.view = view;
         if (msg(bool, view, "respondsToSelector:", .{objc.sel("setInspectable:")})) msg(void, view, "setInspectable:", .{true});
         self.syncBackground();
         msg(void, view, "setAllowsBackForwardNavigationGestures:", .{true});
         msg(void, view, "setAllowsMagnification:", .{true});
+        self.applyZoom();
 
         self.delegate = msg(id, msg(id, delegateClass(), "alloc", .{}), "init", .{});
         msg(void, view, "setNavigationDelegate:", .{self.delegate});
         msg(void, view, "setUIDelegate:", .{self.delegate});
-        self.env.host.?.attach(view.?);
+        if (self.env.host) |h| h.attach(view);
     }
 
     /// Around and beyond the page (overscroll) the app's background shows,
@@ -211,7 +468,13 @@ pub const WebTab = struct {
             self.setError("That is not a valid address.", self.url.items);
             return;
         }
-        const req = msg(id, objc.class("NSURLRequest"), "requestWithURL:", .{nsurl});
+        // Do Not Track: the request carries the DNT header when asked for
+        // (Settings › Browser). A mutable request is needed to add it.
+        const req = if (cfg_mod.get().browser.do_not_track) blk: {
+            const mreq = msg(id, objc.class("NSMutableURLRequest"), "requestWithURL:", .{nsurl});
+            msg(void, mreq, "setValue:forHTTPHeaderField:", .{ objc.nsString("1"), objc.nsString("DNT") });
+            break :blk mreq;
+        } else msg(id, objc.class("NSURLRequest"), "requestWithURL:", .{nsurl});
         _ = msg(id, v, "loadRequest:", .{req});
         self.loading = true;
         self.progress = 0;
@@ -280,6 +543,8 @@ pub const WebTab = struct {
     }
 
     pub fn status(self: *WebTab) tab_mod.Status {
+        // A question for the user shows on the tab, even from behind.
+        if (self.prompts.items.len > 0) return .attention;
         return if (self.loading) .running else .none;
     }
 
@@ -304,6 +569,7 @@ pub const WebTab = struct {
     /// Polls the web view; true when something the chrome shows changed.
     pub fn tick(self: *WebTab, now: f64, active: bool) bool {
         var changed = false;
+        self.in_front = active;
         // The window (and with it the host) came after this tab — the
         // workspace restores tabs before there is one: make the web view
         // now and bring up the address it holds.
@@ -341,6 +607,25 @@ pub const WebTab = struct {
                 self.bar_focused = false;
                 changed = true;
             }
+
+            // The camera and the microphone, in use or muted (macOS 12+).
+            if (msg(bool, v, "respondsToSelector:", .{objc.sel("cameraCaptureState")})) {
+                const cam = msg(NSInteger, v, "cameraCaptureState", .{});
+                const mic = msg(NSInteger, v, "microphoneCaptureState", .{});
+                if (cam != self.camera_state or mic != self.mic_state) changed = true;
+                self.camera_state = cam;
+                self.mic_state = mic;
+            }
+        }
+        // Settings changed (here or in Settings › Permissions): questions it
+        // answers go, and the pages learn their notification permission.
+        const cfg = cfg_mod.get();
+        if (cfg.version != self.cfg_seen) {
+            self.cfg_seen = cfg.version;
+            const before = self.prompts.items.len;
+            self.settleQueued();
+            if (self.prompts.items.len != before) changed = true;
+            self.syncNotifyStates();
         }
         if (self.editor.version != self.seen_version) {
             self.seen_version = self.editor.version;
@@ -417,6 +702,12 @@ pub const WebTab = struct {
             .forward => self.goForward(),
             .reload => self.reload(),
             .open_location => self.focusBar(true),
+            .zoom_in => self.zoomBy(0.1),
+            .zoom_out => self.zoomBy(-0.1),
+            .zoom_reset => {
+                self.page_zoom = 1;
+                self.applyZoom();
+            },
             else => return false,
         }
         return true;
@@ -452,8 +743,21 @@ pub const WebTab = struct {
     // ── drawing ─────────────────────────────────────────────────────────
     pub fn draw(self: *WebTab, ui: *Ui, rect: Rect, focused: bool) void {
         const bar: Rect = .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = @min(bar_h, rect.h) };
-        const body: Rect = .{ .x = rect.x, .y = rect.y + bar.h, .w = rect.w, .h = @max(0, rect.h - bar.h) };
-        self.drawBar(ui, bar, focused);
+        // A question for the user sits between the address bar and the page;
+        // with none, the site's notification bar can (the bell opens it).
+        var origin_buf: [512]u8 = undefined;
+        const origin = originOfUrl(&origin_buf, self.url.items);
+        const kept = if (origin.len > 0) cfg_mod.get().siteDecision(origin, .notifications) else .ask;
+        if (kept == .ask) self.site_bar = false;
+        const show_site = self.prompts.items.len == 0 and self.site_bar;
+        const ask_h: f32 = if (self.prompts.items.len > 0 or show_site) @min(prompt_h, @max(0, rect.h - bar.h)) else 0;
+        const body_y = rect.y + bar.h + ask_h;
+        const body: Rect = .{ .x = rect.x, .y = body_y, .w = rect.w, .h = @max(0, rect.bottom() - body_y) };
+        self.drawBar(ui, bar, focused, origin, kept);
+        const strip: Rect = .{ .x = rect.x, .y = bar.bottom(), .w = rect.w, .h = ask_h };
+        if (ask_h > 0) {
+            if (show_site) self.drawSiteBar(ui, strip, origin, kept) else self.drawPrompt(ui, strip);
+        }
 
         if (self.error_text) |text| {
             self.drawError(ui, body, text);
@@ -466,7 +770,8 @@ pub const WebTab = struct {
         }
     }
 
-    fn drawBar(self: *WebTab, ui: *Ui, bar: Rect, focused: bool) void {
+    fn drawBar(self: *WebTab, ui: *Ui, bar: Rect, focused: bool, origin: []const u8, kept: cfg_mod.Permission) void {
+        _ = origin;
         const dl = ui.dl;
         dl.rect(.{ .x = bar.x, .y = bar.bottom() - 1, .w = bar.w, .h = 1 }, theme.line);
         const cy = bar.centerY();
@@ -485,6 +790,28 @@ pub const WebTab = struct {
         const field: Rect = .{ .x = x, .y = cy - 15, .w = @max(40, bar.right() - 10 - x), .h = 30 };
         const border = if (self.bar_focused and focused) theme.accent.alpha(0.8) else theme.line_strong;
         dl.shape(field, 8, theme.bg_inset, 1, border);
+        // Camera and microphone in use: a button each at the field's right
+        // end; a click mutes or unmutes.
+        var field_end = field.right() - 10;
+        if (self.mic_state != 0) {
+            field_end -= 26;
+            if (self.captureButton(ui, .{ .x = field_end, .y = cy - 12, .w = 24, .h = 24 }, .mic, self.mic_state, Ui.id("web.mic", key))) self.toggleCapture(false);
+        }
+        if (self.camera_state != 0) {
+            field_end -= 26;
+            if (self.captureButton(ui, .{ .x = field_end, .y = cy - 12, .w = 24, .h = 24 }, .camera, self.camera_state, Ui.id("web.camera", key))) self.toggleCapture(true);
+        }
+        // The site has an answer about notifications: the bell opens the
+        // bar that shows it, to change or remove.
+        if (kept != .ask) {
+            field_end -= 26;
+            const br: Rect = .{ .x = field_end, .y = cy - 12, .w = 24, .h = 24 };
+            const st = ui.button(Ui.id("web.site_bell", key), br);
+            ui.feedback(br, 6, st);
+            if (self.site_bar) dl.rrect(br, 6, theme.accent.alpha(0.14));
+            dl.icon(.bell, br.x + 4, br.y + 4, 16, if (kept == .allow) theme.accent else theme.text_3);
+            if (st.clicked) self.site_bar = !self.site_bar;
+        }
         if (self.loading) {
             dl.rrect(.{ .x = field.x + 1, .y = field.bottom() - 3, .w = @max(0, (field.w - 2) * self.progress), .h = 2 }, 1, theme.accent.alpha(0.85));
         }
@@ -494,7 +821,7 @@ pub const WebTab = struct {
             dl.icon(.lock, tx - 1, cy - 6.5, 13, theme.text_3);
             tx += 18;
         }
-        const text_rect: Rect = .{ .x = tx, .y = field.y + 1, .w = @max(0, field.right() - 10 - tx), .h = field.h - 2 };
+        const text_rect: Rect = .{ .x = tx, .y = field.y + 1, .w = @max(0, field_end - tx), .h = field.h - 2 };
         const d = ui.drag(Ui.id("web.field", key), field);
         if (d.hover or d.dragging) ui.cursor = .ibeam;
         if (d.started and !self.bar_focused) self.focusBar(false);
@@ -578,6 +905,143 @@ pub const WebTab = struct {
         if (focused and (self.blink_on or ui.down)) dl.rect(self.caret, theme.accent);
     }
 
+    /// The camera's or the microphone's indicator: the accent and a dot
+    /// while live, dimmed while muted. True when clicked.
+    fn captureButton(self: *WebTab, ui: *Ui, r: Rect, icon: icons.Icon, state: NSInteger, wid: u64) bool {
+        _ = self;
+        const dl = ui.dl;
+        const st = ui.button(wid, r);
+        ui.feedback(r, 6, st);
+        const live = state == 1;
+        const color = if (live) theme.accent else theme.text_3;
+        dl.icon(icon, r.x + 4, r.y + 4, 16, color);
+        if (live) dl.circle(r.right() - 4, r.y + 5, 2.5, theme.red);
+        return st.clicked;
+    }
+
+    /// Mutes the camera or the microphone, or turns it back on.
+    pub fn toggleCapture(self: *WebTab, camera: bool) void {
+        const v = self.view orelse return;
+        const now = if (camera) self.camera_state else self.mic_state;
+        const want: NSInteger = if (now == 1) 2 else 1;
+        if (camera) {
+            msg(void, v, "setCameraCaptureState:completionHandler:", .{ want, noopBlock() });
+        } else {
+            msg(void, v, "setMicrophoneCaptureState:completionHandler:", .{ want, noopBlock() });
+        }
+    }
+
+    /// The bar that asks the user: what the site wants, Block and Allow
+    /// (kept for the site), and × for "not now".
+    fn drawPrompt(self: *WebTab, ui: *Ui, r: Rect) void {
+        const p = self.prompts.items[0];
+        const dl = ui.dl;
+        const key = @intFromPtr(self);
+        dl.pushClip(r);
+        defer dl.popClip();
+        dl.rect(r, theme.accent.alpha(0.08));
+        dl.rect(.{ .x = r.x, .y = r.bottom() - 1, .w = r.w, .h = 1 }, theme.line);
+        const cy = r.centerY();
+
+        // Right to left: ×, Allow, Block.
+        var bx = r.right() - 12 - 28;
+        {
+            const cr: Rect = .{ .x = bx, .y = cy - 14, .w = 28, .h = 28 };
+            const st = ui.button(Ui.id("web.prompt.dismiss", key), cr);
+            ui.feedback(cr, 7, st);
+            dl.icon(.close, cr.x + 7, cr.y + 7, 14, if (st.hover) theme.text else theme.text_3);
+            if (st.clicked) return self.answer(false, false);
+        }
+        const allow_w = ui.text.measure(theme.font_ui_medium, "Allow") + 28;
+        bx -= 8 + allow_w;
+        {
+            const ar: Rect = .{ .x = bx, .y = cy - 14, .w = allow_w, .h = 28 };
+            const st = ui.button(Ui.id("web.prompt.allow", key), ar);
+            dl.rrect(ar, 8, if (st.held) theme.accent.alpha(0.8) else if (st.hover) theme.accent.alpha(0.92) else theme.accent);
+            _ = dl.textCentered(theme.font_ui_medium, ar.x + 14, cy, "Allow", theme.on_accent);
+            if (st.clicked) return self.answer(true, true);
+        }
+        const block_w = ui.text.measure(theme.font_ui_medium, "Block") + 28;
+        bx -= 8 + block_w;
+        if (barButton(ui, Ui.id("web.prompt.block", key), .{ .x = bx, .y = cy - 14, .w = block_w, .h = 28 }, "Block")) return self.answer(false, true);
+
+        // The icon, the site, the question.
+        var tx = r.x + 16;
+        dl.icon(p.icon(), tx, cy - 8, 16, theme.accent);
+        tx += 16 + 10;
+        const room = bx - 16 - tx;
+        const site = notify.siteName(p.origin);
+        const site_w = @min(ui.text.measure(theme.font_ui_medium, site), room * 0.6);
+        _ = dl.textEllipsis(theme.font_ui_medium, tx, cy, site, site_w + 1, theme.text);
+        _ = dl.textEllipsis(theme.font_ui, tx + site_w + 5, cy, p.question(), @max(0, room - site_w - 5), theme.text_2);
+        // More waiting behind this one.
+        if (self.prompts.items.len > 1) {
+            var more_buf: [24]u8 = undefined;
+            const more = std.fmt.bufPrint(&more_buf, "+{d}", .{self.prompts.items.len - 1}) catch "";
+            _ = dl.textRight(theme.font_hint, bx - 12, cy, more, theme.text_3);
+        }
+    }
+
+    /// The site's notifications, as answered: Block (or Allow) changes the
+    /// answer, Remove takes it back so the site has to ask again, × closes.
+    fn drawSiteBar(self: *WebTab, ui: *Ui, r: Rect, origin: []const u8, kept: cfg_mod.Permission) void {
+        const dl = ui.dl;
+        const key = @intFromPtr(self);
+        dl.pushClip(r);
+        defer dl.popClip();
+        dl.rect(r, theme.bg_block);
+        dl.rect(.{ .x = r.x, .y = r.bottom() - 1, .w = r.w, .h = 1 }, theme.line);
+        const cy = r.centerY();
+        const cfg = cfg_mod.get();
+
+        var bx = r.right() - 12 - 28;
+        {
+            const cr: Rect = .{ .x = bx, .y = cy - 14, .w = 28, .h = 28 };
+            const st = ui.button(Ui.id("web.site.close", key), cr);
+            ui.feedback(cr, 7, st);
+            dl.icon(.close, cr.x + 7, cr.y + 7, 14, if (st.hover) theme.text else theme.text_3);
+            if (st.clicked) {
+                self.site_bar = false;
+                return;
+            }
+        }
+        const remove_w = ui.text.measure(theme.font_ui_medium, "Remove") + 28;
+        bx -= 8 + remove_w;
+        if (barButton(ui, Ui.id("web.site.remove", key), .{ .x = bx, .y = cy - 14, .w = remove_w, .h = 28 }, "Remove")) {
+            cfg.removeSitePermissions(origin, &.{.notifications});
+            cfg.save();
+            self.site_bar = false;
+            return;
+        }
+        const flip = if (kept == .allow) "Block" else "Allow";
+        const flip_w = ui.text.measure(theme.font_ui_medium, flip) + 28;
+        bx -= 8 + flip_w;
+        if (barButton(ui, Ui.id("web.site.flip", key), .{ .x = bx, .y = cy - 14, .w = flip_w, .h = 28 }, flip)) {
+            cfg.setSitePermission(origin, .notifications, if (kept == .allow) .block else .allow);
+            if (kept != .allow) notify.requestAuth();
+            cfg.save();
+            return;
+        }
+
+        var tx = r.x + 16;
+        dl.icon(.bell, tx, cy - 8, 16, if (kept == .allow) theme.accent else theme.text_3);
+        tx += 16 + 10;
+        const room = bx - 16 - tx;
+        const site = notify.siteName(origin);
+        const site_w = @min(ui.text.measure(theme.font_ui_medium, site), room * 0.6);
+        _ = dl.textEllipsis(theme.font_ui_medium, tx, cy, site, site_w + 1, theme.text);
+        const what = if (kept == .allow) "may show notifications. Remove to have it ask again." else "is blocked from showing notifications. Remove to have it ask again.";
+        _ = dl.textEllipsis(theme.font_ui, tx + site_w + 5, cy, what, @max(0, room - site_w - 5), theme.text_2);
+    }
+
+    /// A plain button of the bars under the address bar; true when clicked.
+    fn barButton(ui: *Ui, wid: u64, r: Rect, label: []const u8) bool {
+        const st = ui.button(wid, r);
+        ui.dl.shape(r, 8, if (st.held) theme.pressed else if (st.hover) theme.hover else theme.bg_block, 1, theme.line_strong);
+        _ = ui.dl.textCentered(theme.font_ui_medium, r.x + 14, r.centerY(), label, theme.text);
+        return st.clicked;
+    }
+
     /// A round icon button; true when clicked. Disabled ones are dimmed and inert.
     fn navButton(self: *WebTab, ui: *Ui, r: Rect, icon: icons.Icon, enabled: bool, wid: u64) bool {
         _ = self;
@@ -653,6 +1117,96 @@ var live_head: ?*WebTab = null;
 
 const fromView = WebTab.fromView;
 
+/// Lets a prompt go: WebKit hears `allow` when it was waiting on it.
+fn freePrompt(gpa: std.mem.Allocator, p: *Prompt, allow: bool) void {
+    if (p.decide) |d| decideMedia(d, allow);
+    p.decide = null;
+    gpa.free(p.origin);
+}
+
+/// Answers WebKit's camera/microphone question and lets the block go.
+fn decideMedia(block: *anyopaque, allow: bool) void {
+    // WKPermissionDecision: 1 grant, 2 deny.
+    objc.invokeBlock(block, .{@as(NSInteger, if (allow) 1 else 2)});
+    objc.releaseBlock(block);
+}
+
+/// A notification was clicked (notify.zig): its tab comes to the front and
+/// the page hears the click, as a browser's would; with the tab gone, the
+/// site opens again.
+fn notificationClicked(serial: u32, nid: u32, origin: []const u8) void {
+    var t = live_head;
+    while (t) |tab| : (t = tab.next_live) {
+        if (tab.serial != serial) continue;
+        tab.env.revealTab(tab);
+        if (tab.view) |v| if (tab.env.host) |h| h.focusView(v);
+        var buf: [96]u8 = undefined;
+        tab.evalPage(std.fmt.bufPrint(&buf, "window.__ttNotifications && __ttNotifications.click({d})", .{nid}) catch return);
+        return;
+    }
+    if (origin.len > 0 and serial != 0) if (shared_env) |env| env.openUrl(origin);
+}
+
+/// A hash of the notification permissions every page starts with.
+fn notifyStatesHash() u64 {
+    const gpa = std.heap.c_allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    web_bridge.notifications.states(gpa, cfg_mod.get(), &out) catch return 0;
+    return std.hash.Wyhash.hash(0, out.items);
+}
+
+/// "Version/<Safari's version> Safari/605.1.15" for the user agent.
+fn userAgentSuffix() []const u8 {
+    const S = struct {
+        var buf: [64]u8 = undefined;
+        var text: []const u8 = "";
+    };
+    if (S.text.len > 0) return S.text;
+    var version: []const u8 = ua_fallback_version;
+    const info = msg(id, objc.class("NSDictionary"), "dictionaryWithContentsOfFile:", .{objc.nsString("/Applications/Safari.app/Contents/Info.plist")});
+    if (info != null) {
+        const v = msg(id, info, "objectForKey:", .{objc.nsString("CFBundleShortVersionString")});
+        const s = objc.utf8(v);
+        if (s.len > 0 and s.len < 16) version = s;
+    }
+    S.text = std.fmt.bufPrint(&S.buf, "Version/{s} Safari/605.1.15", .{version}) catch "Version/" ++ ua_fallback_version ++ " Safari/605.1.15";
+    return S.text;
+}
+
+/// Calls in a tab: WebKit leaves `navigator.mediaDevices` (the camera and
+/// the microphone) and `getDisplayMedia` (screen sharing) out of an app's
+/// web views on macOS unless its preferences turn them on — WebKit's own
+/// switches, looked up first so a WebKit without them is left alone. The
+/// user still decides: the bar asks for the camera and the microphone,
+/// macOS's picker for the screen.
+fn enableCapture(prefs: id) void {
+    const switches = [_][:0]const u8{ "_setMediaDevicesEnabled:", "_setScreenCaptureEnabled:" };
+    inline for (switches) |name| {
+        if (msg(bool, prefs, "respondsToSelector:", .{objc.sel(name)})) msg(void, prefs, name, .{true});
+    }
+    // Selftest only: stand-in devices, so capture runs without macOS's
+    // privacy prompt, and without the window having to be in front.
+    if (@import("../sys.zig").getenv("TT_SELFTEST_MOCK_CAPTURE") != null) {
+        if (msg(bool, prefs, "respondsToSelector:", .{objc.sel("_setMockCaptureDevicesEnabled:")})) msg(void, prefs, "_setMockCaptureDevicesEnabled:", .{true});
+        if (msg(bool, prefs, "respondsToSelector:", .{objc.sel("_setGetUserMediaRequiresFocus:")})) msg(void, prefs, "_setGetUserMediaRequiresFocus:", .{false});
+    }
+}
+
+/// A completion handler that does nothing, for WebKit calls that want one.
+fn noopBlock() ?*anyopaque {
+    const S = struct {
+        var block: objc.Block = undefined;
+        var ready = false;
+        fn call(_: *objc.Block) callconv(.c) void {}
+    };
+    if (!S.ready) {
+        S.block = objc.Block.global(@ptrCast(&S.call), @sizeOf(objc.Block));
+        S.ready = true;
+    }
+    return @ptrCast(&S.block);
+}
+
 // ── the view class ──────────────────────────────────────────────────────
 // A WKWebView that is first responder claims every ⌘ chord for the page and
 // only hands the unhandled ones on later, if at all — so ⌘K, ⌘T, ⌘W … would
@@ -717,6 +1271,10 @@ fn delegateClass() objc.Class {
         b.method("webView:didFailNavigation:withError:", didFail, "v@:@@@");
         b.method("webViewWebContentProcessDidTerminate:", processDied, "v@:@");
         b.method("webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:", createWebView, "@@:@@@@");
+        b.method("webViewDidClose:", didClose, "v@:@");
+        b.method("webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:", requestMedia, "v@:@@@q@?");
+        // WebKit's private delegate method for screen sharing.
+        b.method("_webView:requestDisplayCapturePermissionForOrigin:initiatedByFrame:withSystemAudio:decisionHandler:", requestDisplay, "v@:@@@B@?");
         delegate_class = b.register();
     }
     return delegate_class;
@@ -741,13 +1299,90 @@ fn processDied(_: id, _: SEL, web_view: id) callconv(.c) void {
     self.setError("The web content process stopped.", self.url.items);
 }
 
-/// target=_blank links and window.open: the same tab, since the app has no
-/// separate window to give them.
-fn createWebView(_: id, _: SEL, web_view: id, _: id, action: id, _: id) callconv(.c) id {
-    const req = msg(id, action, "request", .{});
-    if (req != null) _ = msg(id, web_view, "loadRequest:", .{req});
-    return null;
+/// target=_blank links and window.open: a new tab, around a web view made
+/// with the configuration WebKit passes (it must be that one) — the page
+/// that opened it can then talk to it, as sign-in popups do. WebKit loads
+/// it; the app adopts it as a tab on its next tick.
+fn createWebView(_: id, _: SEL, web_view: id, config: id, action: id, _: id) callconv(.c) id {
+    const opener = fromView(web_view) orelse {
+        const req = msg(id, action, "request", .{});
+        if (req != null) _ = msg(id, web_view, "loadRequest:", .{req});
+        return null;
+    };
+    const view = msg(id, msg(id, webViewClass(), "alloc", .{}), "initWithFrame:configuration:", .{ CGRect.make(0, 0, 200, 200), config });
+    if (view == null) return null;
+    if (@import("../sys.zig").getenv("TT_DEBUG_EVENTS") != null) {
+        const req = msg(id, action, "request", .{});
+        const url = if (req != null) msg(id, req, "URL", .{}) else null;
+        std.debug.print("web new window for '{s}' (navigation type {d}, button {d})\n", .{
+            if (url != null) objc.utf8(msg(id, url, "absoluteString", .{})) else "", msg(NSInteger, action, "navigationType", .{}), msg(NSInteger, action, "buttonNumber", .{}),
+        });
+    }
+    noteOpener(view.?, opener.serial);
+    opener.env.adoptWebView(view.?);
+    return view;
 }
+
+/// The page called `window.close()` (a popup done with its sign-in): its
+/// tab goes, and the page that opened it comes back to the front when the
+/// popup was there.
+fn didClose(_: id, _: SEL, web_view: id) callconv(.c) void {
+    const self = fromView(web_view) orelse return;
+    self.env.closeTab(self);
+    if (!self.in_front or self.opener == 0) return;
+    var t = live_head;
+    while (t) |tab| : (t = tab.next_live) {
+        if (tab.serial == self.opener and tab != self) return self.env.revealTab(tab);
+    }
+}
+
+/// Web views WebKit made for new windows, waiting for their tab, and the
+/// serial of the tab whose page opened each (see `createWebView`).
+const Opener = struct { view: ?*anyopaque = null, serial: u32 = 0 };
+var openers: [8]Opener = [_]Opener{.{}} ** 8;
+
+fn noteOpener(view: *anyopaque, serial: u32) void {
+    for (&openers) |*o| {
+        if (o.view == null) {
+            o.* = .{ .view = view, .serial = serial };
+            return;
+        }
+    }
+}
+
+fn takeOpener(view: *anyopaque) u32 {
+    for (&openers) |*o| {
+        if (o.view == view) {
+            const serial = o.serial;
+            o.* = .{};
+            return serial;
+        }
+    }
+    return 0;
+}
+
+/// Screen sharing (getDisplayMedia, which only runs from a click in the
+/// page): macOS's own picker asks what to share, and nothing is shared
+/// unless the user picks something there — the picker is the question, as
+/// in browsers, so there is no bar for it. WKDisplayCapturePermissionDecision:
+/// 0 deny, 1 the screen picker.
+fn requestDisplay(_: id, _: SEL, web_view: id, _: id, _: id, _: bool, decision: ?*anyopaque) callconv(.c) void {
+    objc.invokeBlock(decision, .{@as(NSInteger, if (fromView(web_view) != null) 1 else 0)});
+}
+
+/// The camera and/or the microphone (WKMediaCaptureType: 0 camera, 1
+/// microphone, 2 both), asked by a page from `origin`: the site's answer in
+/// the settings, else the bar asks the user. `decision` is called exactly
+/// once, now or when the user answers.
+fn requestMedia(_: id, _: SEL, web_view: id, origin: id, frame: id, kind: NSInteger, decision: ?*anyopaque) callconv(.c) void {
+    _ = frame;
+    const block = objc.copyBlock(decision) orelse return;
+    const self = fromView(web_view) orelse return decideMedia(block, false);
+    var buf: [512]u8 = undefined;
+    const site = web_bridge.originOf(&buf, origin);
+    self.ask(site, .{ .camera = kind != 1, .microphone = kind != 0 }, block);
+}
+
 
 // ── addresses ───────────────────────────────────────────────────────────
 /// The address a typed string means: as is with a scheme, https:// (http://
@@ -814,6 +1449,45 @@ fn isLocal(t: []const u8) bool {
     return false;
 }
 
+/// The site an address belongs to, as WebKit names it (its origin):
+/// "https://Teams.Microsoft.com/v2/?x" → "https://teams.microsoft.com";
+/// default ports are dropped, other ones kept. Empty without a host part
+/// (about:blank, a search typed but not loaded).
+pub fn originOfUrl(buf: []u8, url: []const u8) []const u8 {
+    const sep = std.mem.indexOf(u8, url, "://") orelse return "";
+    if (sep == 0 or sep > 16) return "";
+    const rest = url[sep + 3 ..];
+    var authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    var host = authority;
+    var port: NSInteger = 0;
+    // "host:port", or "[v6]:port": the port's colon comes after any bracket.
+    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |c| {
+        const after_bracket = if (std.mem.lastIndexOfScalar(u8, authority, ']')) |rb| c > rb else true;
+        if (after_bracket) {
+            port = std.fmt.parseInt(NSInteger, authority[c + 1 ..], 10) catch 0;
+            host = authority[0..c];
+        }
+    }
+    var scheme_buf: [16]u8 = undefined;
+    var host_buf: [256]u8 = undefined;
+    if (host.len > host_buf.len) return "";
+    const scheme = std.ascii.lowerString(&scheme_buf, url[0..sep]);
+    const lower_host = std.ascii.lowerString(&host_buf, host);
+    return web_bridge.formatOrigin(buf, scheme, lower_host, port);
+}
+
+test "originOfUrl: scheme and host, lower case, default ports dropped" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("https://teams.microsoft.com", originOfUrl(&buf, "https://Teams.Microsoft.com/v2/?x=1#y"));
+    try std.testing.expectEqualStrings("https://a.example", originOfUrl(&buf, "https://a.example:443/"));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8765", originOfUrl(&buf, "http://127.0.0.1:8765/perm.html"));
+    try std.testing.expectEqualStrings("https://b.example", originOfUrl(&buf, "https://user:pw@b.example"));
+    try std.testing.expectEqualStrings("http://[::1]:8080", originOfUrl(&buf, "http://[::1]:8080/x"));
+    try std.testing.expectEqualStrings("", originOfUrl(&buf, "about:blank"));
+    try std.testing.expectEqualStrings("", originOfUrl(&buf, ""));
+}
+
 /// "https://zig.news/foo" → "zig.news".
 pub fn hostOf(url: []const u8) []const u8 {
     const start = if (std.mem.indexOf(u8, url, "://")) |i| i + 3 else 0;
@@ -854,6 +1528,13 @@ test "isAddress" {
 test "hostOf" {
     try std.testing.expectEqualStrings("zig.news", hostOf("https://www.zig.news/a/b?c"));
     try std.testing.expectEqualStrings("", hostOf(""));
+}
+
+/// The configured homepage a fresh website tab should open, if any
+/// (Settings › Browser). Blank means start on a white page.
+fn homepage() ?[]const u8 {
+    const url = cfg_mod.get().browser.homepage;
+    return if (url.len > 0) url else null;
 }
 
 /// The address a saved website tab was showing (see `save`).

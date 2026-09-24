@@ -29,8 +29,9 @@ pub const Rect = ui_mod.Rect;
 pub const Status = enum { none, running, attention, failed };
 
 /// Document commands routed to the active tab (menu items, palette, ⌘S …).
-/// The last four are for website tabs: history, reload, focus the address bar.
-pub const Command = enum { save, undo, redo, toggle_view, back, forward, reload, open_location };
+/// back/forward/reload/open_location are for website tabs (history, reload,
+/// focus the address bar); zoom_in/out/reset zoom a website tab's page.
+pub const Command = enum { save, undo, redo, toggle_view, back, forward, reload, open_location, zoom_in, zoom_out, zoom_reset };
 
 /// Where a text document's caret is, the way "go to line" counts:
 /// 1-based line and column, and how many lines there are.
@@ -44,6 +45,10 @@ pub const OpenArgs = struct {
     path: ?[]const u8 = null,
     /// Website: the page to load (null = an empty tab with the address bar focused).
     url: ?[]const u8 = null,
+    /// Website: a web view WebKit already made for a new window (a link
+    /// with target=_blank, `window.open`), loading on its own; the tab takes
+    /// it over (it arrives retained, and the tab releases it).
+    web_view: ?*anyopaque = null,
     /// Terminal: spawn the shell right away; false waits for the first command.
     start_shell: bool = true,
     /// What the kind's `save` wrote in an earlier run (see workspace.zig),
@@ -61,6 +66,9 @@ pub const Env = struct {
     launch_cwd: []const u8,
     /// Puts text on the system clipboard (no-op when headless).
     setClipboard: *const fn ([]const u8) void,
+    /// The text on the system clipboard (caller frees), null when there
+    /// is none. Set by the platform layer; headless runs keep their own.
+    getClipboard: *const fn (std.mem.Allocator) ?[]u8 = noClipboard,
     /// GPU textures for viewers that draw pictures (null without a renderer, e.g. in tests).
     textures: ?*Textures = null,
     /// Where a tab can hang a native view (a website tab's WKWebView) over
@@ -82,6 +90,32 @@ pub const Env = struct {
         self.requests.append(self.gpa, .{ .send_to_shell = copy }) catch self.gpa.free(copy);
     }
 
+    /// `line` run in an idle shell of the row on show (a new one when
+    /// every shell there is busy), without a history entry: how a
+    /// notebook starts the coding agent on a failed cell.
+    pub fn runInShell(self: *Env, line: []const u8) void {
+        const copy = self.gpa.dupe(u8, line) catch return;
+        self.requests.append(self.gpa, .{ .run_in_shell = copy }) catch self.gpa.free(copy);
+    }
+
+    /// A new website tab around a web view WebKit made for a new window
+    /// (see `OpenArgs.web_view`).
+    pub fn adoptWebView(self: *Env, view: *anyopaque) void {
+        self.requests.append(self.gpa, .{ .adopt_web_view = view }) catch {};
+    }
+
+    /// Closes the tab whose object is `tab_ptr` (`Tab.ptr`), wherever it is:
+    /// a page that called `window.close()`.
+    pub fn closeTab(self: *Env, tab_ptr: *anyopaque) void {
+        self.requests.append(self.gpa, .{ .close_tab = tab_ptr }) catch {};
+    }
+
+    /// Brings the tab whose object is `tab_ptr` to the front, in whichever
+    /// project it is: a click on one of its notifications.
+    pub fn revealTab(self: *Env, tab_ptr: *anyopaque) void {
+        self.requests.append(self.gpa, .{ .reveal_tab = tab_ptr }) catch {};
+    }
+
     /// `question` to the agent that takes plain-English lines, in a shell
     /// of the row on show, as a block headed `label`.
     pub fn askAgent(self: *Env, label: []const u8, question: []const u8) void {
@@ -97,19 +131,31 @@ pub const Env = struct {
     }
 };
 
+fn noClipboard(_: std.mem.Allocator) ?[]u8 {
+    return null;
+}
+
 /// Something a tab wants done beyond its own rect — another tab opened,
 /// text handed to a shell, the agent asked — queued on `Env` and served by
 /// the app between ticks (`App.update`). The text is the queue's until then.
 pub const Request = union(enum) {
     open_url: []u8,
     send_to_shell: []u8,
+    run_in_shell: []u8,
     ask_agent: Ask,
+    /// A web view for a new tab (`Env.adoptWebView`); the tab it goes to
+    /// releases it.
+    adopt_web_view: *anyopaque,
+    /// A tab by its object (`Tab.ptr`): to close, to bring forward.
+    close_tab: *anyopaque,
+    reveal_tab: *anyopaque,
 
     pub const Ask = struct { label: []u8, question: []u8 };
 
     pub fn free(self: Request, gpa: std.mem.Allocator) void {
         switch (self) {
-            .open_url, .send_to_shell => |s| gpa.free(s),
+            .adopt_web_view, .close_tab, .reveal_tab => {},
+            .open_url, .send_to_shell, .run_in_shell => |s| gpa.free(s),
             .ask_agent => |a| {
                 gpa.free(a.label);
                 gpa.free(a.question);
@@ -127,12 +173,26 @@ pub const Request = union(enum) {
 pub const Host = struct {
     attach: *const fn (view: *anyopaque) void,
     place: *const fn (view: *anyopaque, rect: Rect) void,
+    /// Like `place`, but for a view that scrolls inside a viewport: `content`
+    /// is where the whole view would sit, `clip` the visible slice (usually
+    /// their intersection). The host shows the view at `content`'s full size,
+    /// clipped to `clip`, so the content is not squashed as it scrolls — a
+    /// notebook cell's web output places itself this way.
+    placeClipped: *const fn (view: *anyopaque, content: Rect, clip: Rect) void,
     detach: *const fn (view: *anyopaque) void,
     /// True while the native view (or something inside it) has the keyboard.
     hasFocus: *const fn (view: *anyopaque) bool,
     /// Gives the keyboard to the native view / back to the app's own view.
     focusView: *const fn (view: *anyopaque) void,
     focusApp: *const fn () void,
+    /// Makes a bare web view (a WKWebView) the caller can `attach`, load and
+    /// place; null when the platform has none. The caller owns it: `detach`
+    /// then `destroyWebView` when done.
+    createWebView: *const fn () ?*anyopaque,
+    destroyWebView: *const fn (view: *anyopaque) void,
+    /// Loads a local HTML file into a web view, granting it read access to
+    /// `read_dir` so the page can pull in siblings (e.g. the Plotly library).
+    loadHtmlFile: *const fn (view: *anyopaque, file_path: []const u8, read_dir: []const u8) void,
 };
 
 pub const Tab = struct {
@@ -719,6 +779,28 @@ pub const TabManager = struct {
             }
         }
         return null;
+    }
+
+    /// The uid of the tab whose object is `ptr`, in any group.
+    pub fn uidOf(self: *TabManager, ptr: *anyopaque) ?u32 {
+        for (self.groups.items) |g| {
+            for (g.layout.owned.items) |p| {
+                for (p.tabs.items) |t| if (t.ptr == ptr) return t.uid;
+            }
+        }
+        return null;
+    }
+
+    /// Closes the tab `uid`, in any group (no confirmation).
+    pub fn closeUid(self: *TabManager, uid: u32) bool {
+        for (self.groups.items) |*g| {
+            for (g.layout.owned.items) |p| {
+                const i = p.indexOf(uid) orelse continue;
+                self.closeIn(g, p, i);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// A tab from any group.

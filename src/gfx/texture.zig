@@ -32,6 +32,10 @@ pub const Textures = struct {
     /// Level-0 bytes currently resident, for keeping an eye on viewers.
     resident_bytes: usize = 0,
     count: usize = 0,
+    /// Released handles still alive until `collect`: a tab can let go of a
+    /// texture mid-frame (closed from its menu, a cell deleted …) while the
+    /// frame's draw list, encoded right after, still names it.
+    retired: std.ArrayList(id) = .empty,
 
     pub fn upload(self: *Textures, bm: Bitmap) !Texture {
         if (bm.width == 0 or bm.height == 0) return error.EmptyBitmap;
@@ -68,12 +72,22 @@ pub const Textures = struct {
         return .{ .handle = tex, .width = bm.width, .height = bm.height };
     }
 
-    /// Frees the GPU memory; safe to call on an empty handle.
+    /// Lets go of a texture; safe to call on an empty handle. The GPU memory
+    /// goes at the next `collect`, once no draw list can refer to it.
     pub fn release(self: *Textures, tex: *Texture) void {
         if (tex.handle == null) return;
-        objc.release(tex.handle);
+        // Out of memory to remember it: a leak beats a freed texture in the frame.
+        self.retired.append(std.heap.c_allocator, tex.handle) catch {};
         self.resident_bytes -= @min(self.resident_bytes, @as(usize, tex.width) * tex.height * 4);
         self.count -|= 1;
         tex.* = .{};
+    }
+
+    /// Frees the released textures. Call between frames: after the last
+    /// draw list was encoded (command buffers retain what they use) and
+    /// before the next one is built.
+    pub fn collect(self: *Textures) void {
+        for (self.retired.items) |handle| objc.release(handle);
+        self.retired.clearRetainingCapacity();
     }
 };

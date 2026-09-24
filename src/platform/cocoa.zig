@@ -13,6 +13,9 @@ const sys = @import("../sys.zig");
 const tab_mod = @import("../tabs/tab.zig");
 const WebTab = @import("../tabs/web_tab.zig").WebTab;
 const TerminalTab = @import("../tabs/terminal_tab.zig").TerminalTab;
+const NotebookTab = @import("../tabs/notebook_tab.zig").NotebookTab;
+const notify = @import("notify.zig");
+const cfg_mod = @import("../config.zig");
 
 const id = objc.id;
 const SEL = objc.SEL;
@@ -77,6 +80,7 @@ pub fn run(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
 // ── application delegate ─────────────────────────────────────────────────
 fn registerDelegateClass() objc.Class {
     const b = objc.ClassBuilder.begin("TTAppDelegate", "NSObject");
+    b.method("applicationWillFinishLaunching:", willFinishLaunching, "v@:@");
     b.method("applicationDidFinishLaunching:", didFinishLaunching, "v@:@");
     b.method("applicationShouldTerminateAfterLastWindowClosed:", shouldTerminateAfterLastWindow, "B@:@");
     b.method("applicationShouldTerminate:", shouldTerminate, "Q@:@");
@@ -92,6 +96,12 @@ fn registerDelegateClass() objc.Class {
     b.method("windowDidChangeScreen:", screensChanged, "v@:@");
     b.method("applicationDidChangeScreenParameters:", screensChanged, "v@:@");
     return b.register();
+}
+
+/// Before launching is over, so a notification click that started tt
+/// reaches the website tabs (platform/notify.zig).
+fn willFinishLaunching(_: id, _: SEL, _: id) callconv(.c) void {
+    notify.setup();
 }
 
 fn screensChanged(_: id, _: SEL, _: id) callconv(.c) void {
@@ -205,7 +215,10 @@ fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
         msg(void, g.nsapp, "terminate:", .{@as(id, null)});
         return;
     };
-    if (g.app) |app| app.env.host = &host_impl;
+    if (g.app) |app| {
+        app.env.host = &host_impl;
+        app.env.getClipboard = getClipboard;
+    }
     // The app has read the settings by now: dress the window to match.
     syncWindowAppearance();
 
@@ -239,6 +252,14 @@ fn setClipboard(text: []const u8) void {
     const pb = msg(id, objc.class("NSPasteboard"), "generalPasteboard", .{});
     _ = msg(NSInteger, pb, "clearContents", .{});
     _ = msg(bool, pb, "setString:forType:", .{ objc.nsString(text), NSPasteboardTypeString });
+}
+
+/// The pasteboard's text (caller frees), null when it holds none.
+fn getClipboard(gpa: std.mem.Allocator) ?[]u8 {
+    const pb = msg(id, objc.class("NSPasteboard"), "generalPasteboard", .{});
+    const str = msg(id, pb, "stringForType:", .{NSPasteboardTypeString});
+    if (str == null) return null;
+    return gpa.dupe(u8, objc.utf8(str)) catch null;
 }
 
 // ── menu ─────────────────────────────────────────────────────────────────
@@ -312,6 +333,11 @@ fn buildMenu() void {
     _ = addItem(view_menu, "Split Down", "splitDown:", "d", mod_cmd | mod_shift);
     _ = addItem(view_menu, "Focus Next Pane", "nextPane:", "]", null);
     _ = addItem(view_menu, "Focus Previous Pane", "prevPane:", "[", null);
+    addSeparator(view_menu);
+    // ⌘= (unshifted) is caught in performKeyEquivalent; the item shows ⌘+.
+    _ = addItem(view_menu, "Zoom In", "zoomIn:", "+", null);
+    _ = addItem(view_menu, "Zoom Out", "zoomOut:", "-", null);
+    _ = addItem(view_menu, "Actual Size", "actualSize:", "0", null);
     addSeparator(view_menu);
     _ = addItem(view_menu, "Enter Full Screen", "toggleFullScreen:", "f", mod_cmd | mod_ctrl);
 
@@ -387,6 +413,9 @@ fn registerViewClass() objc.Class {
     b.method("splitDown:", actionSplitDown, "v@:@");
     b.method("nextPane:", actionNextPane, "v@:@");
     b.method("prevPane:", actionPrevPane, "v@:@");
+    b.method("zoomIn:", actionZoomIn, "v@:@");
+    b.method("zoomOut:", actionZoomOut, "v@:@");
+    b.method("actualSize:", actionActualSize, "v@:@");
     b.method("copy:", actionCopy, "v@:@");
     b.method("cut:", actionCut, "v@:@");
     b.method("paste:", actionPaste, "v@:@");
@@ -477,7 +506,7 @@ fn syncWindowAppearance() void {
     if (g.window == null) return;
     const name = switch (theme.scheme) {
         .dark => "NSAppearanceNameDarkAqua",
-        .light, .eink => "NSAppearanceNameAqua",
+        .light, .eink, .eink_color => "NSAppearanceNameAqua",
     };
     const ns_appearance = msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)});
     msg(void, g.window, "setAppearance:", .{ns_appearance});
@@ -538,7 +567,16 @@ fn windowOnScreen() bool {
 // full width, which was the whole window. In the box the two share the
 // page's rect, and the view follows the box (autoresizing) so that layout
 // survives the window resizing.
-const Hosted = struct { view: id, box: id, frame: CGRect = .{}, placed: bool = false, shown: bool = false };
+const Hosted = struct {
+    view: id,
+    box: id,
+    frame: CGRect = .{},
+    /// The view's own frame inside the box when it scrolls under a clip
+    /// (`placeClipped`); null when it just fills the box (`place`).
+    inner: ?CGRect = null,
+    placed: bool = false,
+    shown: bool = false,
+};
 var hosted: std.ArrayList(Hosted) = .empty;
 
 /// NSViewWidthSizable | NSViewHeightSizable.
@@ -548,6 +586,11 @@ fn hostAttach(view: *anyopaque) void {
     const v: id = view;
     const box = msg(id, objc.alloc("NSView"), "initWithFrame:", .{msg(CGRect, v, "frame", .{})});
     msg(void, box, "setHidden:", .{true});
+    // Clip whatever the box holds to its bounds, so a view scrolling under a
+    // notebook's viewport (`placeClipped`) does not overhang it.
+    msg(void, box, "setWantsLayer:", .{true});
+    if (msg(bool, box, "respondsToSelector:", .{objc.sel("setClipsToBounds:")})) msg(void, box, "setClipsToBounds:", .{true});
+    if (msg(id, box, "layer", .{})) |layer| msg(void, layer, "setMasksToBounds:", .{true});
     msg(void, v, "setFrame:", .{msg(CGRect, box, "bounds", .{})});
     msg(void, v, "setAutoresizingMask:", .{follows_box});
     msg(void, box, "addSubview:", .{v});
@@ -565,9 +608,32 @@ fn hostBox(view: id) id {
 
 fn hostPlace(view: *anyopaque, rect: ui_mod.Rect) void {
     const v: id = view;
+    // `rect` is in the app's zoomed logical space; the box is a plain subview
+    // of the content view, whose coordinates are window points — scale up by
+    // the zoom so the native view keeps covering its pane at any zoom.
+    const z: f64 = if (g.app) |app| app.zoom else 1;
     for (hosted.items) |*h| {
         if (h.view != v) continue;
-        h.frame = CGRect.make(rect.x, rect.y, rect.w, rect.h);
+        h.frame = CGRect.make(rect.x * z, rect.y * z, rect.w * z, rect.h * z);
+        h.inner = null;
+        h.placed = true;
+    }
+}
+
+/// Places a view that scrolls inside a viewport: the box takes the visible
+/// `clip`, the view keeps `content`'s full size shifted into it (so it is not
+/// squashed as it scrolls). See `tab_mod.Host.placeClipped`.
+fn hostPlaceClipped(view: *anyopaque, content: ui_mod.Rect, clip: ui_mod.Rect) void {
+    const v: id = view;
+    const z: f64 = if (g.app) |app| app.zoom else 1;
+    for (hosted.items) |*h| {
+        if (h.view != v) continue;
+        h.frame = CGRect.make(clip.x * z, clip.y * z, clip.w * z, clip.h * z);
+        // The box is a plain NSView, not flipped: a subview's y counts up
+        // from the box's bottom edge, so the view's offset is how far its
+        // bottom hangs below the clip's (zero or negative).
+        const below = (clip.y + clip.h) - (content.y + content.h);
+        h.inner = CGRect.make((content.x - clip.x) * z, below * z, content.w * z, content.h * z);
         h.placed = true;
     }
 }
@@ -614,13 +680,50 @@ fn hostFocusApp() void {
     if (g.window != null) _ = msg(bool, g.window, "makeFirstResponder:", .{g.view});
 }
 
+/// A bare WKWebView (no navigation delegate, no bridges): a notebook cell's
+/// web output loads local HTML into it. The caller attaches, loads, places
+/// and finally detaches + destroys it.
+fn hostCreateWebView() ?*anyopaque {
+    const config = objc.new("WKWebViewConfiguration");
+    defer objc.release(config);
+    const prefs = msg(id, config, "preferences", .{});
+    const truth = msg(id, objc.class("NSNumber"), "numberWithBool:", .{true});
+    msg(void, prefs, "setValue:forKey:", .{ truth, objc.nsString("developerExtrasEnabled") });
+    // The page is loaded from a file:// URL and pulls in a sibling script
+    // (the Plotly library); let file pages read other file resources.
+    msg(void, prefs, "setValue:forKey:", .{ truth, objc.nsString("allowFileAccessFromFileURLs") });
+    const view = msg(id, msg(id, objc.class("WKWebView"), "alloc", .{}), "initWithFrame:configuration:", .{ CGRect.make(0, 0, 200, 200), config });
+    if (view == null) return null;
+    if (msg(bool, view, "respondsToSelector:", .{objc.sel("setInspectable:")})) msg(void, view, "setInspectable:", .{true});
+    msg(void, view, "setAllowsMagnification:", .{true});
+    return view;
+}
+
+fn hostDestroyWebView(view: *anyopaque) void {
+    const v: id = view;
+    msg(void, v, "stopLoading", .{});
+    objc.release(v);
+}
+
+fn hostLoadHtmlFile(view: *anyopaque, file_path: []const u8, read_dir: []const u8) void {
+    const v: id = view;
+    const file_url = msg(id, objc.class("NSURL"), "fileURLWithPath:", .{objc.nsString(file_path)});
+    const dir_url = msg(id, objc.class("NSURL"), "fileURLWithPath:isDirectory:", .{ objc.nsString(read_dir), true });
+    if (file_url == null or dir_url == null) return;
+    _ = msg(id, v, "loadFileURL:allowingReadAccessToURL:", .{ file_url, dir_url });
+}
+
 const host_impl: tab_mod.Host = .{
     .attach = hostAttach,
     .place = hostPlace,
+    .placeClipped = hostPlaceClipped,
     .detach = hostDetach,
     .hasFocus = hostHasFocus,
     .focusView = hostFocusView,
     .focusApp = hostFocusApp,
+    .createWebView = hostCreateWebView,
+    .destroyWebView = hostDestroyWebView,
+    .loadHtmlFile = hostLoadHtmlFile,
 };
 
 fn rectEql(a: CGRect, b: CGRect) bool {
@@ -637,9 +740,22 @@ fn hostSync() void {
     var changed = false;
     for (hosted.items) |*h| {
         const show = h.placed and !covered;
-        if (show and !rectEql(msg(CGRect, h.box, "frame", .{}), h.frame)) {
-            msg(void, h.box, "setFrame:", .{h.frame});
-            changed = true;
+        if (show) {
+            if (!rectEql(msg(CGRect, h.box, "frame", .{}), h.frame)) {
+                msg(void, h.box, "setFrame:", .{h.frame});
+                changed = true;
+            }
+            if (h.inner) |inner| {
+                // The view is sized on its own (it scrolls under the box's
+                // clip); the autoresize that fills the box would fight it.
+                msg(void, h.view, "setAutoresizingMask:", .{@as(NSUInteger, 0)});
+                if (!rectEql(msg(CGRect, h.view, "frame", .{}), inner)) {
+                    msg(void, h.view, "setFrame:", .{inner});
+                    changed = true;
+                }
+            } else {
+                msg(void, h.view, "setAutoresizingMask:", .{follows_box});
+            }
         }
         if (show != h.shown) {
             msg(void, h.box, "setHidden:", .{!show});
@@ -647,6 +763,7 @@ fn hostSync() void {
             changed = true;
         }
         h.placed = false;
+        h.inner = null;
     }
     // The cursor rects leave the hosted views' frames out (they set their own).
     if (changed and g.window != null) msg(void, g.window, "invalidateCursorRectsForView:", .{g.view});
@@ -718,7 +835,11 @@ fn resetCursorRects(self: id, _: SEL) callconv(.c) void {
 // ── mouse ────────────────────────────────────────────────────────────────
 fn eventPoint(event: id) CGPoint {
     const p = msg(CGPoint, event, "locationInWindow", .{});
-    return msg(CGPoint, g.view, "convertPoint:fromView:", .{ p, @as(id, null) });
+    const v = msg(CGPoint, g.view, "convertPoint:fromView:", .{ p, @as(id, null) });
+    // The app draws in a logical space shrunk by its zoom, so map the pointer
+    // into that same space; everything downstream compares against it.
+    const z: f64 = if (g.app) |app| app.zoom else 1;
+    return .{ .x = v.x / z, .y = v.y / z };
 }
 
 fn eventMods(event: id) ui_mod.Mods {
@@ -785,7 +906,10 @@ fn scrollWheel(_: id, _: SEL, event: id) callconv(.c) void {
         dx *= 16;
         dy *= 16;
     }
-    app.onScroll(@floatCast(p.x), @floatCast(p.y), @floatCast(dx), @floatCast(dy));
+    // Deltas are physical too; scale them into the zoomed logical space so the
+    // scroll distance per gesture feels the same at any zoom.
+    const z: f64 = app.zoom;
+    app.onScroll(@floatCast(p.x), @floatCast(p.y), @floatCast(dx / z), @floatCast(dy / z));
 }
 
 // ── keyboard ─────────────────────────────────────────────────────────────
@@ -823,6 +947,22 @@ fn performKeyEquivalent(self: id, _: SEL, event: id) callconv(.c) bool {
             app.selectTab(chars[0] - '1');
             return true;
         }
+        // Zoom: ⌘+ arrives as '=' unshifted or '+' shifted; ⌘− as '-'; ⌘0 resets.
+        if (chars.len == 1) switch (chars[0]) {
+            '=', '+' => {
+                app.perform(.zoom_in);
+                return true;
+            },
+            '-', '_' => {
+                app.perform(.zoom_out);
+                return true;
+            },
+            '0' => {
+                app.perform(.zoom_reset);
+                return true;
+            },
+            else => {},
+        };
     }
     return objc.msgSuper(bool, self, objc.class("NSView"), "performKeyEquivalent:", .{event});
 }
@@ -893,7 +1033,10 @@ fn validAttributes(_: id, _: SEL) callconv(.c) id {
 fn firstRect(_: id, _: SEL, _: NSRange, _: ?*NSRange) callconv(.c) CGRect {
     const app = g.app orelse return .{};
     const c = app.caretRect();
-    const in_view = CGRect.make(c.x, c.y, c.w, c.h);
+    // The caret is in the app's zoomed logical space; the view wants window
+    // points, so scale up by the zoom before converting to screen.
+    const z: f64 = app.zoom;
+    const in_view = CGRect.make(c.x * z, c.y * z, c.w * z, c.h * z);
     const in_window = msg(CGRect, g.view, "convertRect:toView:", .{ in_view, @as(id, null) });
     return msg(CGRect, g.window, "convertRectToScreen:", .{in_window});
 }
@@ -1002,6 +1145,15 @@ fn actionNextPane(_: id, _: SEL, _: id) callconv(.c) void {
 fn actionPrevPane(_: id, _: SEL, _: id) callconv(.c) void {
     if (g.app) |app| app.perform(.prev_pane);
 }
+fn actionZoomIn(_: id, _: SEL, _: id) callconv(.c) void {
+    if (g.app) |app| app.perform(.zoom_in);
+}
+fn actionZoomOut(_: id, _: SEL, _: id) callconv(.c) void {
+    if (g.app) |app| app.perform(.zoom_out);
+}
+fn actionActualSize(_: id, _: SEL, _: id) callconv(.c) void {
+    if (g.app) |app| app.perform(.zoom_reset);
+}
 fn actionSelectAll(_: id, _: SEL, _: id) callconv(.c) void {
     if (g.app) |app| app.onEdit(.select_all);
 }
@@ -1092,7 +1244,12 @@ fn selftestStep(now: f64) void {
         .{ .at = 3.4, .keys = "\x1b", .what = "Escape closes the palette" },
         .{ .at = 3.8, .keys = "echo selftest-ok\r", .what = "type a command + Return" },
     };
-    if (g.selftest_step < steps.len) {
+    // The notebook leg skips the regular steps: their typing would land in
+    // the restored notebook's focused cell, and its unsaved edit would then
+    // hold up the quit.
+    if (sys.getenv("TT_SELFTEST_NOTEBOOK") != null) {
+        selftestNotebook(t);
+    } else if (g.selftest_step < steps.len) {
         const s = steps[g.selftest_step];
         if (t >= s.at) {
             std.debug.print("selftest: {s}\n", .{s.what});
@@ -1119,6 +1276,91 @@ fn selftestStep(now: f64) void {
         selftestReportButtons();
         msg(void, g.nsapp, "terminate:", .{@as(id, null)});
     }
+}
+
+/// TT_SELFTEST_NOTEBOOK=1, with TT_WORKSPACE naming a workspace that holds a
+/// notebook tab: instead of the regular steps, the restored notebook is shown
+/// with its first web output (a Plotly figure, an HTML repr) in view; the web
+/// views get a few seconds to load, the counts are printed and the window is
+/// captured (TT_SELFTEST_WINDOW_PNG). Then the notebook scrolls so the figure
+/// goes under the toolbar ("-scrolled": the host must clip it), and another
+/// tab is shown ("-othertab": every hosted view must hide).
+var selftest_nb_step: u8 = 0;
+
+fn selftestNotebook(t: f64) void {
+    const app = g.app orelse return;
+    if (selftest_nb_step == 0) {
+        selftest_nb_step = 1;
+        var found = false;
+        for (app.tabs.items(), 0..) |tab, i| {
+            const nb = NotebookTab.fromTab(tab) orelse continue;
+            app.tabs.activate(i);
+            // No focused cell: its caret would pull the scroll back to it.
+            nb.focus_cell = null;
+            const r = nb.selftestWeb();
+            std.debug.print("selftest: restored notebook, web outputs={d}\n", .{r.outputs});
+            found = true;
+            break;
+        }
+        if (!found) std.debug.print("selftest: no restored notebook tab in the pane on show\n", .{});
+        app.invalidate();
+    } else if (selftest_nb_step == 1 and t >= 12) {
+        // The figure in view, loaded.
+        selftest_nb_step = 2;
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
+        for (app.tabs.items()) |tab| {
+            const nb = NotebookTab.fromTab(tab) orelse continue;
+            const r = nb.selftestWeb();
+            var why: [160]u8 = undefined;
+            std.debug.print("selftest: notebook web outputs={d} live views={d} close_warning='{s}'\n", .{ r.outputs, r.live, tab.vtable.closeWarning(tab.ptr, &why) orelse "none" });
+            // Scroll on so the figure's top goes under the toolbar: the host
+            // must clip the view to the cells, not let it overhang.
+            nb.focus_cell = null;
+            nb.reveal = null;
+            nb.scroll += 300;
+            break;
+        }
+        app.invalidate();
+    } else if (selftest_nb_step == 2 and t >= 13.5) {
+        selftest_nb_step = 3;
+        // Where each shown view really is, next to its box: a view clipped
+        // at the top must start above its box and keep its full height.
+        // (A capture of an occluded window shows a stale Metal frame, so
+        // the numbers are the check; the capture is for looking.)
+        for (hosted.items) |h| {
+            if (!h.shown) continue;
+            const box = msg(CGRect, h.box, "frame", .{});
+            const seen = msg(CGRect, h.view, "convertRect:toView:", .{ msg(CGRect, h.view, "bounds", .{}), g.view });
+            std.debug.print("selftest: hosted box y={d:.0}..{d:.0} view y={d:.0}..{d:.0} (h={d:.0})\n", .{
+                box.origin.y, box.origin.y + box.size.height, seen.origin.y, seen.origin.y + seen.size.height, seen.size.height,
+            });
+        }
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| selftestCaptureSuffixed(path, "-scrolled");
+        // Another tab on show: the notebook's views must all hide.
+        for (app.tabs.items(), 0..) |tab, i| {
+            if (NotebookTab.fromTab(tab) != null) continue;
+            app.tabs.activate(i);
+            break;
+        }
+        app.invalidate();
+    } else if (selftest_nb_step == 3 and t >= 15) {
+        selftest_nb_step = 4;
+        var shown: usize = 0;
+        for (hosted.items) |h| {
+            if (h.shown) shown += 1;
+        }
+        std.debug.print("selftest: another tab on show, hosted views shown={d}\n", .{shown});
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| selftestCaptureSuffixed(path, "-othertab");
+        msg(void, g.nsapp, "terminate:", .{@as(id, null)});
+    }
+}
+
+/// Captures the window to `path` with `suffix` before its extension.
+fn selftestCaptureSuffixed(path: []const u8, suffix: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse path.len;
+    const out = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ path[0..dot], suffix, path[dot..] }) catch return;
+    captureOwnWindow(out, 1 << 3);
 }
 
 /// TT_SELFTEST_URL=https://…: after the regular steps, a website tab on
@@ -1151,6 +1393,10 @@ fn selftestWeb(t: f64, url: []const u8) void {
             };
         }
         app.invalidate();
+    } else if (selftest_web_step == 1 and sys.getenv("TT_SELFTEST_EVAL") != null) {
+        selftestEval(app, t, sys.getenv("TT_SELFTEST_EVAL").?);
+    } else if (selftest_web_step == 1 and sys.getenv("TT_SELFTEST_PERMISSIONS") != null) {
+        selftestPermissions(app, t);
     } else if (selftest_web_step == 1 and t >= 8.5 and sys.getenv("TT_SELFTEST_WEBMENU") != null) {
         // The page's context menu, without the menu (which is modal): the
         // entries the app adds for the selection and the link the page
@@ -1216,6 +1462,180 @@ fn selftestWeb(t: f64, url: []const u8) void {
         if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
         msg(void, g.nsapp, "terminate:", .{@as(id, null)});
     }
+}
+
+/// TT_SELFTEST_EVAL='js' (with TT_SELFTEST_URL): the JavaScript runs in the
+/// page's own world once it has loaded, and whatever it puts in
+/// document.title is printed a moment later — a quick probe of what the
+/// page sees (`navigator.mediaDevices`, `isSecureContext` …).
+var selftest_eval_step: u8 = 0;
+
+fn selftestEval(app: *app_mod.App, t: f64, js: []const u8) void {
+    var page: ?*WebTab = null;
+    for (app.tabs.items()) |tab| {
+        if (WebTab.fromTab(tab)) |w| {
+            page = w;
+            break;
+        }
+    }
+    const w = page orelse return;
+    if (selftest_eval_step == 0 and t >= 8.5) {
+        selftest_eval_step = 1;
+        w.evalPage(js);
+    } else if (selftest_eval_step == 1 and t >= 10) {
+        selftest_eval_step = 2;
+        std.debug.print("selftest: eval url='{s}' title={s}\n", .{ w.url.items, w.page_title.items });
+        msg(void, g.nsapp, "terminate:", .{@as(id, null)});
+    }
+}
+
+/// TT_SELFTEST_PERMISSIONS=1 (with TT_SELFTEST_URL on a page that asks to
+/// show notifications as it loads and defines `startGum()`; TT_NOTIFY_DRYRUN=1
+/// so nothing reaches Notification Center; TT_SELFTEST_MOCK_CAPTURE=1 for
+/// stand-in cameras, as a real getUserMedia would raise macOS's privacy
+/// prompt; a throwaway HOME, as answers are saved): replaces the palette
+/// steps of the website leg. The page's report (its title, JSON) is printed
+/// at each step. In order: the notification question is on show in the bar
+/// ("-ask" capture) and is answered Allow — the page's promise resolves and
+/// its `new Notification` goes to notify.zig with the site's favicon (the
+/// dry run prints it); a click on the notification brings the page's tab
+/// back and reaches its onclick; the camera/microphone answers reach a
+/// stand-in decision block; the page's own getUserMedia goes through
+/// WebKit's block to the bar ("-callask"), is allowed, and the indicators
+/// show the capture (muting the camera from them); last, `window.open`
+/// makes a new tab that keeps its opener, closes itself, and hands the
+/// front back to the page.
+var selftest_perm_step: u8 = 0;
+var selftest_perm_tab: ?*WebTab = null;
+var selftest_perm_origin_buf: [256]u8 = undefined;
+var selftest_perm_origin: []const u8 = "";
+
+const PermProbe = struct {
+    var block: objc.Block = undefined;
+    var got: [4]NSInteger = .{ -1, -1, -1, -1 };
+    var n: usize = 0;
+    fn decided(_: *objc.Block, decision: NSInteger) callconv(.c) void {
+        if (n < got.len) {
+            got[n] = decision;
+            n += 1;
+        }
+    }
+};
+
+/// The fixture's own tab, while it is still open (a popup may be in front,
+/// and tabs close under the test).
+fn selftestPermTab(app: *app_mod.App) ?*WebTab {
+    const want = selftest_perm_tab orelse return null;
+    for (app.tabs.items()) |tab| {
+        if (tab.ptr == @as(*anyopaque, want)) return want;
+    }
+    std.debug.print("selftest: the fixture's tab is gone\n", .{});
+    return null;
+}
+
+fn selftestPermissions(app: *app_mod.App, t: f64) void {
+    if (selftest_perm_step == 0 and t >= 8.5) {
+        selftest_perm_step = 1;
+        selftestListWebTabs(app, "at the start");
+        const url = sys.getenv("TT_SELFTEST_URL") orelse return;
+        for (app.tabs.items()) |tab| {
+            const w = WebTab.fromTab(tab) orelse continue;
+            if (std.mem.eql(u8, w.url.items, url)) selftest_perm_tab = w;
+        }
+        const w = selftest_perm_tab orelse {
+            std.debug.print("selftest: no website tab on {s}\n", .{url});
+            return;
+        };
+        std.debug.print("selftest: page report {s}\n", .{w.page_title.items});
+        const media_sel = msg(bool, w.delegate, "respondsToSelector:", .{objc.sel("webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:")});
+        std.debug.print("selftest: media delegate method={} waiting={d} status={s}\n", .{ media_sel, w.prompts.items.len, @tagName(w.status()) });
+        if (w.prompts.items.len > 0) {
+            const p = w.prompts.items[0];
+            const n = @min(p.origin.len, selftest_perm_origin_buf.len);
+            @memcpy(selftest_perm_origin_buf[0..n], p.origin[0..n]);
+            selftest_perm_origin = selftest_perm_origin_buf[0..n];
+            std.debug.print("selftest: bar asks: '{s}' {s}\n", .{ p.origin, p.question() });
+        }
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| selftestCaptureSuffixed(path, "-ask");
+        std.debug.print("selftest: Allow\n", .{});
+        w.answer(true, true);
+    } else if (selftest_perm_step == 1 and t >= 10) {
+        selftest_perm_step = 2;
+        const w = selftestPermTab(app) orelse return;
+        std.debug.print("selftest: page report {s}\n", .{w.page_title.items});
+        std.debug.print("selftest: kept for the site: notifications={s}\n", .{@tagName(cfg_mod.get().siteDecision(selftest_perm_origin, .notifications))});
+        std.debug.print("selftest: clicking the notification\n", .{});
+        // Show another tab first: the click must bring the page's tab back.
+        _ = app.tabs.openWith("terminal", .{}) catch {};
+        notify.simulateClick(w.serial, 1, selftest_perm_origin);
+    } else if (selftest_perm_step == 2 and t >= 11) {
+        selftest_perm_step = 3;
+        const w = selftestPermTab(app) orelse return;
+        const cur = app.tabs.current();
+        std.debug.print("selftest: page report {s}\n", .{w.page_title.items});
+        std.debug.print("selftest: after the click the tab in front is the page's: {}\n", .{cur != null and cur.?.ptr == @as(*anyopaque, w)});
+
+        // Camera and microphone: WebKit's decision block, answered by the bar.
+        PermProbe.block = objc.Block.global(@ptrCast(&PermProbe.decided), @sizeOf(objc.Block));
+        const blk: ?*anyopaque = @ptrCast(&PermProbe.block);
+        w.ask("https://cam.selftest.example", .{ .camera = true, .microphone = true }, blk);
+        std.debug.print("selftest: media asked → waiting={d} question='{s}'\n", .{ w.prompts.items.len, if (w.prompts.items.len > 0) w.prompts.items[0].question() else "" });
+        w.answer(true, true);
+        w.ask("https://cam.selftest.example", .{ .camera = true }, blk);
+        w.ask("https://blocked.selftest.example", .{ .microphone = true }, blk);
+        w.answer(false, true);
+        w.ask("https://blocked.selftest.example", .{ .camera = true, .microphone = true }, blk);
+        std.debug.print("selftest: media decisions (1 grant, 2 deny) = {d} {d} {d} {d} waiting={d}\n", .{ PermProbe.got[0], PermProbe.got[1], PermProbe.got[2], PermProbe.got[3], w.prompts.items.len });
+        // A real getUserMedia (stand-in devices: TT_SELFTEST_MOCK_CAPTURE).
+        if (sys.getenv("TT_SELFTEST_MOCK_CAPTURE") != null) w.evalPage("window.startGum && startGum()");
+    } else if (selftest_perm_step == 3 and t >= 12.5) {
+        selftest_perm_step = 4;
+        const w = selftestPermTab(app) orelse return;
+        std.debug.print("selftest: after getUserMedia: waiting={d}\n", .{w.prompts.items.len});
+        if (w.prompts.items.len > 0) {
+            const p = w.prompts.items[0];
+            std.debug.print("selftest: bar asks: '{s}' {s} (WebKit's block: {})\n", .{ p.origin, p.question(), p.decide != null });
+            if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| selftestCaptureSuffixed(path, "-callask");
+            w.answer(true, true);
+        }
+    } else if (selftest_perm_step == 4 and t >= 14) {
+        selftest_perm_step = 5;
+        const w = selftestPermTab(app) orelse return;
+        std.debug.print("selftest: page report {s}\n", .{w.page_title.items});
+        std.debug.print("selftest: capture state camera={d} microphone={d} (1 live, 2 muted)\n", .{ w.camera_state, w.mic_state });
+        w.toggleCapture(true);
+    } else if (selftest_perm_step == 5 and t >= 15) {
+        selftest_perm_step = 6;
+        const w = selftestPermTab(app) orelse return;
+        std.debug.print("selftest: after muting the camera: camera={d} microphone={d}\n", .{ w.camera_state, w.mic_state });
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| selftestCaptureSuffixed(path, "-call");
+        // window.open from the page: a new tab that keeps its opener. Pages
+        // may only do that from a click; the selftest lets this one.
+        const view = w.view orelse return;
+        const prefs = msg(id, msg(id, view, "configuration", .{}), "preferences", .{});
+        msg(void, prefs, "setJavaScriptCanOpenWindowsAutomatically:", .{true});
+        w.evalPage("window.open('/popup.html')");
+    } else if (selftest_perm_step == 6 and t >= 16.5) {
+        selftest_perm_step = 7;
+        selftestListWebTabs(app, "after window.open");
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| selftestCaptureSuffixed(path, "-popup");
+    } else if (selftest_perm_step == 7 and t >= 20) {
+        selftest_perm_step = 8;
+        selftestListWebTabs(app, "after window.close()");
+        if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
+        msg(void, g.nsapp, "terminate:", .{@as(id, null)});
+    }
+}
+
+fn selftestListWebTabs(app: *app_mod.App, when: []const u8) void {
+    var n: usize = 0;
+    const cur = app.tabs.current();
+    for (app.tabs.items()) |tab| {
+        const w = WebTab.fromTab(tab) orelse continue;
+        n += 1;
+        std.debug.print("selftest: {s}: website tab url='{s}' title='{s}' front={}\n", .{ when, w.url.items, w.page_title.items, cur != null and cur.?.ptr == tab.ptr });
+    }
+    std.debug.print("selftest: {s}: website tabs={d}\n", .{ when, n });
 }
 
 /// TT_SELFTEST_WEBMENU=1 (with TT_SELFTEST_URL): what the website tab's

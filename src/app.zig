@@ -88,6 +88,10 @@ pub const Action = enum {
     web_reload,
     web_back,
     web_forward,
+    // ⌘+ / ⌘− / ⌘0: zoom the focused website's page, else the whole app.
+    zoom_in,
+    zoom_out,
+    zoom_reset,
 };
 
 pub const App = struct {
@@ -112,9 +116,20 @@ pub const App = struct {
     workspace: workspace_mod.Workspace,
     chrome: Chrome = .{},
 
+    /// `width`/`height`/`scale` are the *effective* logical size and the
+    /// logical→device factor the whole UI draws with; they fold in `zoom`.
+    /// The raw window bounds and backing factor are kept so a zoom change can
+    /// recompute them without another resize from the platform.
     width: f32,
     height: f32,
     scale: f32,
+    raw_width: f32 = 0,
+    raw_height: f32 = 0,
+    raw_scale: f32 = 0,
+    /// App-wide UI zoom (⌘+/⌘−/⌘0). 1 = native. Shrinks the logical space and
+    /// raises the effective scale to match, so every point-sized metric and
+    /// font grows together while the device pixel count stays fixed.
+    zoom: f32 = 1,
     /// Frames still to draw; input sets this to 2 so state changes made while
     /// building a frame are reflected by the next one.
     dirty: u32 = 2,
@@ -178,6 +193,9 @@ pub const App = struct {
             .width = opts.width,
             .height = opts.height,
             .scale = opts.scale,
+            .raw_width = opts.width,
+            .raw_height = opts.height,
+            .raw_scale = opts.scale,
         };
         self.text.setScale(opts.scale);
         self.dl = draw.DrawList.init(gpa, &self.text);
@@ -230,18 +248,40 @@ pub const App = struct {
     }
 
     pub fn resize(self: *App, width: f32, height: f32, scale: f32) void {
-        if (width == self.width and height == self.height and scale == self.scale) return;
-        self.width = width;
-        self.height = height;
-        self.scale = scale;
-        self.text.setScale(scale);
+        if (width == self.raw_width and height == self.raw_height and scale == self.raw_scale) return;
+        self.raw_width = width;
+        self.raw_height = height;
+        self.raw_scale = scale;
+        self.applyZoom();
+    }
+
+    /// Folds `zoom` into the effective size and scale. The device pixel count
+    /// (`width * scale`) is unchanged, so the drawable size the platform set
+    /// from the raw bounds still matches.
+    fn applyZoom(self: *App) void {
+        self.width = self.raw_width / self.zoom;
+        self.height = self.raw_height / self.zoom;
+        self.scale = self.raw_scale * self.zoom;
+        self.text.setScale(self.scale);
         self.invalidate();
+    }
+
+    /// App-wide zoom, clamped to a sensible range and stepped like a browser.
+    pub fn setZoom(self: *App, z: f32) void {
+        const clamped = std.math.clamp(z, 0.5, 3.0);
+        if (clamped == self.zoom) return;
+        self.zoom = clamped;
+        self.applyZoom();
     }
 
     // ── per-tick work ───────────────────────────────────────────────────
     /// Polls tabs; returns true when a new frame should be drawn.
     pub fn update(self: *App, now: f64) bool {
         self.now = now;
+        // Every present / snapshot follows a fresh `buildFrame`, so the draw
+        // list from before this update is never encoded again: textures let
+        // go of since then (a tab closed from its menu mid-frame) can go now.
+        self.renderer.textures.collect();
         // Every group ticks, not just the one on show: shells keep running
         // (and may exit) while another resource is on show. A tab that
         // closes itself may take its pane with it, so the pane list is
@@ -336,7 +376,14 @@ pub const App = struct {
         const dragged = self.draggedFile();
         var ctx: sidebar_mod.Context = .{ .projects = &self.projects, .tabs = &self.tabs, .dragging_file = dragged != null };
         if (self.projects.containing(cwd)) |p| ctx.current_project = p.id;
-        const side = self.sidebar.draw(ui, self.height, self.chrome, ctx);
+        // `inset_left` (where the traffic lights end) comes from the platform in
+        // window points; the sidebar lays out in the zoomed logical space, so
+        // bring it into that space too or the toggle drifts over the lights.
+        var chrome = self.chrome;
+        // The real traffic lights report window points; the fake ones (headless
+        // / selftest) are already given in logical space, so leave those alone.
+        if (!chrome.fake_lights) chrome.inset_left /= self.zoom;
+        const side = self.sidebar.draw(ui, self.height, chrome, ctx);
         self.applySidebar(side);
 
         // The files panel owns the splitter on its left edge, so it goes before the panes.
@@ -365,6 +412,7 @@ pub const App = struct {
         }
         if (pv.toggle_files) self.perform(.toggle_files);
         if (pv.file_drop) |target| self.openDroppedAt(target);
+        if (ui.edit_menu) |m| self.openEditMenu(m);
         if (pv.changed) self.invalidate();
         // The drag is over once the pane view has let go of it.
         if (self.panes.drag == null) self.file_drag.clearRetainingCapacity();
@@ -399,7 +447,24 @@ pub const App = struct {
             self.overlay.openMenu(subject, m.id, m.x, m.y);
         }
         if (side.drop_file) |drop| self.pinDropped(drop);
+        if (side.move_project) |m| {
+            if (self.projects.moveProject(m.id, m.before)) self.projects.save();
+        }
+        if (side.move_resource) |m| self.moveResource(m);
         if (side.changed) self.projects.save();
+    }
+
+    /// A resource was dragged in the sidebar: reorder it, or move it into
+    /// another project (which is then opened so it stays in view).
+    fn moveResource(self: *App, m: sidebar_mod.MoveResource) void {
+        if (!self.projects.moveResource(m.id, m.dest, m.before)) return;
+        if (m.dest == tab_mod.TabManager.default_group) {
+            self.sidebar.default_open = true;
+        } else if (self.projects.find(m.dest)) |p| {
+            p.open = true;
+            self.selected_project = p.id;
+        }
+        self.projects.save();
     }
 
     /// The menu's "New Shell Group": a new group of shells under a project
@@ -470,7 +535,7 @@ pub const App = struct {
             .default_project => &self.projects.default_icon,
             .project => if (self.projects.find(id)) |p| &p.icon else null,
             .resource => if (self.projects.findResource(id)) |f| &f.resource.icon else null,
-            .tab, .file => null,
+            .tab, .file, .edit => null,
         };
     }
 
@@ -576,6 +641,10 @@ pub const App = struct {
             .web_reload => self.tabCommand(.reload),
             .web_back => self.tabCommand(.back),
             .web_forward => self.tabCommand(.forward),
+            // A focused website zooms its page; anything else zooms the app.
+            .zoom_in => if (self.currentTabIsWeb()) self.tabCommand(.zoom_in) else self.setZoom(self.zoom + 0.1),
+            .zoom_out => if (self.currentTabIsWeb()) self.tabCommand(.zoom_out) else self.setZoom(self.zoom - 0.1),
+            .zoom_reset => if (self.currentTabIsWeb()) self.tabCommand(.zoom_reset) else self.setZoom(1),
         }
         self.invalidate();
     }
@@ -583,6 +652,11 @@ pub const App = struct {
     fn tabCommand(self: *App, cmd: tab_mod.Command) void {
         const t = self.tabs.current() orelse return;
         _ = t.vtable.command(t.ptr, cmd);
+    }
+
+    fn currentTabIsWeb(self: *App) bool {
+        const t = self.tabs.current() orelse return false;
+        return std.mem.eql(u8, t.kind, "web");
     }
 
     fn paletteSources(self: *App) palette_mod.Sources {
@@ -661,9 +735,43 @@ pub const App = struct {
                     if (TerminalTab.fromTab(t)) |term| term.askAgent(q.label, q.question);
                     if (self.env.host) |h| h.focusApp();
                 },
+                .run_in_shell => |line| if (self.idleShellTab()) |t| {
+                    if (TerminalTab.fromTab(t)) |term| _ = term.launchLine(line);
+                    if (self.env.host) |h| h.focusApp();
+                },
+                .adopt_web_view => |view| _ = self.tabs.openWith("web", .{ .web_view = view }) catch |err| {
+                    std.log.err("could not open a website tab for a new window: {s}", .{@errorName(err)});
+                    if (self.env.host) |h| h.destroyWebView(view);
+                },
+                .close_tab => |ptr| if (self.tabs.uidOf(ptr)) |uid| {
+                    _ = self.tabs.closeUid(uid);
+                    self.keepShowingSomething();
+                },
+                .reveal_tab => |ptr| if (self.tabs.uidOf(ptr)) |uid| {
+                    if (self.tabs.groupOf(uid)) |gid| {
+                        if (self.projects.find(gid)) |p| self.selected_project = p.id;
+                    }
+                    _ = self.tabs.focus(uid);
+                },
             }
         }
         self.invalidate();
+    }
+
+    /// A shell of the row on show that is free to run something, brought
+    /// to the front: the active tab when it is an idle shell, else the
+    /// first idle one in the focused pane, else a new one.
+    fn idleShellTab(self: *App) ?tab_mod.Tab {
+        if (self.tabs.current()) |t| if (TerminalTab.fromTab(t)) |term| if (term.canLaunch()) return t;
+        for (self.tabs.items()) |t| {
+            if (TerminalTab.fromTab(t)) |term| if (term.canLaunch()) {
+                _ = self.tabs.focus(t.uid);
+                return t;
+            };
+        }
+        self.newShellIn(self.tabs.groupId());
+        const t = self.tabs.current() orelse return null;
+        return if (std.mem.eql(u8, t.kind, "terminal")) t else null;
     }
 
     /// A shell of the row on show, brought to the front, for text sent from
@@ -934,8 +1042,38 @@ pub const App = struct {
             .file_named => |f| self.fileNamed(f.kind, f.name),
             .delete_file => self.askDelete(),
             .delete_confirmed => self.deleteConfirmed(),
+            .edit => |a| self.editAction(a),
         }
         self.invalidate();
+    }
+
+    /// A text surface in a tab was right-clicked: the edit menu, with the
+    /// rows that apply. The tab has the keyboard from here on (a box of
+    /// the files panel gives it up), so the rows act on that text.
+    fn openEditMenu(self: *App, m: ui_mod.EditMenu) void {
+        self.files.dropFocus();
+        const clip = self.env.getClipboard(self.gpa);
+        defer if (clip) |c| self.gpa.free(c);
+        const has_clip = if (clip) |c| c.len > 0 else false;
+        self.overlay.openEditMenu(m.x, m.y, .{
+            .cut = m.editable and m.has_selection,
+            .copy = m.has_selection,
+            .paste = m.editable and has_clip,
+        });
+    }
+
+    /// The edit menu's pick, on what has the keyboard: what ⌘X / ⌘C / ⌘V do.
+    fn editAction(self: *App, a: overlay_mod.EditAction) void {
+        switch (a) {
+            .cut, .copy => if (self.onCopy(a == .cut)) |text| {
+                defer self.gpa.free(text);
+                self.env.setClipboard(text);
+            },
+            .paste => if (self.env.getClipboard(self.gpa)) |text| {
+                defer self.gpa.free(text);
+                self.onPaste(text);
+            },
+        }
     }
 
     // ── files panel: its menu ───────────────────────────────────────────

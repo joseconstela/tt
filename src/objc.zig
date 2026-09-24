@@ -148,6 +148,81 @@ pub const AutoreleasePool = struct {
     }
 };
 
+// ── blocks ──────────────────────────────────────────────────────────────
+// Objective-C blocks by their ABI (clang's "Block Implementation
+// Specification"): an object whose `invoke` takes the block itself first,
+// then the arguments. Blocks WebKit or AppKit hand us are called with
+// `invokeBlock`; the ones we hand them are made with `Block.global`, which
+// needs no copy/dispose helpers — copying a global block returns it as is.
+
+pub const Block = extern struct {
+    isa: ?*const anyopaque,
+    flags: c_int,
+    reserved: c_int = 0,
+    invoke: *const anyopaque,
+    descriptor: *const BlockDescriptor,
+
+    /// A block that calls `func` (first parameter: the block, as `*Block`
+    /// or a struct that starts with one). Put it in static storage, or in
+    /// memory that outlives every call, as blocks of this kind are never
+    /// copied to the heap.
+    pub fn global(func: *const anyopaque, size: usize) Block {
+        return .{ .isa = &_NSConcreteGlobalBlock, .flags = block_is_global, .invoke = func, .descriptor = descriptorFor(size) };
+    }
+};
+
+pub const BlockDescriptor = extern struct { reserved: c_ulong = 0, size: c_ulong };
+
+const block_is_global: c_int = 1 << 28;
+extern "c" var _NSConcreteGlobalBlock: anyopaque;
+extern "c" fn _Block_copy(block: ?*const anyopaque) ?*anyopaque;
+extern "c" fn _Block_release(block: ?*const anyopaque) void;
+
+fn descriptorFor(size: usize) *const BlockDescriptor {
+    // The sizes in use are few (a bare block, a block with a context
+    // pointer); one descriptor each.
+    const S = struct {
+        var bare: BlockDescriptor = .{ .size = @sizeOf(Block) };
+        var with_ctx: BlockDescriptor = .{ .size = @sizeOf(Block) + @sizeOf(usize) };
+    };
+    if (size == @sizeOf(Block)) return &S.bare;
+    return &S.with_ctx;
+}
+
+/// Keeps a block that was passed in (it may live on the caller's stack)
+/// for calling later; balance with `releaseBlock`.
+pub fn copyBlock(block: ?*anyopaque) ?*anyopaque {
+    if (block == null) return null;
+    return _Block_copy(block);
+}
+
+pub fn releaseBlock(block: ?*anyopaque) void {
+    if (block != null) _Block_release(block);
+}
+
+/// Calls a block with `args` (C types; `void` result).
+pub fn invokeBlock(block: ?*anyopaque, args: anytype) void {
+    const b: *Block = @ptrCast(@alignCast(block orelse return));
+    const F = BlockFn(@TypeOf(args));
+    const fp: F = @ptrCast(@alignCast(b.invoke));
+    @call(.auto, fp, .{b} ++ args);
+}
+
+fn BlockFn(comptime Args: type) type {
+    const f = @typeInfo(Args).@"struct".fields;
+    inline for (f) |field| {
+        if (field.type == comptime_int or field.type == comptime_float)
+            @compileError("objc.invokeBlock: cast numeric literals to a concrete C type");
+    }
+    return switch (f.len) {
+        0 => *const fn (*Block) callconv(.c) void,
+        1 => *const fn (*Block, f[0].type) callconv(.c) void,
+        2 => *const fn (*Block, f[0].type, f[1].type) callconv(.c) void,
+        3 => *const fn (*Block, f[0].type, f[1].type, f[2].type) callconv(.c) void,
+        else => @compileError("objc.invokeBlock: too many arguments"),
+    };
+}
+
 /// Builder for runtime-registered classes.
 pub const ClassBuilder = struct {
     cls: Class,
@@ -173,3 +248,24 @@ pub const ClassBuilder = struct {
         return self.cls;
     }
 };
+
+test "blocks: a global block with a context is invoked with its arguments and survives a copy" {
+    const Ctx = extern struct {
+        base: Block,
+        hits: *usize,
+    };
+    const S = struct {
+        fn call(b: *Ctx, a: c_long, c: bool) callconv(.c) void {
+            if (a == 7 and c) b.hits.* += 1;
+        }
+    };
+    var hits: usize = 0;
+    var blk: Ctx = .{ .base = Block.global(@ptrCast(&S.call), @sizeOf(Ctx)), .hits = &hits };
+    invokeBlock(@ptrCast(&blk), .{ @as(c_long, 7), true });
+    // Copying a global block hands back the block itself.
+    const copied = copyBlock(@ptrCast(&blk));
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&blk)), copied);
+    invokeBlock(copied, .{ @as(c_long, 7), true });
+    releaseBlock(copied);
+    try std.testing.expectEqual(@as(usize, 2), hits);
+}

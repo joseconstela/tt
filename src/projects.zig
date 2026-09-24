@@ -240,6 +240,23 @@ pub const Projects = struct {
         _ = self.items.orderedRemove(i);
     }
 
+    /// Reorders the projects: moves project `id` so it sits just before
+    /// `before` (null: to the very end). The default project is not in this
+    /// list, so it always stays first. True when the order changed.
+    pub fn moveProject(self: *Projects, id: u32, before: ?u32) bool {
+        const from = self.indexOf(id) orelse return false;
+        var to: usize = if (before) |b| (self.indexOf(b) orelse self.items.items.len) else self.items.items.len;
+        // Insert index is expressed against the list *with the moved item
+        // still in it*; account for its removal when it sits below.
+        if (to > from) to -= 1;
+        if (to == from) return false;
+        const p = self.items.orderedRemove(from);
+        self.items.insert(self.gpa, to, p) catch {
+            self.items.append(self.gpa, p) catch {};
+        };
+        return true;
+    }
+
     /// Gives a project a name of the user's choosing; a blank name goes
     /// back to the folder's own name (as a tab's blank name restores its
     /// automatic title).
@@ -327,6 +344,50 @@ pub const Projects = struct {
             _ = list.orderedRemove(i);
             return;
         }
+    }
+
+    /// Moves resource `id` into the project whose group id is `dest` (0 =
+    /// the default project) so it sits just before `before` (a resource id
+    /// already in that project, or null to append). This both reorders a
+    /// resource within its project and moves one between projects; the
+    /// resource keeps its id, so its open tabs follow it untouched. True
+    /// when anything changed.
+    pub fn moveResource(self: *Projects, id: u32, dest: u32, before: ?u32) bool {
+        if (before != null and before.? == id) return false;
+        const found = self.findResource(id) orelse return false;
+        const src_list = self.resourcesOf(found.project);
+        var from: usize = src_list.items.len;
+        for (src_list.items, 0..) |*r, i| {
+            if (r.id == id) {
+                from = i;
+                break;
+            }
+        }
+        if (from == src_list.items.len) return false;
+
+        const dest_proj: ?*Project = if (dest == 0) null else (self.find(dest) orelse return false);
+        // No-op: dropped onto its own place (before the sibling that already
+        // follows it, or appended while already last in the same project).
+        if (found.project == dest_proj) {
+            const after: ?u32 = if (from + 1 < src_list.items.len) src_list.items[from + 1].id else null;
+            if ((before orelse 0) == (after orelse 0)) return false;
+        }
+
+        const res = src_list.orderedRemove(from);
+        const dest_list = self.resourcesOf(dest_proj);
+        var to: usize = dest_list.items.len;
+        if (before) |b| {
+            for (dest_list.items, 0..) |*r, i| {
+                if (r.id == b) {
+                    to = i;
+                    break;
+                }
+            }
+        }
+        dest_list.insert(self.gpa, to, res) catch {
+            dest_list.append(self.gpa, res) catch {};
+        };
+        return true;
     }
 
     /// A resource of any project (or the default project's) by id.
@@ -536,4 +597,70 @@ test "projects: resources and roots follow a rename or move on disk" {
     try std.testing.expectEqualStrings("/tmp/demo2", p.root);
     try std.testing.expectEqualStrings("/tmp/demo2/manual/GUIDE.md", p.resources.items[0].path);
     try std.testing.expectEqualStrings("/tmp/other/notes.txt", ps.default_resources.items[0].path);
+}
+
+test "projects: reorder projects by drag and drop" {
+    var ps = Projects.init(std.testing.allocator);
+    defer ps.deinit();
+    const a = (try ps.add("/a")).id;
+    const b = (try ps.add("/b")).id;
+    const c = (try ps.add("/c")).id;
+
+    // Move C before A: order becomes C, A, B.
+    try std.testing.expect(ps.moveProject(c, a));
+    try std.testing.expectEqual(c, ps.items.items[0].id);
+    try std.testing.expectEqual(a, ps.items.items[1].id);
+    try std.testing.expectEqual(b, ps.items.items[2].id);
+
+    // Move C to the end (null target): A, B, C.
+    try std.testing.expect(ps.moveProject(c, null));
+    try std.testing.expectEqual(a, ps.items.items[0].id);
+    try std.testing.expectEqual(b, ps.items.items[1].id);
+    try std.testing.expectEqual(c, ps.items.items[2].id);
+
+    // Dropping a project onto its own place changes nothing.
+    try std.testing.expect(!ps.moveProject(b, c)); // B is already just before C
+    try std.testing.expect(!ps.moveProject(c, null)); // C is already last
+    try std.testing.expect(!ps.moveProject(999, a)); // unknown id
+}
+
+test "projects: move resources within and between projects" {
+    var ps = Projects.init(std.testing.allocator);
+    defer ps.deinit();
+    const p = try ps.add("/p");
+    const q = try ps.add("/q");
+    const pid = p.id;
+    const qid = q.id;
+    const r1 = (try ps.addFile(p, "/p/one")).id;
+    const r2 = (try ps.addFile(p, "/p/two")).id;
+    const r3 = (try ps.addFile(p, "/p/three")).id;
+    const d1 = (try ps.addFile(null, "/x/note")).id;
+
+    // Reorder inside P: move r3 before r1 → three, one, two.
+    try std.testing.expect(ps.moveResource(r3, pid, r1));
+    try std.testing.expectEqual(r3, ps.find(pid).?.resources.items[0].id);
+    try std.testing.expectEqual(r1, ps.find(pid).?.resources.items[1].id);
+    try std.testing.expectEqual(r2, ps.find(pid).?.resources.items[2].id);
+
+    // A no-op: r1 dropped before r2, where it already sits.
+    try std.testing.expect(!ps.moveResource(r1, pid, r2));
+    // A no-op: dropping a resource before itself.
+    try std.testing.expect(!ps.moveResource(r1, pid, r1));
+
+    // Move r1 into project Q (append): Q gains it, P loses it.
+    try std.testing.expect(ps.moveResource(r1, qid, null));
+    try std.testing.expectEqual(@as(usize, 1), ps.find(qid).?.resources.items.len);
+    try std.testing.expectEqual(r1, ps.find(qid).?.resources.items[0].id);
+    try std.testing.expectEqual(@as(usize, 2), ps.find(pid).?.resources.items.len);
+    // Its id (and thus its tabs) survived the move.
+    try std.testing.expect(ps.findResource(r1).?.project.?.id == qid);
+
+    // Move a default-project resource into P, before r3.
+    try std.testing.expect(ps.moveResource(d1, pid, r3));
+    try std.testing.expectEqual(d1, ps.find(pid).?.resources.items[0].id);
+    try std.testing.expectEqual(@as(usize, 0), ps.default_resources.items.len);
+
+    // Move it back out to the default project.
+    try std.testing.expect(ps.moveResource(d1, 0, null));
+    try std.testing.expect(ps.findResource(d1).?.project == null);
 }

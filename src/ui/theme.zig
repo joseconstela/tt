@@ -10,7 +10,7 @@ const draw = @import("../gfx/draw.zig");
 const Color = draw.Color;
 const Font = draw.Font;
 
-pub const Scheme = enum { dark, light, eink };
+pub const Scheme = enum { dark, light, eink, eink_color };
 
 /// Everything that differs between the dark and the light scheme.
 pub const Palette = struct {
@@ -166,6 +166,49 @@ pub const eink_palette: Palette = .{
     },
 };
 
+/// Muted colour on paper, for the colour e-paper panels (Kaleido and the
+/// like). The same paper discipline as `eink_palette` — white grounds, ink
+/// text, borders instead of tint-only separators, and none of what a panel
+/// cannot refresh cleanly: no hover, no blinking caret, no soft shadows, no
+/// scrim — but colour is kept. Such panels show only low-saturation colour,
+/// so the accents, teal, red and ANSI ramp are desaturated mid-tones that
+/// read on white without looking like a backlit screen. The accent is NOT
+/// forced to black (that stays an `eink`-only rule), and `ink` leaves a
+/// program's own 256/true colours alone, since the panel can carry them.
+pub const eink_color_palette: Palette = .{
+    .bg = Color.hex(0xFFFFFF),
+    .bg_side = Color.hex(0xFFFFFF),
+    .bg_block = Color.hex(0xFFFFFF),
+    .bg_inset = Color.hex(0xF1F0ED),
+    .line = Color.hex(0x8A8A8A),
+    .line_strong = Color.hex(0x2A2724),
+    .bg_panel = Color.hex(0xFFFFFF),
+    .bg_panel_footer = Color.hex(0xF1F0ED),
+    .chip_active = Color.hex(0xEAE6DC),
+    .scrim = Color.transparent,
+    .text = Color.hex(0x1A1917),
+    .text_2 = Color.hex(0x4A463F),
+    .text_3 = Color.hex(0x767065),
+    .on_accent = Color.hex(0xFFFFFF),
+    .teal = Color.hex(0x2E8474),
+    .red = Color.hex(0xB0483C),
+    .red_line = Color.hex(0xCFA59D),
+    .hover = Color.transparent,
+    .pressed = Color.hex(0x000000).alpha(0.16),
+    .highlight = Color.hex(0x000000).alpha(0.10),
+    .line_highlight = Color.transparent,
+    .block_border = 1,
+    .caret_blinks = false,
+    .soft_shadow = false,
+    .accents = .{ Color.hex(0xA9853A), Color.hex(0xB57A50), Color.hex(0x7E8B44), Color.hex(0xAE6E82) },
+    .ansi = .{
+        Color.hex(0x2A2724), Color.hex(0xA9483E), Color.hex(0x4E8250), Color.hex(0x93791F),
+        Color.hex(0x4A6E9E), Color.hex(0x8C5B96), Color.hex(0x3C8478), Color.hex(0x8A8477),
+        Color.hex(0x6F695F), Color.hex(0xB86058), Color.hex(0x5E9460), Color.hex(0xA5852F),
+        Color.hex(0x5C7EA8), Color.hex(0x9A6EA2), Color.hex(0x4E9184), Color.hex(0x2A2724),
+    },
+};
+
 pub var scheme: Scheme = .dark;
 
 pub var bg = dark_palette.bg;
@@ -208,6 +251,9 @@ pub fn selection() Color {
     // A translucent accent on e-ink is black at some alpha: a mid grey that
     // would dither. A flat light grey reads the same and stays crisp.
     if (scheme == .eink) return Color.hex(0xCCCCCC);
+    // On colour e-paper a translucent accent would dither: a pale, fully
+    // opaque wash of the accent reads the same and stays crisp.
+    if (scheme == .eink_color) return .{ .r = accent.r * 0.2 + 0.8, .g = accent.g * 0.2 + 0.8, .b = accent.b * 0.2 + 0.8, .a = 1 };
     return accent.alpha(0.28);
 }
 
@@ -260,6 +306,7 @@ pub fn palette(s: Scheme) *const Palette {
         .dark => &dark_palette,
         .light => &light_palette,
         .eink => &eink_palette,
+        .eink_color => &eink_color_palette,
     };
 }
 
@@ -344,7 +391,7 @@ pub const content_max_w: f32 = 880;
 pub const pane_strip_h: f32 = 40;
 pub const pane_min: f32 = 160;
 pub const divider_w: f32 = 1;
-pub const divider_grab: f32 = 4;
+pub const divider_grab: f32 = 9;
 pub const content_pad: f32 = 24;
 pub const block_gap: f32 = 14;
 pub const block_radius: f32 = 10;

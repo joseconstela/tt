@@ -51,7 +51,10 @@ pub fn scriptPath(gpa: std.mem.Allocator, dir: []const u8) ![]const u8 {
 pub fn interpreters(gpa: std.mem.Allocator, dir: []const u8, out: *std.ArrayList([]u8)) !void {
     var found: std.ArrayList(Candidate) = .empty;
     defer found.deinit(gpa);
-    errdefer for (found.items) |cand| gpa.free(cand.path);
+    errdefer for (found.items) |cand| {
+        gpa.free(cand.path);
+        gpa.free(cand.real);
+    };
 
     var d = std.mem.trimEnd(u8, dir, "/");
     var levels: usize = 0;
@@ -82,11 +85,23 @@ pub fn interpreters(gpa: std.mem.Allocator, dir: []const u8, out: *std.ArrayList
             if (cand.tier == tier) try out.append(gpa, cand.path);
         }
     }
+    for (found.items) |cand| gpa.free(cand.real);
     found.clearRetainingCapacity();
 }
 
 const Tier = enum { env, jupyter, other };
-const Candidate = struct { path: []u8, tier: Tier };
+/// `real` is the resolved path: a `python3` link and the `python3.N` it
+/// points to are one interpreter.
+const Candidate = struct { path: []u8, real: []u8, tier: Tier };
+
+/// The resolved path of `python`, or the path itself. Owned by the caller.
+fn realOf(gpa: std.mem.Allocator, python: []const u8) ![]u8 {
+    var z: [1024]u8 = undefined;
+    var real_buf: [1024]u8 = undefined;
+    const pz = std.fmt.bufPrintZ(&z, "{s}", .{python}) catch return gpa.dupe(u8, python);
+    const r = c.realpath(pz.ptr, &real_buf) orelse return gpa.dupe(u8, python);
+    return gpa.dupe(u8, std.mem.span(r));
+}
 
 /// `python3` and every `python3.N` in `bin`, newest version first.
 fn scanDir(gpa: std.mem.Allocator, found: *std.ArrayList(Candidate), bin: []const u8) !void {
@@ -122,8 +137,9 @@ fn versionOf(name: []const u8) ?u32 {
     return 3000 + minor;
 }
 
-/// Keeps `candidate` (owned) when it exists and is new; frees it
-/// otherwise. A null tier is worked out from what is installed beside it.
+/// Keeps `candidate` (owned) when it exists and is new — by name and by
+/// what it resolves to; frees it otherwise. A null tier is worked out from
+/// what is installed beside it.
 fn consider(gpa: std.mem.Allocator, found: *std.ArrayList(Candidate), candidate: []u8, tier: ?Tier) !void {
     errdefer gpa.free(candidate);
     for (found.items) |have| {
@@ -136,8 +152,17 @@ fn consider(gpa: std.mem.Allocator, found: *std.ArrayList(Candidate), candidate:
         gpa.free(candidate);
         return;
     }
+    const real = try realOf(gpa, candidate);
+    errdefer gpa.free(real);
+    for (found.items) |have| {
+        if (std.mem.eql(u8, have.real, real)) {
+            gpa.free(real);
+            gpa.free(candidate);
+            return;
+        }
+    }
     const t = tier orelse if (hasJupyter(gpa, candidate)) Tier.jupyter else Tier.other;
-    try found.append(gpa, .{ .path = candidate, .tier = t });
+    try found.append(gpa, .{ .path = candidate, .real = real, .tier = t });
 }
 
 /// Whether jupyter_client is installed for `python`, judged from the
@@ -190,6 +215,232 @@ fn jupyterAt(gpa: std.mem.Allocator, prefix: []const u8, minor: u32, buf: []u8) 
     return sys.exists(gpa, user);
 }
 
+/// "3.12" for `python3.12` or a `python3` that links to one; "" when the
+/// name says nothing (the kernel reports the real version once up).
+pub fn versionLabel(python: []const u8, buf: []u8) []const u8 {
+    var name = sys.basename(python);
+    var z_buf: [1024]u8 = undefined;
+    var real_buf: [1024]u8 = undefined;
+    // A bare `python3`, or a virtualenv's `python`, is a link to the real
+    // `python3.N`: the link says which.
+    if ((versionOf(name) orelse 0) == 0) {
+        if (std.fmt.bufPrintZ(&z_buf, "{s}", .{python})) |z| {
+            if (c.realpath(z.ptr, &real_buf)) |real| name = sys.basename(std.mem.span(real));
+        } else |_| {}
+    }
+    const v = versionOf(name) orelse return "";
+    if (v == 0) return "";
+    return std.fmt.bufPrint(buf, "3.{d}", .{v % 1000}) catch "";
+}
+
+/// A virtual environment's Python (`<prefix>/pyvenv.cfg` exists): pip
+/// installs into it without `--user`.
+pub fn isVenv(gpa: std.mem.Allocator, python: []const u8) bool {
+    var buf: [1024]u8 = undefined;
+    const cfg = std.fmt.bufPrint(&buf, "{s}/pyvenv.cfg", .{sys.dirname(sys.dirname(python))}) catch return false;
+    return sys.exists(gpa, cfg);
+}
+
+/// Where the interpreter lives, in a word: ".venv", "conda", "Homebrew",
+/// "system" …; "" when nothing fits.
+pub fn envHint(python: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, python, "/.venv/") != null) return ".venv";
+    if (std.mem.indexOf(u8, python, "/venv/") != null) return "venv";
+    if (std.mem.indexOf(u8, python, "/.virtualenvs/") != null) return "virtualenv";
+    if (std.mem.indexOf(u8, python, "conda") != null or std.mem.indexOf(u8, python, "mamba") != null) return "conda";
+    if (std.mem.indexOf(u8, python, "/.pyenv/") != null) return "pyenv";
+    if (std.mem.startsWith(u8, python, "/opt/homebrew/")) return "Homebrew";
+    if (std.mem.startsWith(u8, python, "/usr/bin/")) return "system";
+    if (std.mem.startsWith(u8, python, "/Library/Frameworks/Python.framework/")) return "python.org";
+    if (std.mem.startsWith(u8, python, "/usr/local/")) return "/usr/local";
+    return "";
+}
+
+// ── installing ipykernel ─────────────────────────────────────────────────
+/// `python -m pip install ipykernel`, run in the background with its output
+/// kept, so the kernel picker can offer a Python that lacks Jupyter and show
+/// how the install goes. A Python outside a virtualenv gets `--user`; when
+/// pip refuses that as an externally managed environment (Homebrew's,
+/// PEP 668) the install is tried once more with `--break-system-packages`,
+/// which with `--user` touches only ~/Library/Python. Polled from the tick
+/// like the kernel; no threads.
+pub const Install = struct {
+    pub const State = enum { running, ok, failed };
+
+    gpa: std.mem.Allocator,
+    python: []u8,
+    cwd: []u8,
+    state: State = .running,
+    /// A second attempt with `--break-system-packages` is under way / done.
+    forced: bool = false,
+    /// stdout and stderr together, the last part.
+    log: std.ArrayList(u8) = .empty,
+    line_buf: std.ArrayList(u8) = .empty,
+    pid: c.pid_t = -1,
+    fd: c_int = -1,
+    exit_status: ?c_int = null,
+
+    pub fn start(gpa: std.mem.Allocator, python: []const u8, cwd: []const u8) !*Install {
+        const self = try gpa.create(Install);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .python = try gpa.dupe(u8, python), .cwd = try gpa.dupe(u8, cwd) };
+        errdefer gpa.free(self.python);
+        errdefer gpa.free(self.cwd);
+        try self.spawn();
+        return self;
+    }
+
+    pub fn destroy(self: *Install) void {
+        if (self.pid > 0 and self.exit_status == null) {
+            _ = c.kill(self.pid, .TERM);
+            var status: c_int = 0;
+            _ = c.waitpid(self.pid, &status, 0);
+        }
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.log.deinit(self.gpa);
+        self.line_buf.deinit(self.gpa);
+        self.gpa.free(self.python);
+        self.gpa.free(self.cwd);
+        self.gpa.destroy(self);
+    }
+
+    fn spawn(self: *Install) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ self.python, "-m", "pip", "install", "--disable-pip-version-check", "--no-input" });
+        if (!isVenv(self.gpa, self.python)) try argv.append(arena, "--user");
+        if (self.forced) try argv.append(arena, "--break-system-packages");
+        try argv.append(arena, "ipykernel");
+        const argv_z = try arena.alloc(?[*:0]const u8, argv.items.len + 1);
+        for (argv.items, 0..) |a, i| argv_z[i] = (try arena.dupeZ(u8, a)).ptr;
+        argv_z[argv.items.len] = null;
+
+        const environ = sys._NSGetEnviron().*;
+        var env_count: usize = 0;
+        while (environ[env_count] != null) env_count += 1;
+        const extra = [_][]const u8{ "PYTHONUNBUFFERED=1", "PIP_NO_COLOR=1", "PIP_PROGRESS_BAR=off" };
+        const envp = try arena.alloc(?[*:0]const u8, env_count + extra.len + 1);
+        for (0..env_count) |i| envp[i] = environ[i];
+        for (extra, 0..) |e, i| envp[env_count + i] = (try arena.dupeZ(u8, e)).ptr;
+        envp[env_count + extra.len] = null;
+        const cwd_z = try arena.dupeZ(u8, if (self.cwd.len == 0) "." else self.cwd);
+
+        var out_pipe: [2]c.fd_t = undefined;
+        if (c.pipe(&out_pipe) != 0) return error.PipeFailed;
+        var actions: c.posix_spawn_file_actions_t = undefined;
+        _ = c.posix_spawn_file_actions_init(&actions);
+        defer _ = c.posix_spawn_file_actions_destroy(&actions);
+        _ = c.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", @bitCast(c.O{ .ACCMODE = .RDONLY }), 0);
+        _ = c.posix_spawn_file_actions_adddup2(&actions, out_pipe[1], 1);
+        _ = c.posix_spawn_file_actions_adddup2(&actions, out_pipe[1], 2);
+        _ = c.posix_spawn_file_actions_addchdir_np(&actions, cwd_z.ptr);
+        var attr: c.posix_spawnattr_t = undefined;
+        _ = c.posix_spawnattr_init(&attr);
+        defer _ = c.posix_spawnattr_destroy(&attr);
+        _ = c.posix_spawnattr_setflags(&attr, .{ .CLOEXEC_DEFAULT = true, .SETSIGDEF = true });
+        var pid: c.pid_t = 0;
+        const rc = c.posix_spawnp(&pid, argv_z[0].?, &actions, &attr, @ptrCast(argv_z.ptr), @ptrCast(envp.ptr));
+        _ = c.close(out_pipe[1]);
+        if (rc != 0) {
+            _ = c.close(out_pipe[0]);
+            return error.SpawnFailed;
+        }
+        const flags = c.fcntl(out_pipe[0], F_GETFL);
+        _ = c.fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
+        self.pid = pid;
+        self.fd = out_pipe[0];
+        self.exit_status = null;
+        self.state = .running;
+    }
+
+    /// Reads what pip wrote and notices its end; true when anything changed.
+    pub fn poll(self: *Install) bool {
+        if (self.state != .running) return false;
+        var changed = false;
+        var buf: [8 * 1024]u8 = undefined;
+        while (self.fd >= 0) {
+            const n = c.read(self.fd, &buf, buf.len);
+            if (n > 0) {
+                self.append(buf[0..@intCast(n)]);
+                changed = true;
+                continue;
+            }
+            if (n == 0) {
+                _ = c.close(self.fd);
+                self.fd = -1;
+                break;
+            }
+            const err = __error().*;
+            if (err == EINTR) continue;
+            break; // EAGAIN
+        }
+        if (self.exit_status == null and self.pid > 0) {
+            var status: c_int = 0;
+            if (c.waitpid(self.pid, &status, WNOHANG) == self.pid) {
+                self.exit_status = status;
+                changed = true;
+            }
+        }
+        if (self.exit_status) |raw| {
+            // The pipe may still hold the last lines: drain once more.
+            if (self.fd >= 0) {
+                while (true) {
+                    const n = c.read(self.fd, &buf, buf.len);
+                    if (n > 0) {
+                        self.append(buf[0..@intCast(n)]);
+                        continue;
+                    }
+                    break;
+                }
+                _ = c.close(self.fd);
+                self.fd = -1;
+            }
+            const st: u32 = @bitCast(raw);
+            const code: i32 = if (c.W.IFEXITED(st)) c.W.EXITSTATUS(st) else -1;
+            if (code == 0) {
+                self.state = .ok;
+            } else if (!self.forced and std.mem.indexOf(u8, self.log.items, "externally-managed-environment") != null) {
+                self.forced = true;
+                self.log.clearRetainingCapacity();
+                self.pid = -1;
+                self.spawn() catch {
+                    self.state = .failed;
+                    self.log.appendSlice(self.gpa, "pip could not be started again") catch {};
+                };
+            } else {
+                self.state = .failed;
+            }
+            changed = true;
+        }
+        return changed;
+    }
+
+    fn append(self: *Install, bytes: []const u8) void {
+        if (self.log.items.len > 64 * 1024) {
+            const keep = self.log.items[self.log.items.len - 32 * 1024 ..];
+            std.mem.copyForwards(u8, self.log.items[0..keep.len], keep);
+            self.log.items.len = keep.len;
+        }
+        self.log.appendSlice(self.gpa, bytes) catch {};
+    }
+
+    /// The last non-blank line pip wrote (progress while it runs, the
+    /// reason when it failed).
+    pub fn lastLine(self: *const Install) []const u8 {
+        var text = std.mem.trimEnd(u8, self.log.items, " \r\n\t");
+        while (text.len > 0) {
+            const nl = std.mem.lastIndexOfAny(u8, text, "\r\n") orelse 0;
+            const line = std.mem.trim(u8, text[if (nl == 0) 0 else nl + 1 ..], " \t\r\n");
+            if (line.len > 0) return line;
+            if (nl == 0) break;
+            text = std.mem.trimEnd(u8, text[0..nl], " \r\n\t");
+        }
+        return "";
+    }
+};
+
 // ── events ───────────────────────────────────────────────────────────────
 pub const Phase = enum { off, launching, starting, ready, restarting, dead, failed };
 
@@ -197,6 +448,28 @@ pub const Phase = enum { off, launching, starting, ready, restarting, dead, fail
 pub const DoneStatus = enum { ok, @"error", aborted };
 
 pub const Var = struct { name: []u8, kind: []u8, value: []u8 };
+
+/// A kernelspec jupyter_client knows for the bridge's Python ("python3",
+/// "ir", "julia-1.9" …): what the kernel picker lists besides interpreters.
+pub const Spec = struct {
+    name: []u8,
+    display_name: []u8,
+    language: []u8,
+    /// The kernel's own program, when the spec says (an absolute path).
+    argv0: []u8,
+
+    pub fn deinit(self: Spec, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.display_name);
+        gpa.free(self.language);
+        gpa.free(self.argv0);
+    }
+};
+
+pub fn freeSpecs(gpa: std.mem.Allocator, list: []Spec) void {
+    for (list) |sp| sp.deinit(gpa);
+    gpa.free(list);
+}
 
 /// One line from the script, decoded. Strings are owned by the event
 /// (`deinit`); a consumer that keeps one swaps in an empty slice.
@@ -217,6 +490,8 @@ pub const Event = union(enum) {
     clear: struct { cell: []u8, wait: bool },
     done: struct { cell: []u8, status: DoneStatus, count: ?i64, ms: i64 },
     vars: []Var,
+    /// Every kernelspec the bridge's Python can start.
+    specs: []Spec,
     input_request: struct { cell: []u8, prompt: []u8, password: bool },
     memory_mb: i64,
     log: []u8,
@@ -266,6 +541,7 @@ pub const Event = union(enum) {
                 }
                 gpa.free(list);
             },
+            .specs => |list| freeSpecs(gpa, list),
             .input_request => |i| {
                 gpa.free(i.cell);
                 gpa.free(i.prompt);
@@ -410,6 +686,28 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) !?Event {
             else => {},
         };
         return .{ .vars = try list.toOwnedSlice(gpa) };
+    }
+    if (std.mem.eql(u8, ev, "specs")) {
+        var list: std.ArrayList(Spec) = .empty;
+        errdefer {
+            for (list.items) |item| item.deinit(gpa);
+            list.deinit(gpa);
+        }
+        if (get(v, "items")) |items| switch (items) {
+            .array => |a| for (a.items) |item| {
+                const name = try str(gpa, item, "name");
+                errdefer gpa.free(name);
+                const display_name = try str(gpa, item, "display_name");
+                errdefer gpa.free(display_name);
+                const language = try str(gpa, item, "language");
+                errdefer gpa.free(language);
+                const argv0 = try str(gpa, item, "argv0");
+                errdefer gpa.free(argv0);
+                try list.append(gpa, .{ .name = name, .display_name = display_name, .language = language, .argv0 = argv0 });
+            },
+            else => {},
+        };
+        return .{ .specs = try list.toOwnedSlice(gpa) };
     }
     if (std.mem.eql(u8, ev, "input_request")) return .{ .input_request = .{ .cell = try str(gpa, v, "id"), .prompt = try str(gpa, v, "prompt"), .password = boolean(v, "password") } };
     if (std.mem.eql(u8, ev, "memory")) return .{ .memory_mb = int(v, "rss_mb") orelse 0 };
@@ -712,6 +1010,12 @@ pub const Kernel = struct {
 
     pub fn requestVars(self: *Kernel) void {
         self.request("vars", null, null, null);
+    }
+
+    /// Asks for the kernelspecs again (they come by themselves once the
+    /// kernel is ready).
+    pub fn requestSpecs(self: *Kernel) void {
+        self.request("specs", null, null, null);
     }
 
     /// The answer to an `input_request`.

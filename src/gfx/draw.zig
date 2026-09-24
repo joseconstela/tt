@@ -260,6 +260,12 @@ pub const DrawList = struct {
         return w;
     }
 
+    /// Like `textRight`, truncating with an ellipsis if wider than `max_w`.
+    pub fn textRightEllipsis(self: *DrawList, font: Font, right_x: f32, center_y: f32, str: []const u8, max_w: f32, color: Color) f32 {
+        const w = @min(self.text.measure(font, str), max_w);
+        return self.textEllipsis(font, right_x - w, center_y, str, max_w, color);
+    }
+
     // ── icons ───────────────────────────────────────────────────────────
     /// Draws a stroked icon in a `size`×`size` point box at (x, y).
     pub fn icon(self: *DrawList, which: icons.Icon, x: f32, y: f32, size: f32, color: Color) void {

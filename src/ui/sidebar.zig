@@ -66,6 +66,18 @@ pub const MenuRequest = struct { target: MenuTarget, id: u32, x: f32, y: f32 };
 /// no row under the pointer (null: the app picks the selected project).
 pub const FileDrop = struct { gid: ?u32 };
 
+/// The two things a row can be dragged to reorder: a whole project, or one
+/// resource (which can also cross into another project).
+pub const DragKind = enum { project, resource };
+
+/// A project was dragged to a new spot: it should sit just before project
+/// `before` (null: at the very end). The default project never moves.
+pub const MoveProject = struct { id: u32, before: ?u32 };
+
+/// A resource was dragged: into the project whose group id is `dest` (0 for
+/// the default project), just before resource `before` (null: appended).
+pub const MoveResource = struct { id: u32, dest: u32, before: ?u32 };
+
 /// Everything the user asked for this frame; the app carries it out.
 pub const Result = struct {
     add_project: bool = false,
@@ -81,11 +93,56 @@ pub const Result = struct {
     menu: ?MenuRequest = null,
     /// A file dragged from the files panel was let go here.
     drop_file: ?FileDrop = null,
+    /// A project was dragged to a new position in the list.
+    move_project: ?MoveProject = null,
+    /// A resource was dragged within or between projects.
+    move_resource: ?MoveResource = null,
     /// A project folded or unfolded (worth persisting).
     changed: bool = false,
     /// While collapsed: where the sidebar's toggle in the titlebar band
     /// ends, so the first tab strip starts after it (0 when expanded).
     band_inset: f32 = 0,
+};
+
+/// Collects, over one frame, where a dragged resource would land: the
+/// project (group id `dest`) and the resource it would sit before (`before`,
+/// null to append). Each candidate gap is `at`; the one nearest the pointer
+/// wins, and a drop straight onto a project header (`onto`) beats them all.
+const ResDrop = struct {
+    py: f32,
+    best: f32 = std.math.floatMax(f32),
+    have: bool = false,
+    dest: u32 = 0,
+    before: ?u32 = null,
+    ind_y: f32 = 0,
+
+    fn gap(self: *ResDrop, dest: u32, before: ?u32, y: f32) void {
+        const d = @abs(self.py - y);
+        if (d >= self.best) return;
+        self.* = .{ .py = self.py, .best = d, .have = true, .dest = dest, .before = before, .ind_y = y };
+    }
+
+    /// The pointer is over a project header: move the resource in as that
+    /// project's first child. Wins over any gap.
+    fn onto(self: *ResDrop, dest: u32, first: ?u32, y: f32) void {
+        self.* = .{ .py = self.py, .best = -1, .have = true, .dest = dest, .before = first, .ind_y = y };
+    }
+};
+
+/// The same, for dragging a whole project: `before` is the project it would
+/// sit ahead of (null: last).
+const ProjDrop = struct {
+    py: f32,
+    best: f32 = std.math.floatMax(f32),
+    have: bool = false,
+    before: ?u32 = null,
+    ind_y: f32 = 0,
+
+    fn gap(self: *ProjDrop, before: ?u32, y: f32) void {
+        const d = @abs(self.py - y);
+        if (d >= self.best) return;
+        self.* = .{ .py = self.py, .best = d, .have = true, .before = before, .ind_y = y };
+    }
 };
 
 pub const Sidebar = struct {
@@ -96,9 +153,32 @@ pub const Sidebar = struct {
     scroll: f32 = 0,
     content_h: f32 = 0,
     drag_dx: f32 = 0,
+    /// A project or resource row being dragged to reorder. `moved` turns
+    /// true once the pointer leaves the spot it pressed, so a plain click
+    /// still selects the row instead of moving it.
+    drag: ?RowDrag = null,
+
+    const RowDrag = struct { kind: DragKind, id: u32, moved: bool = false };
 
     pub fn currentWidth(self: *const Sidebar) f32 {
         return if (self.collapsed) 0 else self.width;
+    }
+
+    /// A row that owns the mouse becomes the drag candidate; a small move
+    /// past the press point promotes it to an actual drag.
+    fn trackRowDrag(self: *Sidebar, ui: *Ui, kind: DragKind, id: u32, st: ui_mod.ButtonState) void {
+        if (!st.held) return;
+        if (self.drag == null) self.drag = .{ .kind = kind, .id = id };
+        if (self.drag) |*d| {
+            if (d.kind == kind and d.id == id and
+                @abs(ui.mx - ui.press_x) + @abs(ui.my - ui.press_y) > 5) d.moved = true;
+        }
+    }
+
+    /// True while `id` is the row being dragged (past the threshold).
+    fn dragActive(self: *const Sidebar, kind: DragKind, id: u32) bool {
+        const d = self.drag orelse return false;
+        return d.moved and d.kind == kind and d.id == id;
     }
 
     pub fn toggle(self: *Sidebar) void {
@@ -190,9 +270,29 @@ pub const Sidebar = struct {
         var cy = y + 10 - self.scroll;
         const top = cy;
         const default_group = tab_mod.TabManager.default_group;
-        cy = groupRow(ui, cy, w, ctx, res, .{ .gid = default_group, .name = "Default project", .icon = ctx.projects.default_icon, .open = &self.default_open, .target = .default_project, .id = 0 });
+
+        // Which reorder drag (if any) is live this frame, and where it wants
+        // to land: a gap between rows (nearest the pointer wins), or straight
+        // onto a project header (moves the resource in as its first child).
+        const drag_kind: ?DragKind = if (self.drag) |d| (if (d.moved) d.kind else null) else null;
+        var rd: ResDrop = .{ .py = ui.my };
+        var pd: ProjDrop = .{ .py = ui.my };
+
+        // The default project and its resources.
+        {
+            const hy = cy;
+            cy = self.groupRow(ui, cy, w, ctx, res, .{ .gid = default_group, .name = "Default project", .icon = ctx.projects.default_icon, .open = &self.default_open, .target = .default_project, .id = 0 });
+            if (drag_kind == .resource and pointerInBand(ui, hy, 32)) {
+                const first: ?u32 = if (ctx.projects.default_resources.items.len > 0) ctx.projects.default_resources.items[0].id else null;
+                rd.onto(default_group, first, hy + 32);
+            }
+        }
         if (self.default_open) {
-            for (ctx.projects.default_resources.items) |*r| cy = resourceRow(ui, cy, w, r, default_group, ctx, res);
+            for (ctx.projects.default_resources.items) |*r| {
+                if (drag_kind == .resource) rd.gap(default_group, r.id, cy);
+                cy = self.resourceRow(ui, cy, w, r, default_group, ctx, res);
+            }
+            if (drag_kind == .resource) rd.gap(default_group, null, cy);
         }
         if (ctx.projects.items.items.len == 0) {
             _ = dl.textEllipsis(theme.font_hint, 18, cy + 12, "No projects yet.", w - 36, theme.text_3);
@@ -200,14 +300,58 @@ pub const Sidebar = struct {
             cy += 48;
         }
         for (ctx.projects.items.items) |*p| {
-            cy = groupRow(ui, cy, w, ctx, res, .{ .gid = p.id, .name = p.name, .icon = p.icon, .open = &p.open, .current = ctx.current_project == p.id, .target = .project, .id = p.id });
+            const hy = cy;
+            if (drag_kind == .project) pd.gap(p.id, hy);
+            cy = self.groupRow(ui, cy, w, ctx, res, .{ .gid = p.id, .name = p.name, .icon = p.icon, .open = &p.open, .current = ctx.current_project == p.id, .target = .project, .id = p.id });
+            if (drag_kind == .resource and pointerInBand(ui, hy, 32)) {
+                const first: ?u32 = if (p.resources.items.len > 0) p.resources.items[0].id else null;
+                rd.onto(p.id, first, hy + 32);
+            }
             if (p.open) {
-                for (p.resources.items) |*r| cy = resourceRow(ui, cy, w, r, p.id, ctx, res);
+                for (p.resources.items) |*r| {
+                    if (drag_kind == .resource) rd.gap(p.id, r.id, cy);
+                    cy = self.resourceRow(ui, cy, w, r, p.id, ctx, res);
+                }
+                if (drag_kind == .resource) rd.gap(p.id, null, cy);
             }
         }
+        if (drag_kind == .project) pd.gap(null, cy);
         self.content_h = (cy - top) + 20;
 
+        // While the drag is live, show where it would land; on release, ask
+        // the app to carry the move out (only if let go within the sidebar).
+        if (drag_kind != null and ui.down) drawDropIndicator(ui, w, drag_kind.?, rd, pd);
+        if (ui.released) {
+            if (self.drag) |d| {
+                if (d.moved and ui.mx >= 0 and ui.mx < w and pointerInBand(ui, y, area.h)) switch (d.kind) {
+                    .resource => if (rd.have) {
+                        res.move_resource = .{ .id = d.id, .dest = rd.dest, .before = rd.before };
+                    },
+                    .project => if (pd.have) {
+                        res.move_project = .{ .id = d.id, .before = pd.before };
+                    },
+                };
+                self.drag = null;
+            }
+        }
+
         if (max_scroll > 0) drawScrollbarAxis(ui, bar, .vertical, area, self.scroll, self.content_h);
+    }
+
+    /// The pointer's y is within the band `[y0, y0 + h)`.
+    fn pointerInBand(ui: *Ui, y0: f32, h: f32) bool {
+        return ui.my >= y0 and ui.my < y0 + h;
+    }
+
+    /// A thin accent line across the sidebar at the spot a dragged row would
+    /// drop into, with a small cap at the left so it reads as an insertion.
+    fn drawDropIndicator(ui: *Ui, w: f32, kind: DragKind, rd: ResDrop, pd: ProjDrop) void {
+        const iy = switch (kind) {
+            .resource => if (rd.have) rd.ind_y else return,
+            .project => if (pd.have) pd.ind_y else return,
+        };
+        ui.dl.rrect(.{ .x = 10, .y = iy - 1.5, .w = w - 20, .h = 3 }, 1.5, theme.accent);
+        ui.dl.circle(11, iy, 3, theme.accent);
     }
 
     /// A small icon button that only shows while its row is hovered.
@@ -237,7 +381,7 @@ pub const Sidebar = struct {
     /// its hover terminal opens one more shell among them; everything else
     /// (new shell groups, rename, icon, remove) is in the context menu.
     /// Returns the y under the row.
-    fn groupRow(ui: *Ui, y: f32, w: f32, ctx: Context, res: *Result, spec: RowSpec) f32 {
+    fn groupRow(self: *Sidebar, ui: *Ui, y: f32, w: f32, ctx: Context, res: *Result, spec: RowSpec) f32 {
         const dl = ui.dl;
         const r: Rect = .{ .x = 8, .y = y, .w = w - 16, .h = 32 };
         const hovered = ui.mouseIn(r);
@@ -250,9 +394,13 @@ pub const Sidebar = struct {
         const chev: Rect = .{ .x = r.x, .y = r.y, .w = 24, .h = r.h };
         const cs = ui.button(Ui.id("sidebar.group.fold", spec.gid), chev);
         const st = ui.button(Ui.id("sidebar.group", spec.gid), r);
+        // Only real projects reorder; the default project stays first.
+        if (spec.target == .project) self.trackRowDrag(ui, .project, spec.id, st);
+        const src = spec.target == .project and self.dragActive(.project, spec.id);
         if (ui.rightClicked(r)) res.menu = .{ .target = spec.target, .id = spec.id, .x = ui.mx, .y = ui.my };
         const shown = ctx.tabs.groupId() == spec.gid;
         if (shown) dl.rrect(r, 8, theme.accent.alpha(0.14)) else ui.feedback(r, 8, st);
+        if (src) dl.rrect(r, 8, theme.accent.alpha(0.12));
         if (dropTarget(ui, ctx, r)) res.drop_file = .{ .gid = spec.gid };
         if (spec.current) dl.rrect(.{ .x = r.x + 2, .y = r.centerY() - 8, .w = 3, .h = 16 }, 1.5, theme.accent);
         _ = dl.textCentered(theme.font_section, r.x + 10, r.centerY(), if (spec.open.*) "▾" else "▸", if (cs.hover) theme.text else theme.text_3);
@@ -269,7 +417,7 @@ pub const Sidebar = struct {
                 res.changed = true;
                 res.select_project = spec.id;
             }
-        } else if (st.clicked) res.open_group = spec.gid;
+        } else if (st.clicked and !src) res.open_group = spec.gid;
         return y + 32 + 2;
     }
 
@@ -293,15 +441,18 @@ pub const Sidebar = struct {
     /// A resource under its project: a group of shells or a file, with its
     /// own set of tabs. Selected while those are in the strip; a click
     /// shows them, a right-click asks for its menu (rename, icon, remove).
-    fn resourceRow(ui: *Ui, y: f32, w: f32, r: *Resource, owner: u32, ctx: Context, res: *Result) f32 {
+    fn resourceRow(self: *Sidebar, ui: *Ui, y: f32, w: f32, r: *Resource, owner: u32, ctx: Context, res: *Result) f32 {
         const dl = ui.dl;
         const row: Rect = .{ .x = 8, .y = y, .w = w - 16, .h = 30 };
         // No buttons: a new tab comes from the strip (or ⌘T) while the
         // resource is on show.
         const st = ui.button(Ui.id("sidebar.res", r.id), row);
+        self.trackRowDrag(ui, .resource, r.id, st);
+        const src = self.dragActive(.resource, r.id);
         if (ui.rightClicked(row)) res.menu = .{ .target = .resource, .id = r.id, .x = ui.mx, .y = ui.my };
         const selected = ctx.tabs.groupId() == r.id;
         if (selected) dl.rrect(row, 8, theme.accent.alpha(0.14)) else ui.feedback(row, 8, st);
+        if (src) dl.rrect(row, 8, theme.accent.alpha(0.12));
         // A file dropped on a resource joins the resource's project.
         if (dropTarget(ui, ctx, row)) res.drop_file = .{ .gid = owner };
 
@@ -316,7 +467,7 @@ pub const Sidebar = struct {
         const right = tabsBadge(ui, ctx, r.id, if (r.kind == .shells) 1 else 2, lx, row.right() - 6, row.centerY());
         _ = dl.textEllipsis(theme.font_side, lx, row.centerY(), r.name, right - 4 - lx, if (selected or st.hover) theme.text else theme.text_2);
 
-        if (st.clicked) res.open_resource = r.id;
+        if (st.clicked and !src) res.open_resource = r.id;
         return y + 30 + 2;
     }
 

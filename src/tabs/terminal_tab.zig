@@ -10,6 +10,7 @@ const sidebar = @import("../ui/sidebar.zig");
 const gfx_text = @import("../gfx/text.zig");
 const session_mod = @import("../term/session.zig");
 const buffer_mod = @import("../term/buffer.zig");
+const selection = @import("../term/selection.zig");
 const screen_mod = @import("../term/screen.zig");
 const boxdraw = @import("../gfx/boxdraw.zig");
 const Editor = @import("../input/editor.zig").Editor;
@@ -33,7 +34,6 @@ const collapse_threshold: u32 = 30;
 const collapsed_rows: u32 = 24;
 const line_h = theme.output_line_h;
 const input_row_h: f32 = 23;
-const hint_h: f32 = 19;
 
 const note_no_agent = "No agent takes plain-English lines yet: pick one under Settings › AI › Features.";
 const note_empty_question = "Put the question after the #.";
@@ -118,9 +118,7 @@ pub const TerminalTab = struct {
 
     // Text selection inside a block's output (block id 0 = none).
     sel_block: u32 = 0,
-    sel_anchor: Pos = .{},
-    sel_head: Pos = .{},
-    sel_by_drag: bool = false,
+    sel: selection.Selection = .{},
 
     // While a full-screen program has the tab.
     was_focused: bool = true,
@@ -352,27 +350,11 @@ pub const TerminalTab = struct {
     /// Appends the text selected in a block's output.
     fn copyOutputSelection(self: *TerminalTab, out: *std.ArrayList(u8)) bool {
         if (self.sel_block == 0) return false;
-        const range = orderSelection(self.sel_anchor, self.sel_head) orelse return false;
+        const range = self.sel.range() orelse return false;
         const block = for (self.session.blocks.items) |b| {
             if (b.id == self.sel_block) break b;
         } else return false;
-        const lines = block.buf.lines.items;
-        var line = range[0].line;
-        while (line <= range[1].line and line < lines.len) : (line += 1) {
-            const cells = lines[line].cells.items;
-            const from = if (line == range[0].line) @min(range[0].cell, cells.len) else 0;
-            var to = if (line == range[1].line) @min(range[1].cell, cells.len) else cells.len;
-            // Padding the program added to the right of a line is not content.
-            if (line != range[1].line or to == cells.len) {
-                while (to > from and cells[to - 1].cp == ' ') to -= 1;
-            }
-            for (cells[from..to]) |cell| {
-                var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(cell.cp, &buf) catch continue;
-                out.appendSlice(self.gpa, buf[0..n]) catch return false;
-            }
-            if (line != range[1].line) out.append(self.gpa, '\n') catch return false;
-        }
+        selection.appendText(&block.buf, range, out, self.gpa) catch return false;
         return out.items.len > 0;
     }
 
@@ -495,6 +477,20 @@ pub const TerminalTab = struct {
     pub fn fromTab(t: tab_mod.Tab) ?*TerminalTab {
         if (!std.mem.eql(u8, t.kind, "terminal")) return null;
         return @ptrCast(@alignCast(t.ptr));
+    }
+
+    /// Whether a line sent from another tab could run here right now.
+    pub fn canLaunch(self: *const TerminalTab) bool {
+        return !self.session.busy() and self.launch == null and self.rerun == null;
+    }
+
+    /// Runs `line` here after this frame, without a history entry (a
+    /// notebook's "Fix with agent" starting the coding agent). False, and
+    /// nothing queued, when the shell is busy.
+    pub fn launchLine(self: *TerminalTab, line: []const u8) bool {
+        if (!self.canLaunch()) return false;
+        self.launch = self.gpa.dupe(u8, line) catch return false;
+        return true;
     }
 
     /// A question from elsewhere in the app (a website tab's context menu):
@@ -1473,31 +1469,18 @@ pub const TerminalTab = struct {
             const d = ui.drag(Ui.id("block.select", b.id), rows_rect);
             if (d.hover or d.dragging) ui.cursor = .ibeam;
             if (d.started or d.dragging) {
-                const pos = hitTest(b, l, x, y, cols, cell_w, ui.mx, ui.my);
+                const rows: selection.Rows = .{ .starts = b.row_starts.items, .first_row = l.first_row, .rows = l.rows, .cols = cols };
+                const pos = selection.hitTest(&b.buf, rows, x, y, cell_w, line_h, ui.mx, ui.my);
                 if (d.started) {
                     self.editor.anchor = null;
                     self.sel_block = b.id;
-                    self.sel_anchor = pos;
-                    self.sel_head = pos;
-                    const cells = b.buf.lines.items[pos.line].cells.items;
-                    if (ui.click_count >= 3) {
-                        self.sel_anchor = .{ .line = pos.line, .cell = 0 };
-                        self.sel_head = .{ .line = pos.line, .cell = cells.len };
-                    } else if (ui.click_count == 2) {
-                        var from = @min(pos.cell, cells.len);
-                        var to = from;
-                        while (from > 0 and cells[from - 1].cp != ' ') from -= 1;
-                        while (to < cells.len and cells[to].cp != ' ') to += 1;
-                        self.sel_anchor = .{ .line = pos.line, .cell = from };
-                        self.sel_head = .{ .line = pos.line, .cell = to };
-                    }
-                    self.sel_by_drag = ui.click_count < 2;
-                } else if (self.sel_block == b.id and self.sel_by_drag) {
-                    self.sel_head = pos;
+                    self.sel.press(&b.buf, pos, ui.click_count);
+                } else if (self.sel_block == b.id) {
+                    self.sel.dragTo(pos);
                 }
             }
         }
-        const sel: ?[2]Pos = if (self.sel_block == b.id) orderSelection(self.sel_anchor, self.sel_head) else null;
+        const sel: ?[2]selection.Pos = if (self.sel_block == b.id) self.sel.range() else null;
 
         // Skip rows above the viewport.
         var row = l.first_row;
@@ -1542,7 +1525,7 @@ pub const TerminalTab = struct {
             for (cells[from..to], from..) |cell, cell_idx| {
                 const st = b.buf.style(cell.style);
                 if (sel) |s| {
-                    const here: Pos = .{ .line = line_idx, .cell = cell_idx };
+                    const here: selection.Pos = .{ .line = line_idx, .cell = cell_idx };
                     if (!here.before(s[0]) and here.before(s[1])) {
                         const sw: f32 = @floatFromInt(@max(1, gfx_text.cellWidth(cell.cp)));
                         dl.rect(.{ .x = (x_px + col * cell_px) / scale, .y = y, .w = sw * cell_px / scale, .h = line_h }, theme.selection());
@@ -1823,7 +1806,7 @@ pub const TerminalTab = struct {
 
     fn inputHeight(self: *TerminalTab, ui: *Ui, box_w: f32) f32 {
         const l = self.inputLayout(ui, box_w);
-        return 16 + @as(f32, @floatFromInt(l.rows)) * input_row_h + 12 + hint_h + 14;
+        return 16 + @as(f32, @floatFromInt(l.rows)) * input_row_h + 16;
     }
 
     /// Byte offset of the character cell at (row, col) in the wrapped layout.
@@ -1964,71 +1947,11 @@ pub const TerminalTab = struct {
             const room = (r.right() - theme.block_pad_x) - (cx + 3);
             _ = dl.textEllipsis(theme.font_input, cx + 3, cy + input_row_h / 2, self.suggestion.items, room, theme.text_3);
         }
-
-        // Hint row.
-        const hy = r.bottom() - 14 - hint_h / 2;
-        var hx = px;
-        if (busy) {
-            hx += dl.textCentered(theme.font_hint, hx, hy, if (masked) "↵ Send (hidden)" else "↵ Send to program", theme.text_3) + 20;
-            hx += dl.textCentered(theme.font_hint, hx, hy, "⌃C Stop", theme.text_3) + 20;
-            _ = dl.textCentered(theme.font_hint, hx, hy, "⌃D End of input", theme.text_3);
-        } else if (self.session.dormant()) {
-            hx += dl.textCentered(theme.font_hint, hx, hy, "↵ Start shell", theme.text_3) + 20;
-            _ = dl.textCentered(theme.font_hint, hx, hy, "Type a command to run it in a fresh shell", theme.text_3);
-        } else {
-            hx += dl.textCentered(theme.font_hint, hx, hy, "↵ Run", theme.text_3) + 20;
-            hx += dl.textCentered(theme.font_hint, hx, hy, "Tab Accept suggestion", if (has_suggestion) theme.text_2 else theme.text_3) + 20;
-            var tip_buf: [128]u8 = undefined;
-            const tip = agentTip(&tip_buf);
-            const tw = ui.text.measure(theme.font_hint, tip);
-            if (r.right() - theme.block_pad_x - tw > hx + 8) {
-                _ = dl.textCentered(theme.font_hint, r.right() - theme.block_pad_x - tw, hy, tip, theme.text_3);
-            }
-        }
     }
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────
 /// A position in a block's output: logical line + cell index.
-const Pos = struct {
-    line: usize = 0,
-    cell: usize = 0,
-
-    fn before(a: Pos, b: Pos) bool {
-        return a.line < b.line or (a.line == b.line and a.cell < b.cell);
-    }
-};
-
-fn orderSelection(a: Pos, b: Pos) ?[2]Pos {
-    if (a.line == b.line and a.cell == b.cell) return null;
-    return if (a.before(b)) .{ a, b } else .{ b, a };
-}
-
-/// Maps a mouse position to the output position under it (clamped to the
-/// visible rows, so dragging past the edges selects up to them).
-fn hitTest(b: *Block, l: TerminalTab.BlockLayout, x: f32, rows_y: f32, cols: u32, cell_w: f32, mx: f32, my: f32) Pos {
-    const starts = b.row_starts.items;
-    const rel = @floor((my - rows_y) / line_h);
-    const max_row: f32 = @floatFromInt(l.rows -| 1);
-    const row: u32 = l.first_row + @as(u32, @intFromFloat(std.math.clamp(rel, 0, max_row)));
-
-    var lo: usize = 0;
-    var hi: usize = starts.len;
-    while (lo + 1 < hi) {
-        const mid = (lo + hi) / 2;
-        if (starts[mid] <= row) lo = mid else hi = mid;
-    }
-    const len = b.buf.lines.items[lo].cells.items.len;
-    const seg: usize = row - starts[lo];
-    const seg_start = @min(len, seg * cols);
-    const seg_end = @min(len, seg_start + cols);
-    if (rel < 0) return .{ .line = lo, .cell = seg_start };
-    if (rel > max_row) return .{ .line = lo, .cell = seg_end };
-    const c = @round((mx - x) / cell_w);
-    const span: f32 = @floatFromInt(seg_end - seg_start);
-    return .{ .line = lo, .cell = seg_start + @as(usize, @intFromFloat(std.math.clamp(c, 0, span))) };
-}
-
 /// Width `DrawList.textEllipsis` will use for `str` within `max_w`: the
 /// whole string when it fits, else the longest prefix plus the ellipsis.
 fn fitWidth(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32) f32 {
@@ -2050,16 +1973,6 @@ fn fitWidth(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32) f32 {
         w -= ui.text.advance(font, ' ');
     }
     return w + ell_w;
-}
-
-/// The hint at the right of the input box: where a line the shell does
-/// not know goes.
-fn agentTip(buf: []u8) []const u8 {
-    const cfg = config.get();
-    if (cfg.features.command_fallback_agent) |name| {
-        if (cfg.findAgentByName(name) != null) return std.fmt.bufPrint(buf, "Plain English goes to {s}", .{name}) catch "Plain English goes to the agent";
-    }
-    return "Plain English needs an agent: Settings › AI › Features";
 }
 
 fn statusText(b: *const Block, now: f64, buf: []u8) []const u8 {
@@ -2181,93 +2094,10 @@ fn cellBackground(rs: *const screen_mod.RenderState, raw: screen_mod.Cell, st: s
     return screenColors(rs, st).bg;
 }
 
-/// Greedy word wrap; calls `emit` per line when given, returns the line count.
-fn wrapLines(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32, ctx: anytype) u32 {
-    var lines: u32 = 0;
-    var start: usize = 0;
-    while (start < str.len) {
-        var end = start;
-        var last_break: ?usize = null;
-        var w: f32 = 0;
-        var it = gfx_text.Utf8Iter{ .bytes = str, .index = start };
-        while (it.next()) |cp| {
-            const adv = ui.text.advance(font, cp);
-            if (w + adv > max_w and end > start) break;
-            w += adv;
-            end = it.index;
-            if (cp == ' ') last_break = end;
-        }
-        if (end < str.len) {
-            if (last_break) |lb| end = lb;
-        }
-        ctx.line(std.mem.trimEnd(u8, str[start..end], " "));
-        lines += 1;
-        start = end;
-    }
-    return @max(lines, 1);
-}
-
-/// Word wrap that keeps the text's own line breaks: every line of `str`
-/// wraps on its own, an empty one stays an empty line. Returns the count.
-fn wrapParagraphs(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32, ctx: anytype) u32 {
-    const trimmed = std.mem.trim(u8, str, "\n");
-    var lines: u32 = 0;
-    var it = std.mem.splitScalar(u8, trimmed, '\n');
-    while (it.next()) |para| {
-        if (para.len == 0) {
-            ctx.line("");
-            lines += 1;
-        } else lines += wrapLines(ui, font, para, max_w, ctx);
-    }
-    return @max(lines, 1);
-}
-
-fn wrapParagraphCount(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32) u32 {
-    const Counter = struct {
-        fn line(_: @This(), _: []const u8) void {}
-    };
-    return wrapParagraphs(ui, font, str, max_w, Counter{});
-}
-
-fn drawWrappedParagraphs(ui: *Ui, font: ui_mod.Font, str: []const u8, x: f32, y: f32, max_w: f32, lh: f32, color: Color) f32 {
-    const Painter = struct {
-        ui: *Ui,
-        font: ui_mod.Font,
-        x: f32,
-        y: *f32,
-        lh: f32,
-        color: Color,
-        fn line(p: @This(), s: []const u8) void {
-            if (s.len > 0) _ = p.ui.dl.textCentered(p.font, p.x, p.y.* + p.lh / 2, s, p.color);
-            p.y.* += p.lh;
-        }
-    };
-    var cy = y;
-    _ = wrapParagraphs(ui, font, str, max_w, Painter{ .ui = ui, .font = font, .x = x, .y = &cy, .lh = lh, .color = color });
-    return cy;
-}
-
-fn wrapCount(ui: *Ui, font: ui_mod.Font, str: []const u8, max_w: f32) u32 {
-    const Counter = struct {
-        fn line(_: @This(), _: []const u8) void {}
-    };
-    return wrapLines(ui, font, str, max_w, Counter{});
-}
-
-fn drawWrapped(ui: *Ui, font: ui_mod.Font, str: []const u8, x: f32, y: f32, max_w: f32, lh: f32, color: Color) f32 {
-    const Painter = struct {
-        ui: *Ui,
-        font: ui_mod.Font,
-        x: f32,
-        y: *f32,
-        lh: f32,
-        color: Color,
-        fn line(p: @This(), s: []const u8) void {
-            _ = p.ui.dl.textCentered(p.font, p.x, p.y.* + p.lh / 2, s, p.color);
-            p.y.* += p.lh;
-        }
-    };
-    var cy = y;
-    _ = wrapLines(ui, font, str, max_w, Painter{ .ui = ui, .font = font, .x = x, .y = &cy, .lh = lh, .color = color });
-    return cy;
-}
+const wrap = @import("../ui/wrap.zig");
+const wrapLines = wrap.wrapLines;
+const wrapParagraphs = wrap.wrapParagraphs;
+const wrapParagraphCount = wrap.wrapParagraphCount;
+const drawWrappedParagraphs = wrap.drawWrappedParagraphs;
+const wrapCount = wrap.wrapCount;
+const drawWrapped = wrap.drawWrapped;

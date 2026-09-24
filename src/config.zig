@@ -6,11 +6,11 @@
 //! builds can read newer files.
 //!
 //!   ui:
-//!     mode: system          # dark | light | system | eink
+//!     mode: system          # dark | light | system | eink | eink-color
 //!     accent: amber         # amber | peach | lime | rose | "#RRGGBB"
 //!   screens:                # the mode to use while the window is on a display
 //!     - name: DASUNG Paperlike   # the display's name in System Settings
-//!       mode: eink               # dark | light | system | eink
+//!       mode: eink               # dark | light | system | eink | eink-color
 //!   apis:                   # (older files say `agents:`; both are read)
 //!     - name: Claude
 //!       provider: anthropic # anthropic | openai | google | mistral | ollama | custom
@@ -23,11 +23,25 @@
 //!     command_fallback_prompt: "…"
 //!     explain_agent: Claude               # an API by name; absent = off
 //!     explain_prompt: "…"
+//!     explain_in_notebooks: true          # "Explain" under a failed notebook cell too
 //!     fix_agent: auto                     # auto | off | a coding agent id (claude, codex …)
 //!     fix_prompt: "…"
+//!     fix_in_notebooks: true              # "Fix with agent" under a failed notebook cell too
 //!   notebooks:
 //!     strip_outputs: false                # save .ipynb files without their outputs
 //!     share_schema: true                  # agents asked from a notebook get variable names + types
+//!   browser:
+//!     keep_cookies: false                 # false clears cookies and site data on close
+//!     homepage: ""                        # blank = a white page
+//!     do_not_track: false
+//!     camera: ask                         # ask | allow | block, for websites that ask
+//!     microphone: ask
+//!     notifications: ask
+//!   sites:                  # what a website was allowed or refused
+//!     - origin: https://teams.microsoft.com
+//!       camera: allow                     # allow | block; absent = the default above
+//!       microphone: allow
+//!       notifications: allow
 //!
 //! In the code an "agent" is one of the APIs (a model at a provider); the
 //! coding agents installed on the Mac live in `coding_agents.zig`.
@@ -44,6 +58,7 @@ pub const Mode = enum {
     light,
     system,
     eink,
+    eink_color,
 
     pub fn label(self: Mode) []const u8 {
         return switch (self) {
@@ -51,10 +66,21 @@ pub const Mode = enum {
             .light => "Light",
             .system => "System",
             .eink => "E-ink",
+            .eink_color => "E-ink colour",
+        };
+    }
+
+    /// How the mode is written in the config file: a hyphen where the enum
+    /// tag has an underscore, so hand-editors see `eink-color`.
+    pub fn configName(self: Mode) []const u8 {
+        return switch (self) {
+            .eink_color => "eink-color",
+            else => @tagName(self),
         };
     }
 
     fn parse(s: []const u8) ?Mode {
+        if (std.ascii.eqlIgnoreCase(s, "eink-color") or std.ascii.eqlIgnoreCase(s, "eink-colour")) return .eink_color;
         inline for (std.meta.fields(Mode)) |f| {
             if (std.ascii.eqlIgnoreCase(s, f.name)) return @enumFromInt(f.value);
         }
@@ -174,10 +200,14 @@ pub const Features = struct {
     /// Name of the agent behind a failed block's "Explain", null = off.
     explain_agent: ?[]u8 = null,
     explain_prompt: []u8 = "",
+    /// "Explain" is offered under a failed notebook cell as well.
+    explain_notebooks: bool = true,
     /// The coding agent "Fix with agent" launches: a `coding_agents` id,
     /// "off", or "" (= `fix_auto`) for whichever one is installed.
     fix_agent: []u8 = "",
     fix_prompt: []u8 = "",
+    /// "Fix with agent" is offered under a failed notebook cell as well.
+    fix_notebooks: bool = true,
 
     pub const fix_auto = "";
     pub const fix_off = "off";
@@ -200,6 +230,110 @@ pub const Notebooks = struct {
     /// Tell the agent the names and types of the kernel's variables when
     /// it is asked from a notebook. Values never leave the kernel.
     share_schema: bool = true,
+};
+
+/// Website tabs (see tabs/web_tab.zig).
+pub const Browser = struct {
+    /// Keep cookies and site data between launches. Off (the default) uses a
+    /// private, in-memory store that is cleared when the app closes.
+    keep_cookies: bool = false,
+    /// The address new website tabs open on. Blank starts them on a white,
+    /// empty page with the address bar ready.
+    homepage: []u8 = "",
+    /// Send the "Do Not Track" request header with page loads.
+    do_not_track: bool = false,
+    /// What a website gets when it asks for the camera, the microphone or
+    /// to show notifications, unless `sites` says otherwise for it.
+    camera: Permission = .ask,
+    microphone: Permission = .ask,
+    notifications: Permission = .ask,
+
+    fn deinit(self: *Browser, gpa: std.mem.Allocator) void {
+        gpa.free(self.homepage);
+        self.* = .{};
+    }
+
+    pub fn default(self: *const Browser, f: SiteFeature) Permission {
+        return switch (f) {
+            .camera => self.camera,
+            .microphone => self.microphone,
+            .notifications => self.notifications,
+        };
+    }
+};
+
+/// What a website may do with something only the user can grant: ask each
+/// time (a bar under the address bar), or a standing yes or no.
+pub const Permission = enum {
+    ask,
+    allow,
+    block,
+
+    fn parse(s: []const u8) ?Permission {
+        const v = std.mem.trim(u8, s, " \t\"'");
+        if (std.ascii.eqlIgnoreCase(v, "ask")) return .ask;
+        if (std.ascii.eqlIgnoreCase(v, "allow") or std.ascii.eqlIgnoreCase(v, "allowed")) return .allow;
+        if (std.ascii.eqlIgnoreCase(v, "block") or std.ascii.eqlIgnoreCase(v, "blocked") or std.ascii.eqlIgnoreCase(v, "deny")) return .block;
+        return null;
+    }
+
+    pub fn label(self: Permission) []const u8 {
+        return switch (self) {
+            .ask => "Ask",
+            .allow => "Allow",
+            .block => "Block",
+        };
+    }
+};
+
+/// What a website has to ask for (Settings › Permissions).
+pub const SiteFeature = enum {
+    camera,
+    microphone,
+    notifications,
+
+    pub fn label(self: SiteFeature) []const u8 {
+        return switch (self) {
+            .camera => "Camera",
+            .microphone => "Microphone",
+            .notifications => "Notifications",
+        };
+    }
+};
+
+/// A website's own answers, by origin ("https://teams.microsoft.com",
+/// scheme://host[:port] as the browser means it). `.ask` = no answer kept:
+/// the default in `Browser` applies.
+pub const Site = struct {
+    origin: []u8 = "",
+    camera: Permission = .ask,
+    microphone: Permission = .ask,
+    notifications: Permission = .ask,
+
+    fn deinit(self: *Site, gpa: std.mem.Allocator) void {
+        gpa.free(self.origin);
+        self.* = .{};
+    }
+
+    pub fn get(self: *const Site, f: SiteFeature) Permission {
+        return switch (f) {
+            .camera => self.camera,
+            .microphone => self.microphone,
+            .notifications => self.notifications,
+        };
+    }
+
+    fn slot(self: *Site, f: SiteFeature) *Permission {
+        return switch (f) {
+            .camera => &self.camera,
+            .microphone => &self.microphone,
+            .notifications => &self.notifications,
+        };
+    }
+
+    fn empty(self: *const Site) bool {
+        return self.camera == .ask and self.microphone == .ask and self.notifications == .ask;
+    }
 };
 
 /// A display the window should change its mode on: the theme follows the
@@ -226,9 +360,12 @@ pub const Config = struct {
     /// Displays with a mode of their own; the window follows whichever
     /// one it is on, and `mode` applies on any other.
     screens: std.ArrayList(Screen) = .empty,
+    /// Websites' remembered answers (camera, microphone, notifications).
+    sites: std.ArrayList(Site) = .empty,
     agents: std.ArrayList(Agent) = .empty,
     features: Features = .{},
     notebooks: Notebooks = .{},
+    browser: Browser = .{},
     /// Bumped on every change, so views can notice edits made elsewhere.
     version: u64 = 0,
     /// A change waiting to be written (see `touch` / `saveIfDue`).
@@ -245,12 +382,15 @@ pub const Config = struct {
         self.agents.deinit(self.gpa);
         for (self.screens.items) |*sc| sc.deinit(self.gpa);
         self.screens.deinit(self.gpa);
+        for (self.sites.items) |*st| st.deinit(self.gpa);
+        self.sites.deinit(self.gpa);
         if (self.features.command_fallback_agent) |s| self.gpa.free(s);
         self.gpa.free(self.features.command_fallback_prompt);
         if (self.features.explain_agent) |s| self.gpa.free(s);
         self.gpa.free(self.features.explain_prompt);
         self.gpa.free(self.features.fix_agent);
         self.gpa.free(self.features.fix_prompt);
+        self.browser.deinit(self.gpa);
         if (self.path) |p| self.gpa.free(p);
         self.* = .{ .gpa = self.gpa };
     }
@@ -414,6 +554,104 @@ pub const Config = struct {
         self.changed();
     }
 
+    // ── websites' permissions ───────────────────────────────────────────
+    pub fn findSite(self: *const Config, origin: []const u8) ?*Site {
+        for (self.sites.items) |*st| {
+            if (std.mem.eql(u8, st.origin, origin)) return st;
+        }
+        return null;
+    }
+
+    /// The answer `origin` has kept for `f` (`.ask` = none).
+    pub fn siteDecision(self: *const Config, origin: []const u8, f: SiteFeature) Permission {
+        const st = self.findSite(origin) orelse return .ask;
+        return st.get(f);
+    }
+
+    /// What `origin` gets for `f`: its own answer, else the default.
+    pub fn permissionFor(self: *const Config, origin: []const u8, f: SiteFeature) Permission {
+        const own = self.siteDecision(origin, f);
+        return if (own != .ask) own else self.browser.default(f);
+    }
+
+    /// Keeps an answer for `origin` (`.ask` forgets it). A site left with
+    /// no answer at all is dropped from the list.
+    pub fn setSitePermission(self: *Config, origin: []const u8, f: SiteFeature, p: Permission) void {
+        if (origin.len == 0) return;
+        for (self.sites.items, 0..) |*st, i| {
+            if (!std.mem.eql(u8, st.origin, origin)) continue;
+            if (st.get(f) == p) return;
+            st.slot(f).* = p;
+            if (st.empty()) {
+                st.deinit(self.gpa);
+                _ = self.sites.orderedRemove(i);
+            }
+            self.changed();
+            return;
+        }
+        if (p == .ask) return;
+        const copy = self.gpa.dupe(u8, origin) catch return;
+        var st: Site = .{ .origin = copy };
+        st.slot(f).* = p;
+        self.sites.append(self.gpa, st) catch {
+            self.gpa.free(copy);
+            return;
+        };
+        self.changed();
+    }
+
+    /// Takes back the answers `origin` has kept for `features`: the site
+    /// asks again next time. A site left with no answer is dropped.
+    /// (`origin` may point into the site's own entry.)
+    pub fn removeSitePermissions(self: *Config, origin: []const u8, features: []const SiteFeature) void {
+        for (self.sites.items, 0..) |*st, i| {
+            if (!std.mem.eql(u8, st.origin, origin)) continue;
+            var any = false;
+            for (features) |f| {
+                if (st.get(f) == .ask) continue;
+                st.slot(f).* = .ask;
+                any = true;
+            }
+            if (st.empty()) {
+                st.deinit(self.gpa);
+                _ = self.sites.orderedRemove(i);
+            }
+            if (any) self.changed();
+            return;
+        }
+    }
+
+    /// `removeSitePermissions` for every site.
+    pub fn removeAllSitePermissions(self: *Config, features: []const SiteFeature) void {
+        var any = false;
+        var i = self.sites.items.len;
+        while (i > 0) {
+            i -= 1;
+            const st = &self.sites.items[i];
+            for (features) |f| {
+                if (st.get(f) == .ask) continue;
+                st.slot(f).* = .ask;
+                any = true;
+            }
+            if (st.empty()) {
+                st.deinit(self.gpa);
+                _ = self.sites.orderedRemove(i);
+            }
+        }
+        if (any) self.changed();
+    }
+
+    pub fn setDefaultPermission(self: *Config, f: SiteFeature, p: Permission) void {
+        const slot = switch (f) {
+            .camera => &self.browser.camera,
+            .microphone => &self.browser.microphone,
+            .notifications => &self.browser.notifications,
+        };
+        if (slot.* == p) return;
+        slot.* = p;
+        self.changed();
+    }
+
     // ── persistence ─────────────────────────────────────────────────────
     /// Marks the config changed; the write happens on the next `saveIfDue`
     /// after a quiet moment, or on `save`.
@@ -474,7 +712,7 @@ pub const Config = struct {
         const gpa = self.gpa;
         try out.appendSlice(gpa, "# tt settings. Changed from the Settings tab; safe to edit by hand.\n");
         try out.appendSlice(gpa, "ui:\n");
-        try out.print(gpa, "  mode: {s}   # dark | light | system | eink\n", .{@tagName(self.mode)});
+        try out.print(gpa, "  mode: {s}   # dark | light | system | eink | eink-color\n", .{self.mode.configName()});
         switch (self.accent) {
             .named => |i| try out.print(gpa, "  accent: {s}   # amber | peach | lime | rose | \"#RRGGBB\"\n", .{accent_names[@min(i, accent_names.len - 1)]}),
             .custom => |rgb| try out.print(gpa, "  accent: \"#{X:0>6}\"   # amber | peach | lime | rose | \"#RRGGBB\"\n", .{rgb}),
@@ -484,7 +722,7 @@ pub const Config = struct {
             for (self.screens.items) |sc| {
                 try out.appendSlice(gpa, "  - name: ");
                 try writeScalar(gpa, out, sc.name);
-                try out.print(gpa, "\n    mode: {s}\n", .{@tagName(sc.mode)});
+                try out.print(gpa, "\n    mode: {s}\n", .{sc.mode.configName()});
             }
         }
         if (self.agents.items.len == 0) {
@@ -510,11 +748,32 @@ pub const Config = struct {
         try writeField(gpa, out, "command_fallback_prompt", self.features.command_fallback_prompt);
         try writeOptField(gpa, out, "explain_agent", self.features.explain_agent);
         try writeField(gpa, out, "explain_prompt", self.features.explain_prompt);
+        try out.print(gpa, "  explain_in_notebooks: {s}\n", .{if (self.features.explain_notebooks) "true" else "false"});
         try writeField(gpa, out, "fix_agent", if (self.features.fixAuto()) "auto" else self.features.fix_agent);
         try writeField(gpa, out, "fix_prompt", self.features.fix_prompt);
+        try out.print(gpa, "  fix_in_notebooks: {s}\n", .{if (self.features.fix_notebooks) "true" else "false"});
         try out.appendSlice(gpa, "notebooks:\n");
         try out.print(gpa, "  strip_outputs: {s}\n", .{if (self.notebooks.strip_outputs) "true" else "false"});
         try out.print(gpa, "  share_schema: {s}\n", .{if (self.notebooks.share_schema) "true" else "false"});
+        try out.appendSlice(gpa, "browser:\n");
+        try out.print(gpa, "  keep_cookies: {s}   # false clears cookies and site data on close\n", .{if (self.browser.keep_cookies) "true" else "false"});
+        try writeField(gpa, out, "homepage", self.browser.homepage); // blank = a white page
+        try out.print(gpa, "  do_not_track: {s}\n", .{if (self.browser.do_not_track) "true" else "false"});
+        try out.print(gpa, "  camera: {s}   # ask | allow | block, for websites that ask\n", .{@tagName(self.browser.camera)});
+        try out.print(gpa, "  microphone: {s}\n", .{@tagName(self.browser.microphone)});
+        try out.print(gpa, "  notifications: {s}\n", .{@tagName(self.browser.notifications)});
+        if (self.sites.items.len > 0) {
+            try out.appendSlice(gpa, "sites:   # what a website was allowed or refused; absent = the default above\n");
+            for (self.sites.items) |st| {
+                try out.appendSlice(gpa, "  - origin: ");
+                try writeScalar(gpa, out, st.origin);
+                try out.append(gpa, '\n');
+                inline for (.{ SiteFeature.camera, SiteFeature.microphone, SiteFeature.notifications }) |f| {
+                    const p = st.get(f);
+                    if (p != .ask) try out.print(gpa, "    {s}: {s}\n", .{ @tagName(f), @tagName(p) });
+                }
+            }
+        }
     }
 
     fn writeField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
@@ -567,7 +826,7 @@ pub const Config = struct {
         return true;
     }
 
-    const Section = enum { none, ui, agents, apis, features, screens, notebooks };
+    const Section = enum { none, ui, agents, apis, features, screens, notebooks, browser, sites };
 
     /// Reads the subset `write` produces (plus hand edits of the same
     /// shape). Anything it does not understand is skipped.
@@ -609,6 +868,13 @@ pub const Config = struct {
                 .features => {
                     const kv = splitKey(body) orelse continue;
                     const f = &self.features;
+                    if (std.mem.eql(u8, kv.key, "explain_in_notebooks")) {
+                        f.explain_notebooks = isTrue(kv.value);
+                        continue;
+                    } else if (std.mem.eql(u8, kv.key, "fix_in_notebooks")) {
+                        f.fix_notebooks = isTrue(kv.value);
+                        continue;
+                    }
                     const opt_slot: ?*?[]u8 = if (std.mem.eql(u8, kv.key, "command_fallback_agent")) &f.command_fallback_agent else if (std.mem.eql(u8, kv.key, "explain_agent")) &f.explain_agent else null;
                     if (opt_slot) |slot| {
                         if (kv.value.len > 0 and !isNull(kv.value)) {
@@ -633,6 +899,40 @@ pub const Config = struct {
                         self.notebooks.strip_outputs = isTrue(kv.value);
                     } else if (std.mem.eql(u8, kv.key, "share_schema")) {
                         self.notebooks.share_schema = isTrue(kv.value);
+                    }
+                },
+                .browser => {
+                    const kv = splitKey(body) orelse continue;
+                    if (std.mem.eql(u8, kv.key, "keep_cookies")) {
+                        self.browser.keep_cookies = isTrue(kv.value);
+                    } else if (std.mem.eql(u8, kv.key, "do_not_track")) {
+                        self.browser.do_not_track = isTrue(kv.value);
+                    } else if (std.mem.eql(u8, kv.key, "homepage")) {
+                        const v = try unquote(self.gpa, kv.value);
+                        defer self.gpa.free(v);
+                        self.setString(&self.browser.homepage, v);
+                    } else if (std.meta.stringToEnum(SiteFeature, kv.key)) |f| {
+                        if (Permission.parse(kv.value)) |p| switch (f) {
+                            .camera => self.browser.camera = p,
+                            .microphone => self.browser.microphone = p,
+                            .notifications => self.browser.notifications = p,
+                        };
+                    }
+                },
+                .sites => {
+                    if (new_item) {
+                        try self.sites.append(self.gpa, .{});
+                        if (body.len == 0) continue;
+                    }
+                    if (self.sites.items.len == 0) continue;
+                    const st = &self.sites.items[self.sites.items.len - 1];
+                    const kv = splitKey(body) orelse continue;
+                    if (std.mem.eql(u8, kv.key, "origin")) {
+                        const v = try unquote(self.gpa, kv.value);
+                        defer self.gpa.free(v);
+                        self.setString(&st.origin, std.mem.trimEnd(u8, v, "/"));
+                    } else if (std.meta.stringToEnum(SiteFeature, kv.key)) |f| {
+                        if (Permission.parse(kv.value)) |p| st.slot(f).* = p;
                     }
                 },
                 .agents => unreachable,
@@ -674,6 +974,20 @@ pub const Config = struct {
                     }
                 },
             }
+        }
+        // A site without an origin or without any answer is noise; an
+        // origin listed twice keeps its first entry.
+        var si: usize = 0;
+        while (si < self.sites.items.len) {
+            const st = &self.sites.items[si];
+            var dup = false;
+            for (self.sites.items[0..si]) |earlier| {
+                if (std.mem.eql(u8, earlier.origin, st.origin)) dup = true;
+            }
+            if (st.origin.len == 0 or st.empty() or dup) {
+                st.deinit(self.gpa);
+                _ = self.sites.orderedRemove(si);
+            } else si += 1;
         }
         // A screen entry without a name matches nothing; a name listed
         // twice keeps its first entry.
@@ -922,6 +1236,26 @@ test "e-ink mode parses and round-trips" {
     try std.testing.expectEqual(Mode.eink, b.mode);
 }
 
+test "e-ink colour mode parses (hyphen or underscore) and round-trips with a hyphen" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try a.parse("ui:\n  mode: eink-color\n");
+    try std.testing.expectEqual(Mode.eink_color, a.mode);
+    try a.parse("ui:\n  mode: EInk-Colour\n");
+    try std.testing.expectEqual(Mode.eink_color, a.mode);
+    try a.parse("ui:\n  mode: eink_color\n"); // the enum tag spelling is accepted too
+    try std.testing.expectEqual(Mode.eink_color, a.mode);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try a.write(&out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "mode: eink-color") != null);
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(out.items);
+    try std.testing.expectEqual(Mode.eink_color, b.mode);
+}
+
 test "hand-written file: comments, quotes, empty list, unknown keys" {
     const gpa = std.testing.allocator;
     var c = Config.init(gpa);
@@ -1062,4 +1396,103 @@ test "notebooks: the two switches round trip and default to outputs kept, schema
     defer b.deinit();
     try b.parse(text.items);
     try std.testing.expect(b.notebooks.strip_outputs and !b.notebooks.share_schema);
+}
+
+test "browser: cookies, homepage and do-not-track round trip and default to session cookies, blank homepage" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try std.testing.expect(!a.browser.keep_cookies and a.browser.homepage.len == 0 and !a.browser.do_not_track);
+    a.browser.keep_cookies = true;
+    a.setString(&a.browser.homepage, "https://ziglang.org/");
+    a.browser.do_not_track = true;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try a.write(&text);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "browser:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "homepage: https://ziglang.org/\n") != null);
+
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(text.items);
+    try std.testing.expect(b.browser.keep_cookies and b.browser.do_not_track);
+    try std.testing.expectEqualStrings("https://ziglang.org/", b.browser.homepage);
+
+    // A blank homepage is what "start on a white page" writes and reads back.
+    var c = Config.init(gpa);
+    defer c.deinit();
+    try c.parse("browser:\n  keep_cookies: yes\n  homepage: \"\"\n  do_not_track: off\n");
+    try std.testing.expect(c.browser.keep_cookies and !c.browser.do_not_track);
+    try std.testing.expectEqualStrings("", c.browser.homepage);
+}
+
+test "sites: permissions round trip, fall back to the defaults and drop empty sites" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try std.testing.expectEqual(Permission.ask, a.permissionFor("https://teams.microsoft.com", .camera));
+    a.setDefaultPermission(.notifications, .block);
+    a.setSitePermission("https://teams.microsoft.com", .camera, .allow);
+    a.setSitePermission("https://teams.microsoft.com", .microphone, .allow);
+    a.setSitePermission("https://teams.microsoft.com", .notifications, .allow);
+    a.setSitePermission("http://localhost:8080", .camera, .block);
+    try std.testing.expectEqual(Permission.allow, a.permissionFor("https://teams.microsoft.com", .notifications));
+    try std.testing.expectEqual(Permission.block, a.permissionFor("https://example.com", .notifications));
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try a.write(&text);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "  notifications: block\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "  - origin: https://teams.microsoft.com\n    camera: allow\n    microphone: allow\n    notifications: allow\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "  - origin: http://localhost:8080\n    camera: block\n") != null);
+
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(text.items);
+    try std.testing.expectEqual(@as(usize, 2), b.sites.items.len);
+    try std.testing.expectEqual(Permission.block, b.browser.notifications);
+    try std.testing.expectEqual(Permission.allow, b.siteDecision("https://teams.microsoft.com", .microphone));
+    try std.testing.expectEqual(Permission.block, b.siteDecision("http://localhost:8080", .camera));
+    try std.testing.expectEqual(Permission.ask, b.siteDecision("http://localhost:8080", .microphone));
+
+    // Forgetting the last answer drops the site.
+    b.setSitePermission("http://localhost:8080", .camera, .ask);
+    try std.testing.expectEqual(@as(usize, 1), b.sites.items.len);
+
+    // Hand edits: a trailing slash, an unknown value, an empty entry, a duplicate.
+    var c = Config.init(gpa);
+    defer c.deinit();
+    try c.parse("sites:\n  - origin: https://a.example/\n    camera: yes-please\n    microphone: allowed\n  -\n  - origin: https://a.example\n    camera: block\n");
+    try std.testing.expectEqual(@as(usize, 1), c.sites.items.len);
+    try std.testing.expectEqualStrings("https://a.example", c.sites.items[0].origin);
+    try std.testing.expectEqual(Permission.ask, c.sites.items[0].camera);
+    try std.testing.expectEqual(Permission.allow, c.sites.items[0].microphone);
+}
+
+test "sites: removing answers, one site or all, keeps the other features" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    a.setSitePermission("https://teams.microsoft.com", .notifications, .allow);
+    a.setSitePermission("https://teams.microsoft.com", .camera, .allow);
+    a.setSitePermission("https://news.example", .notifications, .block);
+    a.setSitePermission("https://spam.example", .notifications, .allow);
+
+    // The origin handed in may be the entry's own string.
+    a.removeSitePermissions(a.sites.items[2].origin, &.{.notifications});
+    try std.testing.expectEqual(@as(usize, 2), a.sites.items.len);
+    try std.testing.expect(a.findSite("https://spam.example") == null);
+
+    const v = a.version;
+    a.removeAllSitePermissions(&.{.notifications});
+    try std.testing.expect(a.version != v);
+    // Teams keeps its camera answer; news.example had nothing else.
+    try std.testing.expectEqual(@as(usize, 1), a.sites.items.len);
+    try std.testing.expectEqual(Permission.allow, a.siteDecision("https://teams.microsoft.com", .camera));
+    try std.testing.expectEqual(Permission.ask, a.siteDecision("https://teams.microsoft.com", .notifications));
+
+    // Nothing to remove: no change recorded.
+    const v2 = a.version;
+    a.removeAllSitePermissions(&.{.notifications});
+    try std.testing.expectEqual(v2, a.version);
 }

@@ -14,6 +14,7 @@ Requests, on stdin:
   {"op": "shutdown"}                              stop it and exit
   {"op": "vars"}                                  list the user's variables
   {"op": "input", "text": "..."}                  answer an input() prompt
+  {"op": "specs"}                                 list the kernelspecs this Python knows
 
 Events, on stdout (all carry "ev"):
   kernel      state: starting | ready | restarting | dead, with the spec, the
@@ -26,6 +27,9 @@ Events, on stdout (all carry "ev"):
   clear       id, wait
   done        id, status (ok | error | aborted), count, ms
   vars        items: [{name, type, value}]
+  specs       items: [{name, display_name, language, argv0}] — every kernelspec
+              jupyter_client finds for this interpreter (sent once the kernel
+              is ready, and on request)
   input_request  id, prompt, password
   memory      rss_mb of the kernel process
   fatal       reason (no_jupyter_client | no_such_kernel | start_failed), detail
@@ -217,6 +221,10 @@ class Bridge:
         self.ops = queue.Queue()
         self.stop = False
         self.pending = {}  # msg_id → cell id
+        # Requests whose execute_reply is in but not their idle status yet:
+        # shell and iopub are separate sockets, so outputs can still arrive
+        # after the reply and must find their cell (msg_id → cell id).
+        self.finishing = {}
         self.started = {}  # cell id → time of the execute request
         self.vars_msg = None
         self.vars_text = []
@@ -281,6 +289,7 @@ class Bridge:
     def restart(self):
         emit("kernel", state="restarting", spec=self.spec)
         self.pending.clear()
+        self.finishing.clear()
         self.started.clear()
         self.vars_msg = None
         try:
@@ -346,6 +355,8 @@ class Bridge:
             self.stop = True
         elif kind == "vars":
             self.request_vars()
+        elif kind == "specs":
+            self.emit_specs()
         elif kind == "input":
             try:
                 self.kc.input(str(op.get("text", "")))
@@ -353,6 +364,28 @@ class Bridge:
                 emit("log", text="input failed: %s" % exc)
         else:
             emit("log", text="unknown op %r" % kind)
+
+    def emit_specs(self):
+        """Every kernelspec this interpreter's jupyter_client can see: the
+        picker in tt lists them (a Python from another environment shows
+        its own set)."""
+        try:
+            from jupyter_client.kernelspec import KernelSpecManager
+            found = KernelSpecManager().get_all_specs()
+        except Exception as exc:
+            emit("log", text="kernelspecs: %s" % exc)
+            return
+        items = []
+        for name in sorted(found):
+            spec = found[name].get("spec", {}) or {}
+            argv = spec.get("argv") or []
+            items.append({
+                "name": name,
+                "display_name": spec.get("display_name") or name,
+                "language": spec.get("language") or "",
+                "argv0": argv[0] if argv else "",
+            })
+        emit("specs", items=items)
 
     def request_vars(self):
         if not self.alive or self.vars_msg is not None:
@@ -374,9 +407,12 @@ class Bridge:
             elif t == "error":
                 emit("log", text="vars failed: %s" % c.get("evalue", ""))
             return
-        cell = self.pending.get(parent)
+        cell = self.pending.get(parent) or self.finishing.get(parent)
         if t == "status":
             emit("status", state=c.get("execution_state"), id=cell)
+            # Idle is the last thing a request publishes.
+            if c.get("execution_state") == "idle":
+                self.finishing.pop(parent, None)
         elif cell is None:
             return  # comms, other clients, our own silent requests
         elif t == "stream":
@@ -400,6 +436,7 @@ class Bridge:
             info = c.get("language_info", {}) or {}
             emit("kernel", state="ready", spec=self.spec, version=info.get("version", ""),
                  implementation=c.get("implementation", ""), language=info.get("name", self.spec.get("language", "")))
+            self.emit_specs()
             return
         if t == "execute_reply":
             if parent == self.vars_msg:
@@ -415,6 +452,9 @@ class Bridge:
             cell = self.pending.pop(parent, None)
             if cell is None:
                 return
+            self.finishing[parent] = cell
+            while len(self.finishing) > 64:  # an idle status that never came
+                self.finishing.pop(next(iter(self.finishing)))
             t0 = self.started.pop(cell, None)
             ms = int((time.monotonic() - t0) * 1000) if t0 else 0
             emit("done", id=cell, status=c.get("status", "ok"), count=c.get("execution_count"), ms=ms)
@@ -453,9 +493,13 @@ class Bridge:
     def pump(self):
         got = False
         if self.alive:
+            # Every output that is in goes before the shell replies, so a
+            # cell's outputs are relayed ahead of its "done".
             try:
                 self.on_iopub(self.kc.get_iopub_msg(timeout=0.02))
                 got = True
+                while True:
+                    self.on_iopub(self.kc.get_iopub_msg(timeout=0))
             except queue.Empty:
                 pass
             try:
@@ -486,6 +530,7 @@ class Bridge:
                 for cell in list(self.pending.values()):
                     emit("done", id=cell, status="aborted", count=None, ms=0)
                 self.pending.clear()
+                self.finishing.clear()
                 self.started.clear()
                 emit("kernel", state="dead", spec=self.spec)
         if self.alive and now - self.last_memory > 3.0:

@@ -2,6 +2,7 @@
 test {
     _ = @import("term/parser.zig");
     _ = @import("term/buffer.zig");
+    _ = @import("term/selection.zig");
     _ = @import("term/screen.zig");
     _ = @import("input/editor.zig");
     _ = @import("input/history.zig");
@@ -22,9 +23,11 @@ test {
     _ = @import("file_index.zig");
     _ = @import("ui/icon_spec.zig");
     _ = @import("config.zig");
+    _ = @import("objc.zig");
     _ = @import("tabs/web_tab.zig");
     _ = @import("tabs/web_bridge.zig");
     _ = @import("tabs/web_menu.zig");
+    _ = @import("platform/notify.zig");
     _ = @import("agent.zig");
     _ = @import("git.zig");
     _ = @import("coding_agents.zig");

@@ -18,9 +18,15 @@
 //!   project /path          add a folder as a project
 //!   open /path/file        open a file in a viewer tab
 //!   web https://…          open a website tab (no web view headless: the chrome only)
+//!   web_ask camera https://meet.example   the website tab on show asks (camera,
+//!                          microphone, both, notifications): the bar under the
+//!                          address bar appears unless the settings answer it
+//!   web_capture 1 2        the page's camera / microphone state (0 off, 1 live,
+//!                          2 muted): the indicators in the address field
 //!   screen Paper | Desk    the connected displays, by name; the window is on the
 //!                          first one (Settings › Mode › Per screen). No name = none known
-//!   paste some text
+//!   paste some text        (as ⌘V would; what the app copies is printed as
+//!                          `clipboard → …` and is what the edit menu's Paste gives)
 //!   snap /path/out.png
 const std = @import("std");
 const app_mod = @import("app.zig");
@@ -28,11 +34,21 @@ const appearance = @import("appearance.zig");
 const apple = @import("apple.zig");
 const sys = @import("sys.zig");
 const EditCommand = @import("events.zig").EditCommand;
+const WebTab = @import("tabs/web_tab.zig").WebTab;
 
 /// What the app puts on the clipboard is printed instead (there is no
-/// pasteboard to check headless).
+/// pasteboard to check headless), and kept for the edit menu's Paste.
+var clipboard: std.ArrayList(u8) = .empty;
+
 fn printClipboard(text: []const u8) void {
     std.debug.print("clipboard → {s}\n", .{text});
+    clipboard.clearRetainingCapacity();
+    clipboard.appendSlice(std.heap.page_allocator, text) catch {};
+}
+
+fn scriptClipboard(gpa: std.mem.Allocator) ?[]u8 {
+    if (clipboard.items.len == 0) return null;
+    return gpa.dupe(u8, clipboard.items) catch null;
 }
 
 fn pump(app: *app_mod.App, ms: f64) void {
@@ -65,6 +81,7 @@ pub fn runHeadless(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
 
     const app = try app_mod.App.create(gpa, opts, null, printClipboard);
     defer app.destroy();
+    app.env.getClipboard = scriptClipboard;
     app.chrome = .{ .inset_left = 79, .fake_lights = true };
     pump(app, 50);
 
@@ -168,6 +185,28 @@ pub fn runHeadless(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
             _ = app.tabs.openWith("web", .{ .url = if (rest.len > 0) rest else null }) catch |err| {
                 std.debug.print("script: could not open a website tab: {s}\n", .{@errorName(err)});
             };
+        } else if (std.mem.eql(u8, cmd, "web_ask") or std.mem.eql(u8, cmd, "web_capture")) {
+            const cur = app.tabs.current() orelse continue;
+            const w = WebTab.fromTab(cur) orelse {
+                std.debug.print("script: {s}: the tab on show is not a website tab\n", .{cmd});
+                continue;
+            };
+            var words = std.mem.tokenizeScalar(u8, rest, ' ');
+            const a = words.next() orelse "";
+            const b = words.next() orelse "";
+            if (std.mem.eql(u8, cmd, "web_ask")) {
+                const both = std.mem.eql(u8, a, "both");
+                w.ask(b, .{
+                    .camera = both or std.mem.eql(u8, a, "camera"),
+                    .microphone = both or std.mem.eql(u8, a, "microphone"),
+                    .notifications = std.mem.eql(u8, a, "notifications"),
+                }, null);
+                std.debug.print("script: web_ask {s} {s} → {d} waiting\n", .{ a, b, w.prompts.items.len });
+            } else {
+                w.camera_state = std.fmt.parseInt(c_long, a, 10) catch 0;
+                w.mic_state = std.fmt.parseInt(c_long, b, 10) catch 0;
+            }
+            app.invalidate();
         } else if (std.mem.eql(u8, cmd, "screen")) {
             var names_buf: [16][]const u8 = undefined;
             var n: usize = 0;

@@ -1,0 +1,117 @@
+MIT License
+
+Copyright (c) 2026 Jose Constela
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+THIRD-PARTY SOFTWARE
+================================================================================
+
+The MIT license above covers tt's own code. tt also uses the software listed
+below, each under its own license. Those licenses, not the one above, govern
+that software.
+
+
+Bundled in the tt binary or app
+-------------------------------
+
+libghostty-vt (Ghostty's terminal emulation core)
+  https://github.com/ghostty-org/ghostty  (commit bd1c82bc, pinned in build.zig.zon)
+  Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors
+  License: MIT
+
+uucode (Unicode data and grapheme breaking, used by libghostty-vt)
+  https://github.com/jacobsandlund/uucode  (commit 9d555245)
+  Copyright (c) 2026 Jacob Sandlund
+  License: MIT
+  Includes Unicode Character Database data, Copyright (c) Unicode, Inc.,
+  under the Unicode License v3, and a UTF-8 decoder by Bjoern Hoehrmann
+  under the MIT license.
+
+Wuffs (pixel format conversion for Kitty graphics, used by libghostty-vt)
+  https://github.com/google/wuffs  (commit 7411f488)
+  Copyright 2023 The Wuffs Authors
+  License: MIT or Apache License 2.0 (dual-licensed)
+
+plotly.js v2.35.2 (interactive figures in notebook outputs)
+  https://github.com/plotly/plotly.js
+  Copyright 2012-2024, Plotly, Inc.
+  License: MIT
+  Vendored as assets/notebook/plotly.min.js. It bundles these packages,
+  whose notices are in assets/notebook/plotly.min.js.LICENSE.txt:
+    - polybooljs, (c) 2016 Sean Connelly: MIT
+    - object-assign, (c) Sindre Sorhus: MIT
+    - is-buffer, ieee754 and buffer, by Feross Aboukhadijeh: MIT
+    - is-number and kind-of, (c) 2014-2015 Jon Schlinkert: MIT
+    - maplibre-gl-js v4.5.2: BSD 3-Clause
+
+Spline Sans
+  https://github.com/SorkinType/SplineSans
+  Copyright 2021 The Spline Sans Project Authors
+  License: SIL Open Font License 1.1 (assets/fonts/OFL-SplineSans.txt)
+
+Spline Sans Mono
+  https://github.com/SorkinType/SplineSansMono
+  Copyright 2022 The Spline Sans Mono Project Authors
+  License: SIL Open Font License 1.1 (assets/fonts/OFL-SplineSansMono.txt)
+
+
+Build toolchain (used to build tt, not shipped)
+-----------------------------------------------
+
+Zig 0.16 compiler and standard library
+  https://ziglang.org  (Copyright (c) Zig contributors)
+  License: MIT. Parts of the standard library are compiled into the binary.
+
+translate-c (Zig's C translation package, fetched by Ghostty's build)
+  https://github.com/ziglang/translate-c  (Copyright (c) Zig contributors)
+  License: MIT
+
+Aro (C compiler frontend, used by translate-c)
+  https://github.com/Vexu/arocc  (Copyright (c) 2021 Veikka Tuominen)
+  License: MIT; Unicode data under the Unicode License v3
+
+
+System frameworks (part of macOS, linked but not shipped)
+---------------------------------------------------------
+
+Apple Foundation, AppKit, Metal, QuartzCore, CoreFoundation, CoreGraphics,
+CoreText, ImageIO, WebKit, AVFoundation, UserNotifications and the
+Objective-C runtime (libobjc). All are Copyright (c) Apple Inc. and are
+covered by the macOS license terms.
+
+
+Used at runtime if installed (not shipped with tt)
+--------------------------------------------------
+
+zsh: the shell tt runs, with assets/shell/tt.zsh for integration. MIT-like
+  zsh license. https://www.zsh.org
+
+Python, jupyter_client and ipykernel: the Python-side notebook kernel,
+  started through assets/notebook/tt_jupyter.py. Python Software Foundation
+  License (Python) and BSD 3-Clause (Jupyter). https://jupyter.org
+
+Coding agents that "Fix with agent" can launch, each under its vendor's
+  own terms: Claude Code, Codex, Gemini CLI, OpenCode, GitHub Copilot CLI,
+  Cursor Agent, Aider and Goose.
+
+AI services the agent fallback can use, each under its provider's terms:
+  Anthropic API, OpenAI API, Google Gemini API and a local Ollama server.

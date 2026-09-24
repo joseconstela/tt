@@ -13,6 +13,8 @@ const appearance = @import("../appearance.zig");
 const apis_mod = @import("settings_apis.zig");
 const coding_mod = @import("settings_coding_agents.zig");
 const features_mod = @import("settings_features.zig");
+const browser_mod = @import("settings_browser.zig");
+const perms_mod = @import("settings_permissions.zig");
 const EditCommand = @import("../events.zig").EditCommand;
 
 const Ui = ui_mod.Ui;
@@ -29,6 +31,12 @@ pub const Page = enum {
     agents,
     mcps,
     features,
+    /// How website tabs behave: cookies, homepage, privacy.
+    browser,
+    /// What websites may use: the camera and the microphone …
+    media,
+    /// … and desktop notifications.
+    notifications,
 
     pub fn label(self: Page) []const u8 {
         return switch (self) {
@@ -38,6 +46,9 @@ pub const Page = enum {
             .agents => "Agents",
             .mcps => "MCPs",
             .features => "Features",
+            .browser => "Website tabs",
+            .media => "Camera & microphone",
+            .notifications => "Notifications",
         };
     }
 
@@ -49,6 +60,9 @@ pub const Page = enum {
             .agents => .agent,
             .mcps => .plug,
             .features => .sparkle,
+            .browser => .globe,
+            .media => .camera,
+            .notifications => .bell,
         };
     }
 
@@ -61,13 +75,16 @@ pub const Page = enum {
             .agents => "The coding agents installed on this Mac, for fixing what fails.",
             .mcps => "Model Context Protocol servers your agents can use.",
             .features => "What your APIs and agents are used for.",
+            .browser => "Cookies, homepage and privacy for website tabs.",
+            .media => "Which websites may use the camera and the microphone, for calls in a tab.",
+            .notifications => "Desktop notifications from websites, with each site's icon.",
         };
     }
 
     /// False while the page only says "coming up soon".
     pub fn ready(self: Page) bool {
         return switch (self) {
-            .mode, .theme, .apis, .agents, .features => true,
+            .mode, .theme, .apis, .agents, .features, .browser, .media, .notifications => true,
             .mcps => false,
         };
     }
@@ -91,6 +108,8 @@ pub const Section = struct {
 pub const sections = [_]Section{
     .{ .title = "UI", .pages = &.{ .mode, .theme } },
     .{ .title = "AI", .pages = &.{ .apis, .agents, .mcps, .features } },
+    .{ .title = "Browser", .pages = &.{.browser} },
+    .{ .title = "Permissions", .pages = &.{ .media, .notifications } },
 };
 
 pub const SettingsTab = struct {
@@ -104,6 +123,9 @@ pub const SettingsTab = struct {
     apis: apis_mod.Page,
     agents: coding_mod.Page,
     features: features_mod.Page,
+    browser: browser_mod.Page,
+    media: perms_mod.MediaPage,
+    notifications: perms_mod.NotificationsPage,
     /// The page drawn last frame: a switch resets the scroll and the focus.
     shown: Page = .mode,
     scroll: f32 = 0,
@@ -113,7 +135,7 @@ pub const SettingsTab = struct {
 
     pub fn create(env: *tab_mod.Env, _: tab_mod.OpenArgs) anyerror!tab_mod.Tab {
         const self = try env.gpa.create(SettingsTab);
-        self.* = .{ .gpa = env.gpa, .apis = apis_mod.Page.init(env.gpa), .agents = coding_mod.Page.init(env.gpa), .features = features_mod.Page.init(env.gpa) };
+        self.* = .{ .gpa = env.gpa, .apis = apis_mod.Page.init(env.gpa), .agents = coding_mod.Page.init(env.gpa), .features = features_mod.Page.init(env.gpa), .browser = browser_mod.Page.init(env.gpa), .media = perms_mod.MediaPage.init(env.gpa), .notifications = perms_mod.NotificationsPage.init() };
         return tab_mod.Tab.from(SettingsTab, self);
     }
 
@@ -121,6 +143,8 @@ pub const SettingsTab = struct {
         self.apis.deinit();
         self.agents.deinit();
         self.features.deinit();
+        self.browser.deinit();
+        self.media.deinit();
         self.gpa.destroy(self);
     }
 
@@ -139,6 +163,10 @@ pub const SettingsTab = struct {
         return switch (self.page) {
             .apis => self.apis.tick(now),
             .features => self.features.tick(now, active),
+            .browser => self.browser.tick(now),
+            // Only while on show: these ask macOS about devices and access.
+            .media => active and self.media.tick(now),
+            .notifications => active and self.notifications.tick(now),
             else => false,
         };
     }
@@ -148,6 +176,7 @@ pub const SettingsTab = struct {
         switch (self.page) {
             .apis => self.apis.onText(utf8),
             .features => self.features.onText(utf8),
+            .browser => self.browser.onText(utf8),
             else => {},
         }
     }
@@ -156,6 +185,7 @@ pub const SettingsTab = struct {
         switch (self.page) {
             .apis => self.apis.onMarkedText(utf8),
             .features => self.features.onMarkedText(utf8),
+            .browser => self.browser.onMarkedText(utf8),
             else => {},
         }
     }
@@ -164,6 +194,7 @@ pub const SettingsTab = struct {
         const used = switch (self.page) {
             .apis => self.apis.onEdit(cmd),
             .features => self.features.onEdit(cmd),
+            .browser => self.browser.onEdit(cmd),
             else => false,
         };
         if (used) return;
@@ -182,6 +213,7 @@ pub const SettingsTab = struct {
     pub fn onCtrl(self: *SettingsTab, key: u8) void {
         switch (self.page) {
             .apis => _ = self.apis.onCtrl(key),
+            .browser => _ = self.browser.onCtrl(key),
             else => {},
         }
     }
@@ -190,6 +222,7 @@ pub const SettingsTab = struct {
         switch (self.page) {
             .apis => self.apis.paste(utf8),
             .features => self.features.paste(utf8),
+            .browser => self.browser.paste(utf8),
             else => {},
         }
     }
@@ -198,6 +231,7 @@ pub const SettingsTab = struct {
         return switch (self.page) {
             .apis => self.apis.copy(out, cut),
             .features => self.features.copy(out, cut),
+            .browser => self.browser.copy(out, cut),
             else => false,
         };
     }
@@ -206,6 +240,7 @@ pub const SettingsTab = struct {
         return switch (self.page) {
             .apis => self.apis.hasMarkedText(),
             .features => self.features.hasMarkedText(),
+            .browser => self.browser.hasMarkedText(),
             else => false,
         };
     }
@@ -214,6 +249,7 @@ pub const SettingsTab = struct {
         return switch (self.page) {
             .apis => self.apis.caretRect(),
             .features => self.features.caretRect(),
+            .browser => self.browser.caretRect(),
             else => .{},
         };
     }
@@ -232,6 +268,7 @@ pub const SettingsTab = struct {
         if (self.page != self.shown) {
             if (self.shown == .apis) self.apis.blur();
             if (self.shown == .features) self.features.blur();
+            if (self.shown == .browser) self.browser.blur();
             self.shown = self.page;
             self.scroll = 0;
         }
@@ -262,6 +299,9 @@ pub const SettingsTab = struct {
             .apis => self.apis.draw(ui, x, y, col_w, ui.now),
             .agents => self.agents.draw(ui, x, y, col_w),
             .features => self.features.draw(ui, x, y, col_w, focused),
+            .browser => self.browser.draw(ui, x, y, col_w, ui.now),
+            .media => self.media.draw(ui, x, y, col_w, ui.now),
+            .notifications => self.notifications.draw(ui, x, y, col_w, ui.now),
             else => drawSoon(ui, x, y, col_w),
         };
 
@@ -282,7 +322,7 @@ pub const SettingsTab = struct {
     }
 
     /// The modes a chip row offers, in order.
-    const mode_choices = [_]config.Mode{ .dark, .light, .system, .eink };
+    const mode_choices = [_]config.Mode{ .dark, .light, .system, .eink, .eink_color };
 
     /// Dark, light, or macOS's choice — and, under it, a mode per display.
     fn drawMode(ui: *Ui, x: f32, y: f32, col_w: f32) f32 {
@@ -316,6 +356,7 @@ pub const SettingsTab = struct {
             .dark => "Always dark, whatever macOS is set to.",
             .light => "Always light, whatever macOS is set to.",
             .eink => "Ink on paper, for e-ink panels: black and white, no blinking, no hover, no shadows.",
+            .eink_color => "Muted colour on paper, for colour e-ink panels: no blinking, no hover, no shadows.",
         };
         _ = dl.textCentered(theme.font_hint, card.x + 18, card.bottom() + 20, note, theme.text_3);
         return drawScreens(ui, x, card.bottom() + 44, col_w);
@@ -369,7 +410,7 @@ pub const SettingsTab = struct {
                 dl.rrect(pill, 9, theme.accent.alpha(0.16));
                 _ = dl.textCentered(theme.font_chip, pill.x + 7, cy, tag, theme.text);
             }
-            // As above | Dark | Light | System | E-ink, right-aligned.
+            // As above | Dark | Light | System | E-ink | E-ink colour, right-aligned.
             const own = cfg.screenMode(name);
             var w: f32 = field.chipWidth(ui, "As above") + 6;
             for (mode_choices) |m| w += field.chipWidth(ui, m.label()) + 6;

@@ -287,12 +287,17 @@ pub const FileBrowser = struct {
     /// Switches views; the one left gives the keyboard up.
     fn setMode(self: *FileBrowser, mode: Mode) void {
         if (self.mode == mode) return;
+        self.dropFocus();
+        self.mode = mode;
+    }
+
+    /// A box of the Git or Search view gives the keyboard up (a tab took it).
+    pub fn dropFocus(self: *FileBrowser) void {
         switch (self.mode) {
             .git => self.git.dropFocus(),
             .search => self.search.dropFocus(),
             .files => {},
         }
-        self.mode = mode;
     }
 
     /// Row `i` of the branch menu was picked.
