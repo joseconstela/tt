@@ -49,7 +49,7 @@ CoreText, WebKit, AVFoundation and others are driven straight from Zig through t
 Requirements: macOS, [Zig 0.16](https://ziglang.org/download/) and the Xcode command line tools (`zig build app` also needs Xcode itself, whose `actool` compiles the app icon).
 
 ```sh
-git clone git@github.com:lab34-es/tt.git
+git clone git@github.com:joseconstela/tt.git
 cd tt
 zig build run                     # build and launch
 ```
