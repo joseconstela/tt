@@ -8,7 +8,7 @@
 //!   explain <tab> done|failed <tab> text   what the explain agent said of a failure
 //!
 //! The flags are letters: `f` ran full-screen, `a` used the alternate
-//! screen, `x` shown expanded, `g` an agent's reply (the output is what the
+//! screen, `g` an agent's reply (the output is what the
 //! agent said); `-` when none. Output lines are written as the
 //! terminal bytes that would have produced them and read back through the
 //! same parser that built them, so colours and attributes survive. A long
@@ -69,9 +69,8 @@ fn writeBlock(b: *const Block, out: *std.ArrayList(u8), raw: *std.ArrayList(u8),
     try out.print(gpa, "block\t{s}\t{d}\t{d}\t", .{ if (b.state == .failed) "failed" else "done", b.exit_code, ms });
     if (b.fullscreen) try out.append(gpa, 'f');
     if (b.used_alt_screen) try out.append(gpa, 'a');
-    if (b.expanded) try out.append(gpa, 'x');
     if (b.agent) try out.append(gpa, 'g');
-    if (!b.fullscreen and !b.used_alt_screen and !b.expanded and !b.agent) try out.append(gpa, '-');
+    if (!b.fullscreen and !b.used_alt_screen and !b.agent) try out.append(gpa, '-');
     try out.append(gpa, '\t');
     try records.escape(out, gpa, b.command);
     try out.append(gpa, '\n');
@@ -137,7 +136,6 @@ pub fn read(session: *Session, data: []const u8) void {
             b.t_end = 1 + @as(f64, @floatFromInt(std.fmt.parseInt(u64, ms, 10) catch 0)) / 1000;
             b.fullscreen = std.mem.indexOfScalar(u8, flags, 'f') != null;
             b.used_alt_screen = std.mem.indexOfScalar(u8, flags, 'a') != null;
-            b.expanded = std.mem.indexOfScalar(u8, flags, 'x') != null;
             b.agent = std.mem.indexOfScalar(u8, flags, 'g') != null;
             parser = .{};
             current = b;
@@ -185,7 +183,6 @@ test "block codec: blocks round-trip with their output, styles, notes, state and
     a.state = .done;
     a.t_start = 10;
     a.t_end = 11.5;
-    a.expanded = true;
     const b = s.restoreBlock("vim").?;
     b.state = .failed;
     b.exit_code = 2;
@@ -208,7 +205,7 @@ test "block codec: blocks round-trip with their output, styles, notes, state and
     defer out.deinit(gpa);
     try write(s, &out, gpa);
     try std.testing.expectEqualStrings(
-        "block\tdone\t0\t1500\tx\tls\\t-la\\nsecond line\n" ++
+        "block\tdone\t0\t1500\t-\tls\\t-la\\nsecond line\n" ++
             "out\tplain \\e[0;1;31mred\\e[m\n" ++
             "out\tnext\\\\line\\e[0;38;2;1;2;3m \\e[m\n" ++
             "block\tfailed\t2\t0\tfa\tvim\n" ++
@@ -228,7 +225,7 @@ test "block codec: blocks round-trip with their output, styles, notes, state and
     try std.testing.expectEqualStrings("ls\t-la\nsecond line", a2.command);
     try std.testing.expectEqual(session_mod.BlockState.done, a2.state);
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), a2.duration(0), 0.001);
-    try std.testing.expect(a2.expanded and !a2.fullscreen);
+    try std.testing.expect(!a2.fullscreen);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
     try a2.buf.appendText(&text, gpa);
@@ -242,7 +239,7 @@ test "block codec: blocks round-trip with their output, styles, notes, state and
     const b2 = t.blocks.items[1];
     try std.testing.expectEqual(session_mod.BlockState.failed, b2.state);
     try std.testing.expectEqual(@as(i32, 2), b2.exit_code);
-    try std.testing.expect(b2.fullscreen and b2.used_alt_screen and !b2.expanded);
+    try std.testing.expect(b2.fullscreen and b2.used_alt_screen);
     try std.testing.expectEqual(@as(usize, 0), b2.buf.lineCount());
     try std.testing.expectEqual(session_mod.ExplainState.done, b2.explain_state);
     try std.testing.expectEqualStrings("vim quit with an error.\n→ vim -u NONE", b2.explanation.items);
@@ -251,7 +248,7 @@ test "block codec: blocks round-trip with their output, styles, notes, state and
     try std.testing.expectEqualStrings("a note", c2.note.?);
     try std.testing.expect(c2.note_owned);
     const d2 = t.blocks.items[3];
-    try std.testing.expect(d2.agent and !d2.expanded);
+    try std.testing.expect(d2.agent);
     try std.testing.expectEqual(session_mod.ExplainState.none, d2.explain_state);
     try std.testing.expectEqual(@as(usize, 0), d2.explanation.items.len);
     try std.testing.expectEqual(session_mod.BlockState.done, d2.state);

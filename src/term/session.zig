@@ -43,9 +43,13 @@ pub const Block = struct {
     /// failed block), shown under the output and kept across relaunches.
     explanation: std.ArrayList(u8) = .empty,
     explain_state: ExplainState = .none,
+    /// Typed while another command ran: waits in `Session.queued` for its
+    /// turn. `held` = a command before it failed (or was stopped), so it
+    /// waits for the user to resume the queue or remove it.
+    queued: bool = false,
+    held: bool = false,
 
     // View state owned by the terminal tab.
-    expanded: bool = false,
     /// Wrapped-row index: row_starts[i] = first visual row of line i.
     row_starts: std.ArrayList(u32) = .empty,
     total_rows: u32 = 0,
@@ -109,7 +113,8 @@ pub const Session = struct {
     /// own the terminal (cursor hidden, bracketed paste, mouse …); they are
     /// replayed into its screen, which never saw them.
     early_modes: std.ArrayList(EarlyMode) = .empty,
-    /// Blocks waiting for the shell to become ready (owned by `blocks`).
+    /// Blocks waiting for their turn, oldest first (owned by `blocks`): the
+    /// shell is still starting, or busy with an earlier command.
     queued: std.ArrayList(*Block) = .empty,
     integration_dir: []const u8,
     user_zdotdir: []const u8,
@@ -226,9 +231,55 @@ pub const Session = struct {
         return self.phase == .pending or self.phase == .running;
     }
 
-    /// Busy, or has commands waiting for the shell to come up.
+    /// Busy, or has commands that will run without the user's say
+    /// (queued ones on hold wait for it).
     pub fn working(self: *const Session) bool {
-        return self.busy() or self.queued.items.len > 0;
+        return self.busy() or self.nextQueued() != null;
+    }
+
+    /// The queued block that runs next: the oldest not on hold.
+    pub fn nextQueued(self: *const Session) ?usize {
+        for (self.queued.items, 0..) |b, i| if (!b.held) return i;
+        return null;
+    }
+
+    /// Queued blocks on hold after a failure.
+    pub fn heldCount(self: *const Session) usize {
+        var n: usize = 0;
+        for (self.queued.items) |b| n += @intFromBool(b.held);
+        return n;
+    }
+
+    /// Takes a queued block out of the queue and the tab before it ran;
+    /// false when it is not waiting (any more).
+    pub fn unqueue(self: *Session, id: u32) bool {
+        const qi = for (self.queued.items, 0..) |b, i| {
+            if (b.id == id) break i;
+        } else return false;
+        const b = self.queued.orderedRemove(qi);
+        if (std.mem.indexOfScalar(*Block, self.blocks.items, b)) |bi| _ = self.blocks.orderedRemove(bi);
+        self.freeBlock(b);
+        return true;
+    }
+
+    /// Lets the block `id` run again, with the blocks on hold right after
+    /// it in the tab (held by the same failure), in the order they were typed.
+    pub fn resumeFrom(self: *Session, id: u32) void {
+        const first = for (self.blocks.items, 0..) |b, i| {
+            if (b.id == id) break i;
+        } else return;
+        for (self.blocks.items[first..]) |b| {
+            if (!b.queued or !b.held) break;
+            b.held = false;
+        }
+        self.runNext();
+    }
+
+    /// Starts the next queued block when the shell sits at its prompt.
+    fn runNext(self: *Session) void {
+        if (self.phase != .idle) return;
+        const i = self.nextQueued() orelse return;
+        self.dispatch(self.queued.orderedRemove(i));
     }
 
     fn newBlock(self: *Session, command: []const u8) ?*Block {
@@ -275,14 +326,18 @@ pub const Session = struct {
         };
         const b = self.newBlock(command) orelse return;
         b.t_start = self.now;
-        if (self.phase == .idle and self.queued.items.len == 0) {
+        // Blocks on hold do not stand in the way of a new command.
+        if (self.phase == .idle and self.nextQueued() == null) {
             self.dispatch(b);
         } else {
+            b.queued = true;
             self.queued.append(self.gpa, b) catch {};
         }
     }
 
     fn dispatch(self: *Session, b: *Block) void {
+        b.queued = false;
+        b.held = false;
         b.t_start = self.now;
         self.current = b;
         self.phase = .pending;
@@ -572,14 +627,19 @@ pub const Session = struct {
                 'D' => {
                     var code: i32 = 0;
                     if (rest.len > 2) code = std.fmt.parseInt(i32, rest[2..], 10) catch 0;
-                    if (self.busy()) self.finishCurrent(code);
+                    if (self.busy()) {
+                        self.finishCurrent(code);
+                        // What was typed after a command that failed (or was
+                        // stopped) was meant for its success: it waits.
+                        if (code != 0) for (self.queued.items) |b| {
+                            b.held = true;
+                        };
+                    }
                     self.phase = .idle;
                 },
                 'A' => {
                     if (self.phase == .starting) self.phase = .idle;
-                    if (self.phase == .idle and self.queued.items.len > 0) {
-                        self.dispatch(self.queued.orderedRemove(0));
-                    }
+                    self.runNext();
                 },
                 else => {},
             }
@@ -597,3 +657,63 @@ pub const Session = struct {
         }
     }
 };
+
+test "session: commands typed while one runs wait their turn; a failure holds them" {
+    const gpa = std.testing.allocator;
+    const s = try Session.create(gpa, .{ .integration_dir = "", .user_zdotdir = "", .cwd = "/" });
+    defer s.deinit();
+    // A shell at its prompt (no process: the PTY only buffers what is sent).
+    s.phase = .idle;
+
+    s.submit("make");
+    try std.testing.expect(s.busy());
+    s.submit("make test");
+    s.submit("deploy");
+    try std.testing.expectEqual(@as(usize, 2), s.queued.items.len);
+    try std.testing.expect(s.queued.items[0].queued and !s.queued.items[0].held);
+
+    // "make" succeeds: "make test" goes as soon as the prompt is back.
+    s.osc("133;C");
+    s.osc("133;D;0");
+    s.osc("133;A");
+    try std.testing.expectEqualStrings("make test", s.current.?.command);
+    try std.testing.expect(!s.current.?.queued);
+
+    // "make test" fails: "deploy" waits for the user.
+    s.osc("133;C");
+    s.osc("133;D;2");
+    s.osc("133;A");
+    try std.testing.expect(s.current == null);
+    try std.testing.expect(s.queued.items[0].held);
+    try std.testing.expectEqual(@as(usize, 1), s.heldCount());
+    try std.testing.expect(!s.working());
+
+    // A new command runs right away; what is on hold stays there.
+    s.submit("git status");
+    try std.testing.expectEqualStrings("git status", s.current.?.command);
+    s.submit("ls");
+    s.osc("133;C");
+    s.osc("133;D;0");
+    s.osc("133;A");
+    try std.testing.expectEqualStrings("ls", s.current.?.command);
+    s.osc("133;C");
+    s.osc("133;D;0");
+    s.osc("133;A");
+    try std.testing.expect(s.current == null);
+
+    // Resumed, the held command runs; a removed one never does.
+    s.submit("sleep 1");
+    s.submit("echo removed");
+    const removed_id = s.queued.items[s.queued.items.len - 1].id;
+    const blocks_before = s.blocks.items.len;
+    try std.testing.expect(s.unqueue(removed_id));
+    try std.testing.expect(!s.unqueue(removed_id));
+    try std.testing.expectEqual(blocks_before - 1, s.blocks.items.len);
+    s.osc("133;C");
+    s.osc("133;D;0");
+    s.osc("133;A");
+    try std.testing.expect(s.current == null); // "deploy" is still on hold
+    s.resumeFrom(s.queued.items[0].id);
+    try std.testing.expectEqualStrings("deploy", s.current.?.command);
+    try std.testing.expectEqual(@as(usize, 0), s.queued.items.len);
+}

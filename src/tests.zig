@@ -14,6 +14,7 @@ test {
     _ = @import("tabs/tab.zig");
     _ = @import("records.zig");
     _ = @import("term/block_codec.zig");
+    _ = @import("term/session.zig");
     _ = @import("workspace.zig");
     _ = @import("tabs/viewer.zig");
     _ = @import("tabs/layout.zig");

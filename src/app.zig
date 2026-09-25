@@ -1641,7 +1641,14 @@ pub const App = struct {
             if (self.overlay.onEdit(cmd)) |out| self.applyOverlay(out);
         } else if (self.files.hasFocus()) {
             self.files.onEdit(cmd);
-        } else if (self.tabs.current()) |t| t.vtable.onEdit(t.ptr, cmd);
+        } else if (self.tabs.current()) |t| blk: {
+            // ⌥↵ in a shell with a command running: the line is that
+            // program's input rather than the next queued command.
+            if ((cmd == .insert_newline or cmd == .insert_line_break) and self.ui.mods.alt and !self.ui.mods.shift) {
+                if (TerminalTab.fromTab(t)) |term| if (term.sendToProgram()) break :blk;
+            }
+            t.vtable.onEdit(t.ptr, cmd);
+        }
         self.invalidate();
     }
 

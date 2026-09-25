@@ -31,8 +31,6 @@ const Session = session_mod.Session;
 const Block = session_mod.Block;
 const Buffer = buffer_mod.Buffer;
 
-const collapse_threshold: u32 = 30;
-const collapsed_rows: u32 = 24;
 const input_row_h: f32 = 23;
 
 /// The room kept between blocks and around the column: none in compact
@@ -108,6 +106,10 @@ pub const TerminalTab = struct {
     closing: bool = false,
     /// Action button clicked during the current block's draw.
     clicked_id: u64 = 0,
+    /// The queued block whose × or "Resume queue" was clicked during this
+    /// frame's draw; applied once the blocks are drawn (0 = none).
+    unqueue_id: u32 = 0,
+    resume_id: u32 = 0,
     /// Distinguishes this tab's widgets from other terminal tabs'.
     wid_salt: usize = 0,
     /// Replies still coming in from the agent (see `ask`).
@@ -233,7 +235,8 @@ pub const TerminalTab = struct {
     /// Why closing needs a confirmation: a command still running (or queued),
     /// or typed input that was never run.
     pub fn closeWarning(self: *TerminalTab, _: []u8) ?[]const u8 {
-        if (self.session.working() or self.rerun != null or self.launch != null) return "A command is still running; closing the tab will stop it.";
+        if (self.session.busy() or self.rerun != null or self.launch != null) return "A command is still running; closing the tab will stop it.";
+        if (self.session.queued.items.len > 0) return "Commands are queued in this tab; closing it drops them.";
         if (!self.editor.isEmpty()) return "The command input has text you haven't run; it will be lost.";
         return null;
     }
@@ -252,7 +255,7 @@ pub const TerminalTab = struct {
             h.update(std.mem.asBytes(&b.id));
             h.update(std.mem.asBytes(&b.buf.version));
             h.update(std.mem.asBytes(&b.exit_code));
-            h.update(&[_]u8{ @intFromEnum(b.state), @intFromBool(b.expanded), @intFromEnum(b.explain_state) });
+            h.update(&[_]u8{ @intFromEnum(b.state), @intFromEnum(b.explain_state) });
             // An explanation counts once it is settled (the codec skips one
             // still coming in), so streaming does not rewrite the file.
             if (b.explain_state == .done or b.explain_state == .failed) h.update(b.explanation.items);
@@ -444,13 +447,15 @@ pub const TerminalTab = struct {
 
     fn submit(self: *TerminalTab) void {
         const text = self.editor.bytes();
-        if (self.session.busy()) {
-            // While a program runs, the box feeds its stdin.
-            self.session.sendLine(text);
-            self.editor.clear();
+        const cmd = std.mem.trim(u8, text, " \t\n");
+        // While a command runs, a line typed here waits its turn after it
+        // (see `Session.queued`); a secret the program asks for (a line
+        // read without echo) and a bare ↵ ("press ↵ to continue") go to
+        // its stdin, as ⌥↵ sends anything (`sendToProgram`).
+        if (self.session.busy() and (self.toProgram() or cmd.len == 0)) {
+            _ = self.sendToProgram();
             return;
         }
-        const cmd = std.mem.trim(u8, text, " \t\n");
         if (cmd.len == 0) {
             // ↵ on an empty box is how a "New" tab becomes a shell.
             if (self.session.dormant()) self.session.spawn() catch |err| {
@@ -460,6 +465,22 @@ pub const TerminalTab = struct {
         }
         self.run(cmd);
         self.editor.clear();
+    }
+
+    /// ⌥↵: the box's line goes to the running program's stdin instead of
+    /// the queue. False when no command is running (↵ does the job then).
+    pub fn sendToProgram(self: *TerminalTab) bool {
+        if (!self.session.busy() or self.session.fullscreen() != null) return false;
+        self.session.sendLine(self.editor.bytes());
+        self.editor.clear();
+        self.hist_index = null;
+        return true;
+    }
+
+    /// The running program reads a line without echo (a password): what
+    /// is typed is masked and ↵ hands it over.
+    fn toProgram(self: *TerminalTab) bool {
+        return self.session.busy() and !self.session.pty.echoEnabled();
     }
 
     fn run(self: *TerminalTab, cmd: []const u8) void {
@@ -557,7 +578,6 @@ pub const TerminalTab = struct {
         b.exit_code = 0;
         b.t_start = self.now;
         b.t_end = 0;
-        b.expanded = false;
         if (self.sel_block == b.id) self.sel_block = 0;
 
         const cfg = config.get();
@@ -1096,7 +1116,7 @@ pub const TerminalTab = struct {
         self.suggestion_for = self.editor.version;
         self.suggestion.clearRetainingCapacity();
         const text = self.editor.bytes();
-        if (self.session.busy() or text.len == 0 or !self.editor.atEnd() or self.editor.isMultiline()) return;
+        if (self.toProgram() or text.len == 0 or !self.editor.atEnd() or self.editor.isMultiline()) return;
         if (self.editor.marked.items.len > 0) return;
         if (self.env.history.suggest(text)) |rest| {
             const one_line = rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len];
@@ -1157,6 +1177,14 @@ pub const TerminalTab = struct {
         if (ui.pressed) self.sel_block = 0;
         if (self.editor.selection() != null) self.sel_block = 0;
         self.drawBlocks(ui, area, col_x, col_w, cols);
+        if (self.unqueue_id != 0) {
+            _ = self.session.unqueue(self.unqueue_id);
+            self.unqueue_id = 0;
+        }
+        if (self.resume_id != 0) {
+            self.session.resumeFrom(self.resume_id);
+            self.resume_id = 0;
+        }
         self.drawInput(ui, input_rect, focused);
 
         if (self.rerun) |cmd| {
@@ -1177,9 +1205,6 @@ pub const TerminalTab = struct {
         h: f32,
         header_h: f32,
         rows: u32,
-        first_row: u32,
-        hidden: u32,
-        collapsible: bool,
         failed: bool,
         note: ?[]const u8,
         note_lines: u32 = 0,
@@ -1208,9 +1233,6 @@ pub const TerminalTab = struct {
             .h = 0,
             .header_h = 0,
             .rows = b.total_rows,
-            .first_row = 0,
-            .hidden = 0,
-            .collapsible = b.total_rows > collapse_threshold,
             // ⌃C is the user's own doing, not a failure that needs fixing;
             // an agent's failure to answer is not one the agent can fix.
             .failed = b.state == .failed and b.exit_code != 130 and !b.agent,
@@ -1220,15 +1242,8 @@ pub const TerminalTab = struct {
         if (l.note) |note| {
             l.note_lines = wrapCount(ui, theme.font_ui, note, col_w - 2 * theme.block_pad_x);
             l.rows = 0;
-            l.collapsible = false;
         }
-        if (l.collapsible and !b.expanded) {
-            l.rows = collapsed_rows;
-            l.first_row = b.total_rows - collapsed_rows;
-            l.hidden = l.first_row;
-        }
-        const hidden_row: f32 = if (l.hidden > 0) theme.term_line_h else 0;
-        const out_h = @as(f32, @floatFromInt(l.rows)) * theme.term_line_h + hidden_row;
+        const out_h = @as(f32, @floatFromInt(l.rows)) * theme.term_line_h;
         const has_body = l.rows > 0 or l.note != null;
 
         const pad_y = theme.block_pad_y;
@@ -1246,7 +1261,7 @@ pub const TerminalTab = struct {
             l.header_h = pad_y + 21 + (if (has_body) @as(f32, if (theme.compact) 2 else 10) else pad_y);
             l.h = l.header_h;
             if (l.note != null) l.h += @as(f32, @floatFromInt(l.note_lines)) * 21 + pad_y;
-            if (l.rows > 0) l.h += out_h + (if (l.collapsible) @as(f32, 4 + 28 + 10) else pad_y);
+            if (l.rows > 0) l.h += out_h + pad_y;
         }
         return l;
     }
@@ -1304,16 +1319,31 @@ pub const TerminalTab = struct {
         // Header: "$ command" … status.
         const head_cy = r.y + theme.block_pad_y + 10.5;
         var status_buf: [64]u8 = undefined;
-        const status_text = statusText(b, self.now, &status_buf);
-        const status_color = switch (b.state) {
+        var status_x = r.right() - theme.block_pad_x;
+        if (b.queued) status_x = self.queueControls(ui, b, status_x, head_cy);
+        const status_text = if (b.queued) self.queuedStatus(b) else statusText(b, self.now, &status_buf);
+        const status_color = if (b.queued) (if (b.held) theme.text_2 else theme.text_3) else switch (b.state) {
             .failed => if (b.exit_code == 130) theme.text_3 else theme.red,
             .running, .pending => theme.teal,
             .done => theme.text_3,
         };
-        const sw = dl.textRight(theme.font_hint, r.right() - theme.block_pad_x, head_cy, status_text, status_color);
+        const sw = dl.textRight(theme.font_hint, status_x, head_cy, status_text, status_color);
 
         // "Copy" appears on hover, left of the status.
-        var right_limit = r.right() - theme.block_pad_x - sw - 12;
+        var right_limit = status_x - sw - 12;
+        if (b.held and self.startsHold(b)) {
+            // Only the user sends what waits after a failure on its way:
+            // this block and the ones on hold right under it.
+            const label = "Resume queue";
+            const lw = ui.text.measure(theme.font_hint, label);
+            const rr: Rect = .{ .x = right_limit - lw - 16, .y = head_cy - 12, .w = lw + 16, .h = 24 };
+            const st = ui.button(Ui.id("block.resume", b.id), rr);
+            ui.feedback(rr, 6, st);
+            dl.border(rr, 6, 1, theme.line_strong);
+            _ = dl.textCentered(theme.font_hint, rr.x + 8, head_cy, label, theme.text);
+            if (st.clicked) self.resume_id = b.id;
+            right_limit = rr.x - 8;
+        }
         if (ui.mouseIn(r) and (l.rows > 0)) {
             const label = if (b.agent) "Copy answer" else "Copy output";
             const lw = ui.text.measure(theme.font_hint, label);
@@ -1335,7 +1365,7 @@ pub const TerminalTab = struct {
         const multi = first_line.len != b.command.len;
         var cmd_buf: [512]u8 = undefined;
         const shown = if (multi) (std.fmt.bufPrint(&cmd_buf, "{s} …", .{first_line[0..@min(first_line.len, 500)]}) catch first_line) else first_line;
-        _ = dl.textEllipsis(theme.font_cmd, cmd_x, head_cy, shown, right_limit - cmd_x, theme.text);
+        _ = dl.textEllipsis(theme.font_cmd, cmd_x, head_cy, shown, right_limit - cmd_x, if (b.queued) theme.text_2 else theme.text);
 
         var y = r.y + l.header_h;
 
@@ -1346,7 +1376,7 @@ pub const TerminalTab = struct {
 
         if (l.rows > 0) {
             if (l.failed) {
-                const inset: Rect = .{ .x = px, .y = y, .w = inner_w, .h = 20 + @as(f32, @floatFromInt(l.rows)) * theme.term_line_h + (if (l.hidden > 0) theme.term_line_h else 0) };
+                const inset: Rect = .{ .x = px, .y = y, .w = inner_w, .h = 20 + @as(f32, @floatFromInt(l.rows)) * theme.term_line_h };
                 dl.rrect(inset, theme.row_radius, theme.bg_inset);
                 y = self.drawRows(ui, b, l, px + 14, y + 10, area, cols) + 10;
             } else {
@@ -1357,7 +1387,7 @@ pub const TerminalTab = struct {
         if (l.failed) {
             if (l.explain_lines > 0) y = self.drawExplanation(ui, b, px, y, inner_w);
 
-            // Action row (design: Fix with agent · Explain · Run again ··· Show full output).
+            // Action row (design: Fix with agent · Explain · Run again).
             const by = y + theme.block_pad_y;
             var bx = px;
             const fix_id = Ui.id("block.fix", b.id);
@@ -1374,18 +1404,40 @@ pub const TerminalTab = struct {
             const run_again_id = Ui.id("block.rerun", b.id);
             bx = self.actionButton(ui, run_again_id, bx, by, "Run again", .outline) + 14;
             if (self.clicked_id == run_again_id) self.queueRerun(b.command);
-            var right = r.right() - theme.block_pad_x;
-            if (l.collapsible) {
-                self.expandToggle(ui, b, right, by + 17);
-                right -= ui.text.measure(ui_mod.Font.sans(13.5), "Show full output · 00000 lines") + 24;
-            }
+            const right = r.right() - theme.block_pad_x;
             if (self.fix_note_block == b.id and right - bx > 60) {
                 _ = dl.textEllipsis(theme.font_hint, bx, by + 17, self.fix_note, right - bx, theme.text_3);
             }
-        } else if (l.rows > 0 and l.collapsible) {
-            self.expandToggle(ui, b, r.right() - theme.block_pad_x, y + 4 + 14);
         }
         self.clicked_id = 0;
+    }
+
+    /// The × that takes a queued block out of the queue, at the header's
+    /// right end; returns where the status text ends.
+    fn queueControls(self: *TerminalTab, ui: *Ui, b: *Block, right: f32, cy: f32) f32 {
+        const xr: Rect = .{ .x = right - 22, .y = cy - 11, .w = 22, .h = 22 };
+        const st = ui.button(Ui.id("block.unqueue", b.id), xr);
+        ui.feedback(xr, 6, st);
+        ui.dl.icon(.close, xr.x + 4, xr.y + 4, 14, if (st.hover) theme.text else theme.text_3);
+        if (st.clicked) self.unqueue_id = b.id;
+        return xr.x - 8;
+    }
+
+    /// Where a queued block stands: next in line, further back, or on
+    /// hold after a failure.
+    fn queuedStatus(self: *TerminalTab, b: *const Block) []const u8 {
+        if (b.held) return "On hold";
+        const next = if (self.session.nextQueued()) |i| self.session.queued.items[i] == b else false;
+        if (next) return if (self.session.busy()) "Up next" else "Starting…";
+        return "Queued";
+    }
+
+    /// `b` is the first of the blocks one failure put on hold: the block
+    /// above it in the tab is not on hold.
+    fn startsHold(self: *TerminalTab, b: *const Block) bool {
+        const blocks = self.session.blocks.items;
+        const i = std.mem.indexOfScalar(*Block, blocks, @constCast(b)) orelse return false;
+        return i == 0 or !blocks[i - 1].held;
     }
 
     const ButtonKind = enum { primary, outline };
@@ -1410,19 +1462,6 @@ pub const TerminalTab = struct {
         }
         if (st.clicked) self.clicked_id = wid;
         return r.right();
-    }
-
-    fn expandToggle(self: *TerminalTab, ui: *Ui, b: *Block, right: f32, cy: f32) void {
-        _ = self;
-        var buf: [64]u8 = undefined;
-        const label = if (b.expanded) "Collapse output" else (std.fmt.bufPrint(&buf, "Show full output · {d} lines", .{b.total_rows}) catch "Show full output");
-        const font = ui_mod.Font.sans(13.5);
-        const w = ui.text.measure(font, label);
-        const r: Rect = .{ .x = right - w - 8, .y = cy - 14, .w = w + 16, .h = 28 };
-        const st = ui.button(Ui.id("block.expand", b.id), r);
-        ui.feedback(r, 6, st);
-        _ = ui.dl.textCentered(font, r.x + 8, cy, label, if (st.hover) theme.text else theme.text_2);
-        if (st.clicked) b.expanded = !b.expanded;
     }
 
     /// The explanation under a failed command: a label saying how it is
@@ -1454,7 +1493,8 @@ pub const TerminalTab = struct {
     }
 
     fn queueRerun(self: *TerminalTab, cmd: []const u8) void {
-        if (self.rerun != null or self.session.busy()) return;
+        // While a command runs, the rerun is queued after it.
+        if (self.rerun != null) return;
         self.rerun = self.gpa.dupe(u8, cmd) catch null;
     }
 
@@ -1469,12 +1509,6 @@ pub const TerminalTab = struct {
     fn drawRows(self: *TerminalTab, ui: *Ui, b: *Block, l: BlockLayout, x: f32, y0: f32, area: Rect, cols: u32) f32 {
         const dl = ui.dl;
         var y = y0;
-        if (l.hidden > 0) {
-            var buf: [64]u8 = undefined;
-            const label = std.fmt.bufPrint(&buf, "··· {d} earlier lines", .{l.hidden}) catch "···";
-            _ = dl.textCentered(theme.font_output, x, y + theme.term_line_h / 2, label, theme.text_3);
-            y += theme.term_line_h;
-        }
         if (b.row_starts.items.len == 0) return y;
 
         // A link under the pointer: ⌘/⌃-click opens it, before the
@@ -1484,7 +1518,7 @@ pub const TerminalTab = struct {
             const cell_w = ui.text.cellAdvance(theme.font_output);
             const rows_rect: Rect = .{ .x = x, .y = y, .w = @as(f32, @floatFromInt(cols)) * cell_w, .h = @as(f32, @floatFromInt(l.rows)) * theme.term_line_h };
             if (!ui.mouseIn(rows_rect)) break :blk null;
-            const rows: selection.Rows = .{ .starts = b.row_starts.items, .first_row = l.first_row, .rows = l.rows, .cols = cols };
+            const rows: selection.Rows = .{ .starts = b.row_starts.items, .first_row = 0, .rows = l.rows, .cols = cols };
             const found = selection.linkUnder(&b.buf, rows, x, y, cell_w, theme.term_line_h, ui.mx, ui.my, &link_buf) orelse break :blk null;
             _ = ui.link(found.url);
             break :blk found;
@@ -1497,7 +1531,7 @@ pub const TerminalTab = struct {
             const d = ui.drag(Ui.id("block.select", b.id), rows_rect);
             if (d.hover or d.dragging) ui.cursor = .ibeam;
             if (d.started or d.dragging) {
-                const rows: selection.Rows = .{ .starts = b.row_starts.items, .first_row = l.first_row, .rows = l.rows, .cols = cols };
+                const rows: selection.Rows = .{ .starts = b.row_starts.items, .first_row = 0, .rows = l.rows, .cols = cols };
                 const pos = selection.hitTest(&b.buf, rows, x, y, cell_w, theme.term_line_h, ui.mx, ui.my);
                 if (d.started) {
                     self.editor.anchor = null;
@@ -1511,8 +1545,8 @@ pub const TerminalTab = struct {
         const sel: ?[2]selection.Pos = if (self.sel_block == b.id) self.sel.range() else null;
 
         // Skip rows above the viewport.
-        var row = l.first_row;
-        const end_row = l.first_row + l.rows;
+        var row: u32 = 0;
+        const end_row = l.rows;
         if (y < area.y) {
             const skip: u32 = @intFromFloat(@floor((area.y - y) / theme.term_line_h));
             const s = @min(skip, l.rows);
@@ -1876,6 +1910,7 @@ pub const TerminalTab = struct {
         const lay = self.inputLayout(ui, r.w);
         const cell = ui.text.cellAdvance(theme.font_input);
         const border_color = if (!focused) theme.line_strong else if (busy) theme.teal.alpha(0.75) else theme.accent;
+        const to_program = self.toProgram();
         if (theme.compact) {
             // Flush with the pane: a line on top says where the focus is.
             dl.rect(r, theme.bg_inset);
@@ -1901,7 +1936,7 @@ pub const TerminalTab = struct {
                 x += dl.textEllipsis(theme.font_input, x, pcy, p.branch, p.branch_max_w, theme.ansi[1]);
                 x += dl.textCentered(theme.font_input, x, pcy, ")", theme.ansi[4]) + cell;
             }
-            _ = dl.textCentered(theme.font_input, x, pcy, if (busy) "›" else "$", if (busy) theme.teal else theme.ansi[3]);
+            _ = dl.textCentered(theme.font_input, x, pcy, if (to_program) "›" else "$", if (to_program) theme.teal else theme.ansi[3]);
         }
 
         // Mouse: place caret / drag-select.
@@ -1924,7 +1959,7 @@ pub const TerminalTab = struct {
         }
 
         // Text, selection, caret.
-        const masked = busy and !self.session.pty.echoEnabled();
+        const masked = to_program;
         const sel = self.editor.selection();
         var row: usize = 0;
         var col: usize = 0;
@@ -1982,6 +2017,13 @@ pub const TerminalTab = struct {
         self.caret = .{ .x = cx, .y = cy + 1.5, .w = 2, .h = 20 };
         if (focused and (self.blink_on or ui.down)) dl.rect(self.caret, theme.accent);
 
+        // While a command runs, an empty box says where ↵ sends a line.
+        if (busy and self.editor.isEmpty() and self.editor.marked.items.len == 0) {
+            const hint: []const u8 = if (to_program) "The program asks for a hidden answer · ↵ sends it" else "↵ queue next · ⌥↵ send to the running program";
+            const room = (r.right() - theme.block_pad_x) - (cx + 3);
+            _ = dl.textEllipsis(theme.font_input, cx + 3, cy + input_row_h / 2, hint, room, theme.text_3);
+        }
+
         // Ghost suggestion after the caret.
         const has_suggestion = self.suggestion.items.len > 0 and self.editor.atEnd() and self.editor.marked.items.len == 0;
         if (has_suggestion) {
@@ -2028,7 +2070,8 @@ fn statusText(b: *const Block, now: f64, buf: []u8) []const u8 {
     return switch (b.state) {
         .pending => "Starting…",
         .running => std.fmt.bufPrint(buf, "Running · {s}", .{dur}) catch "Running",
-        .done => if (d >= 1.0) (std.fmt.bufPrint(buf, "Done · {s}", .{dur}) catch "Done") else "Done",
+        // A finished command needs no label: just how long it took.
+        .done => if (d >= 1.0) (std.fmt.bufPrint(buf, "{s}", .{dur}) catch "") else "",
         .failed => blk: {
             if (b.exit_code == 130) break :blk std.fmt.bufPrint(buf, "Stopped · {s}", .{dur}) catch "Stopped";
             if (b.exit_code > 1) break :blk std.fmt.bufPrint(buf, "Failed · exit {d} · {s}", .{ b.exit_code, dur }) catch "Failed";
