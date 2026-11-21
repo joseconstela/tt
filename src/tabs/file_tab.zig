@@ -28,6 +28,13 @@ const saved_flash: f64 = 1.6;
 
 var next_salt: usize = 1;
 
+/// A widget-id salt no other text editor of a document tab has.
+pub fn newSalt() usize {
+    const salt = next_salt;
+    next_salt += 1;
+    return salt;
+}
+
 pub const FileDoc = struct {
     gpa: std.mem.Allocator,
     file_path: []u8,
@@ -49,9 +56,7 @@ pub const FileDoc = struct {
     pub fn init(gpa: std.mem.Allocator, path: []const u8) !FileDoc {
         const owned = try gpa.dupe(u8, path);
         errdefer gpa.free(owned);
-        const salt = next_salt;
-        next_salt += 1;
-        var self: FileDoc = .{ .gpa = gpa, .file_path = owned, .ed = TextEditor.init(gpa, salt) };
+        var self: FileDoc = .{ .gpa = gpa, .file_path = owned, .ed = TextEditor.init(gpa, newSalt()) };
         self.load();
         return self;
     }

@@ -23,6 +23,8 @@
 //!       default: true
 //!   features:
 //!     command_fallback_agent: Claude      # an API by name; absent = off
+//!     command_fallback_coding_agent: claude   # or a coding agent id (claude, codex …),
+//!                                         # asked through its CLI; when set it comes first
 //!     command_fallback_prompt: "…"
 //!     explain_agent: Claude               # an API by name; absent = off
 //!     explain_prompt: "…"
@@ -211,6 +213,10 @@ pub const Features = struct {
     /// Name of the agent that turns unrecognised terminal commands into a
     /// conversation, null = off.
     command_fallback_agent: ?[]u8 = null,
+    /// Or the coding agent that does (a `coding_agents` id, asked through
+    /// its CLI by `agent_cli.zig`), "" = none. When set it comes before
+    /// `command_fallback_agent`; the Features page keeps only one of the two.
+    command_fallback_coding_agent: []u8 = "",
     command_fallback_prompt: []u8 = "",
     /// Name of the agent behind a failed block's "Explain", null = off.
     explain_agent: ?[]u8 = null,
@@ -234,6 +240,12 @@ pub const Features = struct {
 
     pub fn fixAuto(self: *const Features) bool {
         return self.fix_agent.len == 0;
+    }
+
+    /// True when something — an API or a coding agent — answers the lines
+    /// the shell does not know.
+    pub fn fallbackOn(self: *const Features) bool {
+        return self.command_fallback_agent != null or self.command_fallback_coding_agent.len > 0;
     }
 };
 
@@ -425,6 +437,7 @@ pub const Config = struct {
         for (self.sites.items) |*st| st.deinit(self.gpa);
         self.sites.deinit(self.gpa);
         if (self.features.command_fallback_agent) |s| self.gpa.free(s);
+        self.gpa.free(self.features.command_fallback_coding_agent);
         self.gpa.free(self.features.command_fallback_prompt);
         if (self.features.explain_agent) |s| self.gpa.free(s);
         self.gpa.free(self.features.explain_prompt);
@@ -799,6 +812,7 @@ pub const Config = struct {
         }
         try out.appendSlice(gpa, "features:\n");
         try writeOptField(gpa, out, "command_fallback_agent", self.features.command_fallback_agent);
+        if (self.features.command_fallback_coding_agent.len > 0) try writeField(gpa, out, "command_fallback_coding_agent", self.features.command_fallback_coding_agent);
         try writeField(gpa, out, "command_fallback_prompt", self.features.command_fallback_prompt);
         try writeOptField(gpa, out, "explain_agent", self.features.explain_agent);
         try writeField(gpa, out, "explain_prompt", self.features.explain_prompt);
@@ -952,7 +966,7 @@ pub const Config = struct {
                         }
                         continue;
                     }
-                    const slot: ?*[]u8 = if (std.mem.eql(u8, kv.key, "command_fallback_prompt")) &f.command_fallback_prompt else if (std.mem.eql(u8, kv.key, "explain_prompt")) &f.explain_prompt else if (std.mem.eql(u8, kv.key, "fix_agent")) &f.fix_agent else if (std.mem.eql(u8, kv.key, "fix_prompt")) &f.fix_prompt else null;
+                    const slot: ?*[]u8 = if (std.mem.eql(u8, kv.key, "command_fallback_prompt")) &f.command_fallback_prompt else if (std.mem.eql(u8, kv.key, "command_fallback_coding_agent")) &f.command_fallback_coding_agent else if (std.mem.eql(u8, kv.key, "explain_prompt")) &f.explain_prompt else if (std.mem.eql(u8, kv.key, "fix_agent")) &f.fix_agent else if (std.mem.eql(u8, kv.key, "fix_prompt")) &f.fix_prompt else null;
                     if (slot) |s| {
                         const v = try unquote(self.gpa, kv.value);
                         defer self.gpa.free(v);
@@ -1266,6 +1280,7 @@ test "round trip through the YAML subset" {
     a.setString(&a.features.explain_prompt, "Why did it fail?");
     a.setString(&a.features.fix_agent, "codex");
     a.setString(&a.features.fix_prompt, "Fix: it");
+    a.setString(&a.features.command_fallback_coding_agent, "claude");
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -1294,6 +1309,8 @@ test "round trip through the YAML subset" {
     try std.testing.expectEqualStrings("Why did it fail?", b.features.explain_prompt);
     try std.testing.expectEqualStrings("codex", b.features.fix_agent);
     try std.testing.expectEqualStrings("Fix: it", b.features.fix_prompt);
+    try std.testing.expectEqualStrings("claude", b.features.command_fallback_coding_agent);
+    try std.testing.expect(b.features.fallbackOn());
     try std.testing.expect(b.defaultAgent().? == &b.agents.items[1]);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "apis:\n") != null);
 }
@@ -1308,6 +1325,8 @@ test "fix_agent: auto is the blank default, off is off, and the defaults write b
     try a.write(&out);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "fix_agent: auto\n") != null);
     // Nothing under features is absent: explain_agent is off, so it is not written.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "command_fallback_coding_agent") == null);
+    try std.testing.expect(!a.features.fallbackOn());
     try std.testing.expect(std.mem.indexOf(u8, out.items, "explain_agent") == null);
 
     var b = Config.init(gpa);

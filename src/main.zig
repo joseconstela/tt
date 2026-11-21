@@ -1,13 +1,18 @@
 const std = @import("std");
 const sys = @import("sys.zig");
 const apple = @import("apple.zig");
+const cli = @import("cli.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
 const usage =
     \\tt — a calm, block-based terminal for macOS (Zig + Metal)
     \\
-    \\usage: tt [options]
+    \\usage: tt [options] [path...]
+    \\  <path>                  open a folder (a shell in it) or a file in the default
+    \\                          project; a tt that is already running takes it over
+    \\  --foreground            be the app in this process: hand nothing to a running
+    \\                          tt and stay attached to the terminal
     \\  --probe <cmd>...        run commands headlessly and print the captured blocks
     \\  --script <file>         drive the UI from a script (testing; see src/script.zig)
     \\  --size <W>x<H>          window / snapshot size in points (default 1440x900)
@@ -22,10 +27,25 @@ pub fn main(init: std.process.Init) !void {
 
     var probe_cmds: std.ArrayList([]const u8) = .empty;
     var opts: @import("app.zig").LaunchOptions = .{};
+    var paths: std.ArrayList([]const u8) = .empty;
+    var foreground = false;
+    var only_paths = false;
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd: []const u8 = if (std.c.getcwd(&cwd_buf, cwd_buf.len) != null) std.mem.sliceTo(&cwd_buf, 0) else "/";
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+        if (only_paths or a.len == 0 or a[0] != '-') {
+            try paths.append(gpa, try cli.absolute(gpa, cwd, a));
+        } else if (std.mem.eql(u8, a, "--")) {
+            only_paths = true;
+        } else if (std.mem.eql(u8, a, "--foreground")) {
+            foreground = true;
+        } else if (std.mem.startsWith(u8, a, "-NS") or std.mem.startsWith(u8, a, "-Apple")) {
+            // A Cocoa default (`-NSApplicationShowExceptions YES`): AppKit
+            // reads it, and its value is not a path.
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print("{s}", .{usage});
             return;
         } else if (std.mem.eql(u8, a, "--probe")) {
@@ -49,8 +69,17 @@ pub fn main(init: std.process.Init) !void {
 
     if (probe_cmds.items.len > 0) return probe(gpa, probe_cmds.items);
 
+    opts.open_paths = paths.items;
     if (opts.script_path != null) {
         return @import("script.zig").runHeadless(gpa, opts);
+    }
+    if (paths.items.len > 0 and !foreground) {
+        var sock_buf: [256]u8 = undefined;
+        if (cli.socketPath(&sock_buf)) |sock| {
+            if (cli.send(sock, paths.items)) return;
+        }
+        // Nobody to hand them to: become the app, away from the terminal.
+        cli.detach(gpa, args[1..]);
     }
     return @import("platform/cocoa.zig").run(gpa, opts);
 }

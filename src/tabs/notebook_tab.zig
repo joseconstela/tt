@@ -45,6 +45,7 @@ const sys = @import("../sys.zig");
 const records = @import("../records.zig");
 const config = @import("../config.zig");
 const agent = @import("../agent.zig");
+const agent_cli = @import("../agent_cli.zig");
 const coding_agents = @import("../coding_agents.zig");
 const settings_features = @import("settings_features.zig");
 const wrap = @import("../ui/wrap.zig");
@@ -933,7 +934,7 @@ pub const NotebookTab = struct {
     events: std.ArrayList(bridge.Event) = .empty,
 
     // The agent (ask cells).
-    ask_req: ?*agent.Request = null,
+    ask_req: ?agent_cli.Reply = null,
     ask_cell: []u8 = &.{},
     // The agents behind a failed cell's Explain and Fix with agent.
     explain_req: ?*agent.Request = null,
@@ -1839,32 +1840,41 @@ pub const NotebookTab = struct {
         cell.t_start = self.now;
         self.reveal = self.cells.items.len - 1;
 
-        const cfg = config.get();
-        const name = cfg.features.command_fallback_agent orelse return self.failAsk(cell, "No agent answers here yet: pick one under Settings › AI › Features › Unrecognised commands.");
-        const a = cfg.findAgentByName(name) orelse return self.failAsk(cell, "The agent chosen under Settings › AI › Features is no longer set up.");
-
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const system = self.askSystemPrompt(arena) catch "";
         var messages: std.ArrayList(agent.Message) = .empty;
         self.askConversation(arena, &messages, cell, question) catch return self.failAsk(cell, "Out of memory.");
-        var prepared = agent.prepare(self.gpa, a, system, messages.items, .{ .tools = true, .tool = .notebook_cell }) catch |err| {
-            const why = switch (err) {
-                error.NoModel => "The agent has no model set (Settings › AI › APIs).",
-                error.NoApiKey => "The agent needs an API key (Settings › AI › APIs).",
-                error.NoBaseUrl => "The agent has no base URL (Settings › AI › APIs).",
-                error.OutOfMemory => "Out of memory.",
-            };
-            return self.failAsk(cell, why);
+        const reply: agent_cli.Reply = switch (agent_cli.answerer(config.get())) {
+            .off => return self.failAsk(cell, "No agent answers here yet: pick one under Settings › AI › Features › Unrecognised commands."),
+            .api_gone => return self.failAsk(cell, "The agent chosen under Settings › AI › Features is no longer set up."),
+            .cli_gone => return self.failAsk(cell, agent_cli.note_cli_gone),
+            .api => |a| blk: {
+                const system = self.askSystemPrompt(arena, .tool) catch "";
+                var prepared = agent.prepare(self.gpa, a, system, messages.items, .{ .tools = true, .tool = .notebook_cell }) catch |err| {
+                    const why = switch (err) {
+                        error.NoModel => "The agent has no model set (Settings › AI › APIs).",
+                        error.NoApiKey => "The agent needs an API key (Settings › AI › APIs).",
+                        error.NoBaseUrl => "The agent has no base URL (Settings › AI › APIs).",
+                        error.OutOfMemory => "Out of memory.",
+                    };
+                    return self.failAsk(cell, why);
+                };
+                defer prepared.deinit(self.gpa);
+                break :blk .{ .api = agent.Request.start(&prepared) catch return self.failAsk(cell, "Out of memory.") };
+            },
+            // A coding agent: one prompt to its CLI, run beside the notebook.
+            .cli => |who| blk: {
+                const system = self.askSystemPrompt(arena, .fenced) catch "";
+                const prompt = agent_cli.flatten(arena, system, messages.items) catch return self.failAsk(cell, "Out of memory.");
+                break :blk .{ .cli = agent_cli.Request.start(who, sys.dirname(self.file_path), prompt) catch return self.failAsk(cell, "The coding agent could not be started.") };
+            },
         };
-        defer prepared.deinit(self.gpa);
-        const req = agent.Request.start(&prepared) catch return self.failAsk(cell, "Out of memory.");
-        self.ask_req = req;
+        self.ask_req = reply;
         self.ask_cell = self.gpa.dupe(u8, cell.id) catch &.{};
     }
 
-    fn askSystemPrompt(self: *NotebookTab, arena: std.mem.Allocator) ![]u8 {
+    fn askSystemPrompt(self: *NotebookTab, arena: std.mem.Allocator, how: enum { tool, fenced }) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(arena, "You help the user in a Jupyter notebook, shown in a native macOS app. ");
         if (self.kernel_display.len > 0) {
@@ -1875,7 +1885,13 @@ pub const NotebookTab = struct {
             try out.appendSlice(arena, "The kernel is Python 3 (ipykernel). ");
         }
         try out.print(arena, "The notebook is {s} in {s}. ", .{ sys.basename(self.file_path), sys.dirname(self.file_path) });
-        try out.appendSlice(arena, "The messages carry the notebook so far: its cells in order — Markdown, code with the outputs it gave, %%sh shell cells — then the user's question; read them before answering. When code would do what the user wants, call propose_command with the source of one new cell: it is added to the notebook under the question for the user to review and run, so never assume it ran and never make up its output; say in a line what it does. Answer in plain text, briefly: no Markdown headings or tables.");
+        try out.appendSlice(arena, "The messages carry the notebook so far: its cells in order — Markdown, code with the outputs it gave, %%sh shell cells — then the user's question; read them before answering. ");
+        // An API calls the tool; a coding agent's CLI writes a fenced block.
+        try out.appendSlice(arena, switch (how) {
+            .tool => "When code would do what the user wants, call propose_command with the source of one new cell: it is added to the notebook under the question for the user to review and run, so never assume it ran and never make up its output; say in a line what it does.",
+            .fenced => agent_cli.cell_form,
+        });
+        try out.appendSlice(arena, " Answer in plain text, briefly: no Markdown headings or tables.");
         if (config.get().notebooks.share_schema and self.vars.len > 0) {
             try out.appendSlice(arena, "\n\nVariables in the kernel right now (name: type):");
             var n: usize = 0;

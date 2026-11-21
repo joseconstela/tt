@@ -78,6 +78,7 @@ Other targets:
 
 ```sh
 zig build app                     # zig-out/tt.app, ready for /Applications
+zig build install-app -Doptimize=ReleaseFast   # build the bundle and put it in ~/Applications
 zig build test                    # unit tests for the pure-logic modules
 zig build -Doptimize=ReleaseFast  # optimised binary
 ```
@@ -85,6 +86,20 @@ zig build -Doptimize=ReleaseFast  # optimised binary
 The first build fetches tt's one dependency, [libghostty-vt](https://github.com/ghostty-org/ghostty),
 pinned by commit in `build.zig.zon` (about 130 MB unpacked into the git-ignored `zig-pkg/`). If that
 first fetch errors out, run `zig build` again.
+
+### From the command line
+
+`tt` takes paths, which open in the default project:
+
+```sh
+tt .            # a shell in the current directory
+tt notes.md     # the file, in a tab
+```
+
+A tt that is already running opens them (it listens on a socket in `~/.tt/`) and comes to the
+front; otherwise tt starts, detached from the terminal. To have `tt` on your `PATH`, choose
+**tt › Install CLI Tools…** in the app's menu: it links `/usr/local/bin/tt` to the app, and macOS
+asks for your password if that folder needs it.
 
 ### Development
 

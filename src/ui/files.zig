@@ -47,9 +47,14 @@ pub const FileMenu = struct { kind: FileKind, x: f32, y: f32 };
 /// A Search match to open: the file, the spot in it.
 pub const OpenAt = search_panel.Open;
 
+/// A change of the Git view to show side by side.
+pub const Diff = git_panel.Diff;
+
 pub const Result = struct {
     open_file: ?[]const u8 = null,
     pin_file: ?[]const u8 = null,
+    /// The Git view: a change to show side by side (valid this frame).
+    open_diff: ?Diff = null,
     /// The Git view wants a discard confirmed (see `discardConfirmed`).
     confirm: ?git_panel.Confirm = null,
     /// The Git view's branch menu to open (see `menuPicked`).
@@ -385,7 +390,7 @@ pub const FileBrowser = struct {
             const area: Rect = .{ .x = rect.x + 1, .y = y, .w = rect.w - 1, .h = @max(0, rect.bottom() - y) };
             if (self.mode == .git) {
                 const gr = self.git.draw(ui, area);
-                res.open_file = gr.open_file;
+                res.open_diff = gr.open_diff;
                 res.confirm = gr.confirm;
                 res.menu = gr.menu;
             } else {

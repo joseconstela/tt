@@ -16,6 +16,7 @@ Requires Zig 0.17.1 (`minimum_zig_version` in `build.zig.zon`) and the Xcode com
 zig build                         # zig-out/bin/tt
 zig build run                     # build and launch (args after `--` are passed through)
 zig build app                     # zig-out/tt.app, ad-hoc signed; needs full Xcode (actool compiles icon.icon)
+zig build install-app             # `app`, then copy it to ~/Applications/tt.app (add -Doptimize=ReleaseFast for a daily driver)
 zig build test                    # unit tests
 zig build -Doptimize=ReleaseFast
 ```
@@ -36,6 +37,7 @@ The script language (`type`, `key`, `click`, `drag`, `open`, `action <App.Action
 - A script runs the user's real zsh with their real dotfiles and history, and reads `~/.tt/config.yml` and `~/.tt_projects`. Point `HOME` at a throwaway directory when a run must be isolated or reproducible.
 - Scripts and the selftest do not read or write `~/.tt_workspace` unless `TT_WORKSPACE=<file>` names one.
 - Headless there is no window, so nothing hosted in a native view exists (website tabs show only their chrome, notebook HTML outputs have no web view). The clipboard and "open in browser" are printed as `clipboard → …` / `browser → …`.
+- Scripts and the selftest do not listen for `tt <path>` either unless `TT_SOCKET=<file>` names a socket of their own; the script command `cli /path` does what the argument does.
 - `TT_SELFTEST=1` on the windowed binary posts real NSEvents through the window to exercise the AppKit side (hit testing, first responder, key routing); extra legs are selected with `TT_SELFTEST_*` variables, each described in a comment in `src/platform/cocoa.zig`. `TT_SELFTEST_SNAP` / `TT_SELFTEST_WINDOW_PNG` name the output images.
 - `TT_DEBUG_EVENTS=1` prints input events, web-bridge messages and what a notebook kernel sends.
 
@@ -43,7 +45,7 @@ The script language (`type`, `key`, `click`, `drag`, `open`, `action <App.Action
 
 ### Layers
 
-- `src/main.zig` parses flags and picks one of three drivers: `probe` (session only), `script.runHeadless`, or `platform/cocoa.zig` `run`.
+- `src/main.zig` parses flags and picks one of three drivers: `probe` (session only), `script.runHeadless`, or `platform/cocoa.zig` `run`. Paths on the command line (`tt .`, `tt notes.md`) go through `src/cli.zig`: handed to the running tt over the socket `~/.tt/tt.sock` (`$TT_SOCKET` overrides it) and opened by `App.openPath` in the default project, else the app starts detached with them (`--foreground` keeps it attached and hands nothing over). The app menu's "Install CLI Tools…" (`App.Action.install_cli` → `cli.install`) links `/usr/local/bin/tt` to the running binary; `$TT_CLI_LINK` moves the link for tests.
 - `src/platform/cocoa.zig` is the macOS shell: NSApplication, NSWindow and one CAMetalLayer-backed NSView whose class is registered at runtime. It translates AppKit events into the `on*` methods of `App` and nothing else; app behaviour does not belong here.
 - `src/app.zig` is the platform-neutral core. `App` owns the renderer, UI state, tab manager, projects, workspace, palette and overlay. The loop is `update(now)` (tick every tab, serve tab requests, save the workspace) → `buildFrame()` (immediate-mode UI into the draw list) → `present()` or `snapshot(path)`. Everything a menu item, shortcut, palette row or script can trigger is an `App.Action` handled in `perform`.
 
@@ -81,11 +83,12 @@ Changes to these formats must keep older files readable (see the version and leg
 
 - `term/session.zig` is one long-lived zsh on a PTY (`term/pty.zig`). `assets/shell/tt.zsh`, installed into a private `ZDOTDIR` by `term/shell_integration.zig`, emits OSC 133 marks from `preexec`/`precmd`; the session keeps only what arrives between marks and slices it into *blocks* (command, output, exit code, cwd, branch). The prompt and zsh's line editor are never shown: tt has its own input box (`src/input/`).
 - Normal output goes through tt's own parser and line buffer (`term/parser.zig`, `term/buffer.zig`). When a program enters the alternate screen or raw mode, the block hands its stream to libghostty-vt through `term/screen.zig`, the only file that imports `ghostty-vt`; on exit the final screen becomes the block's output. Keep ghostty behind that seam, and keep `simd = false` in `build.zig`.
-- `tabs/terminal_tab.zig` is the frontend: blocks, the input box, the command queue, and the agent features (`src/agent.zig` for API agents answering plain-English lines and Explain, `src/coding_agents.zig` for launching a CLI coding agent on a failed block).
+- `tabs/terminal_tab.zig` is the frontend: blocks, the input box, the command queue, and the agent features (`src/agent.zig` for API agents answering plain-English lines and Explain, `src/coding_agents.zig` for launching a CLI coding agent on a failed block, `src/agent_cli.zig` for asking such a CLI one question without its interface when it is the one chosen for plain-English lines).
 
 ### Documents, notebooks, web
 
 - Text editing is shared: `input/editor.zig` (buffer, caret, selection, IME) → `input/document.zig` (line index, undo, per-line syntax state) → `tabs/text_editor.zig`. `syntax/` holds the lexers. The Markdown tab's preview (`tabs/markdown_view.zig`) is itself editable.
+- Comparisons: a row of the files panel's Git view (`ui/git_panel.zig`) opens `tabs/diff_tab.zig`, two read-only `TextEditor`s side by side over the rows `src/diff.zig` computes (the versions come from `git show` and the disk).
 - Notebooks: `notebook/bridge.zig` starts `assets/notebook/tt_jupyter.py` with the notebook's Python; that script runs the kernel through jupyter_client and relays messages as one JSON line each over pipes. `tabs/notebook_tab.zig` is tt's own cell frontend; `notebook/ipynb.zig` reads and writes plain nbformat 4. HTML/Plotly/SVG outputs are WKWebViews clipped over the Metal layer.
 - Website tabs (`tabs/web_tab.zig`, `web_bridge.zig`, `web_menu.zig`) host a WKWebView through `Env.host`; permissions and notifications go through `platform/media.zig` and `platform/notify.zig`.
 

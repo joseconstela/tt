@@ -302,6 +302,7 @@ fn buildMenu() void {
     _ = addItem(app_menu, "About tt", "orderFrontStandardAboutPanel:", "", null);
     addSeparator(app_menu);
     _ = addItem(app_menu, "Settings…", "openSettings:", ",", null);
+    _ = addItem(app_menu, "Install CLI Tools…", "installCli:", "", null);
     addSeparator(app_menu);
     _ = addItem(app_menu, "Hide tt", "hide:", "h", null);
     _ = addItem(app_menu, "Hide Others", "hideOtherApplications:", "h", mod_cmd | mod_alt);
@@ -417,6 +418,7 @@ fn registerViewClass() objc.Class {
     b.method("quickOpen:", actionQuickOpen, "v@:@");
     b.method("goToLine:", actionGoToLine, "v@:@");
     b.method("openSettings:", actionOpenSettings, "v@:@");
+    b.method("installCli:", actionInstallCli, "v@:@");
     b.method("clearBlocks:", actionClear, "v@:@");
     b.method("saveDocument:", actionSave, "v@:@");
     b.method("undo:", actionUndo, "v@:@");
@@ -560,6 +562,13 @@ fn tick(_: id, _: SEL, _: id) callconv(.c) void {
         pickProjectFolder();
     }
     const dirty = app.update(now);
+    // A `tt <path>` typed in a shell (maybe another terminal's) reached us.
+    if (app.front_requested) {
+        app.front_requested = false;
+        if (msg(bool, g.window, "isMiniaturized", .{})) msg(void, g.window, "deminiaturize:", .{@as(id, null)});
+        msg(void, g.window, "makeKeyAndOrderFront:", .{@as(id, null)});
+        msg(void, g.nsapp, "activateIgnoringOtherApps:", .{true});
+    }
     if (!dirty) return;
     // nextDrawable blocks when the window is not on screen; skip drawing
     // then. The self test still lays the frame out so the hosted views get
@@ -1195,6 +1204,9 @@ fn actionQuickOpen(_: id, _: SEL, _: id) callconv(.c) void {
 }
 fn actionGoToLine(_: id, _: SEL, _: id) callconv(.c) void {
     if (g.app) |app| app.perform(.go_to_line);
+}
+fn actionInstallCli(_: id, _: SEL, _: id) callconv(.c) void {
+    if (g.app) |app| app.perform(.install_cli);
 }
 fn actionOpenSettings(_: id, _: SEL, _: id) callconv(.c) void {
     if (g.app) |app| app.perform(.open_settings);

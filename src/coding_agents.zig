@@ -1,9 +1,12 @@
 //! The coding agents that may be installed on this Mac — Claude Code,
 //! Codex, Gemini CLI … — as opposed to the model APIs in `config.zig`.
 //! Knows which ones to look for, finds the ones that are there (Settings ›
-//! AI › Agents shows the result) and builds the shell line that starts one
-//! on a task ("Fix with agent" on a failed block). Nothing here runs
-//! anything: the line goes to the tab's own shell like a typed command.
+//! AI › Agents shows the result) and builds the two ways one is used: the
+//! shell line that starts it on a task ("Fix with agent" on a failed
+//! block) and the arguments that make it answer one question and exit
+//! ("Unrecognised commands" with a coding agent). Nothing here runs
+//! anything: the line goes to the tab's own shell like a typed command,
+//! and `agent_cli.zig` runs the question.
 const std = @import("std");
 const sys = @import("sys.zig");
 
@@ -16,6 +19,12 @@ pub const Known = struct {
     binary: []const u8,
     /// How it is started on a task: `{prompt}` becomes the quoted prompt.
     template: []const u8,
+    /// The arguments that make it answer one prompt on stdout and exit,
+    /// without its interface; the prompt follows as the last argument.
+    /// Null when the agent has no such mode, or when that mode would run
+    /// commands or change files without asking: an answer must only ever
+    /// be text.
+    ask: ?[]const []const u8 = null,
     blurb: []const u8,
     /// How to get it, for the card of one that is not installed.
     install: []const u8,
@@ -23,11 +32,14 @@ pub const Known = struct {
 
 /// In the order they are listed and, for "automatic", tried.
 pub const known = [_]Known{
-    .{ .id = "claude", .label = "Claude Code", .binary = "claude", .template = "claude {prompt}", .blurb = "Anthropic's coding agent for the terminal.", .install = "npm install -g @anthropic-ai/claude-code" },
-    .{ .id = "codex", .label = "Codex", .binary = "codex", .template = "codex {prompt}", .blurb = "OpenAI's coding agent for the terminal.", .install = "npm install -g @openai/codex" },
-    .{ .id = "gemini", .label = "Gemini CLI", .binary = "gemini", .template = "gemini -i {prompt}", .blurb = "Google's coding agent for the terminal.", .install = "npm install -g @google/gemini-cli" },
+    // `--tools ""` leaves it no tools; it must come before `-p`, or the
+    // prompt would be read as a tool name. The question is not kept as a
+    // session to resume.
+    .{ .id = "claude", .label = "Claude Code", .binary = "claude", .template = "claude {prompt}", .ask = &.{ "--tools", "", "--no-session-persistence", "-p" }, .blurb = "Anthropic's coding agent for the terminal.", .install = "npm install -g @anthropic-ai/claude-code" },
+    .{ .id = "codex", .label = "Codex", .binary = "codex", .template = "codex {prompt}", .ask = &.{ "exec", "--skip-git-repo-check", "--sandbox", "read-only" }, .blurb = "OpenAI's coding agent for the terminal.", .install = "npm install -g @openai/codex" },
+    .{ .id = "gemini", .label = "Gemini CLI", .binary = "gemini", .template = "gemini -i {prompt}", .ask = &.{"-p"}, .blurb = "Google's coding agent for the terminal.", .install = "npm install -g @google/gemini-cli" },
     .{ .id = "opencode", .label = "OpenCode", .binary = "opencode", .template = "opencode --prompt {prompt}", .blurb = "Open-source agent that works with any model.", .install = "curl -fsSL https://opencode.ai/install | bash" },
-    .{ .id = "copilot", .label = "GitHub Copilot CLI", .binary = "copilot", .template = "copilot -i -p {prompt}", .blurb = "GitHub's coding agent for the terminal.", .install = "npm install -g @github/copilot" },
+    .{ .id = "copilot", .label = "GitHub Copilot CLI", .binary = "copilot", .template = "copilot -i -p {prompt}", .ask = &.{"-p"}, .blurb = "GitHub's coding agent for the terminal.", .install = "npm install -g @github/copilot" },
     .{ .id = "cursor", .label = "Cursor Agent", .binary = "cursor-agent", .template = "cursor-agent {prompt}", .blurb = "Cursor's agent for the terminal.", .install = "curl https://cursor.com/install -fsS | bash" },
     .{ .id = "aider", .label = "Aider", .binary = "aider", .template = "aider --message {prompt}", .blurb = "Pair programming in the terminal; runs the task and hands back.", .install = "python -m pip install aider-install && aider-install" },
     .{ .id = "goose", .label = "Goose", .binary = "goose", .template = "goose run -s -t {prompt}", .blurb = "Block's open-source agent.", .install = "brew install block-goose-cli" },
@@ -167,6 +179,38 @@ pub fn launchCommand(gpa: std.mem.Allocator, k: *const Known, prompt: []const u8
     return out.toOwnedSlice(gpa);
 }
 
+/// The command that makes `k` answer `prompt` and exit: the program (its
+/// full `path` when the scan found it, else its name for PATH to resolve),
+/// the `ask` arguments, then the prompt. Null when `k` cannot be asked.
+/// The slice is the caller's (`gpa`); its strings are borrowed.
+pub fn askArgv(gpa: std.mem.Allocator, k: *const Known, path: ?[]const u8, prompt: []const u8) !?[][]const u8 {
+    const args = k.ask orelse return null;
+    const argv = try gpa.alloc([]const u8, args.len + 2);
+    argv[0] = path orelse k.binary;
+    @memcpy(argv[1 .. 1 + args.len], args);
+    argv[argv.len - 1] = prompt;
+    return argv;
+}
+
+/// The PATH a coding agent started by tt itself gets: the folder it was
+/// found in (an agent installed through npm keeps its `node` there), then
+/// tt's own PATH, then the usual places — an app started from the Finder
+/// has a short PATH. As `PATH=…`, owned by the caller.
+pub fn pathEnv(gpa: std.mem.Allocator, path: ?[]const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "PATH=");
+    if (path) |p| {
+        const dir = sys.dirname(p);
+        if (dir.len > 0) try out.print(gpa, "{s}:", .{dir});
+    }
+    if (sys.getenv("PATH")) |own| {
+        if (own.len > 0) try out.print(gpa, "{s}:", .{own});
+    }
+    try out.appendSlice(gpa, "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    return out.toOwnedSlice(gpa);
+}
+
 /// `s` as a zsh `$'…'` word: backslash and quote escaped, line breaks and
 /// tabs as `\n` / `\t`, other control bytes as `\xHH`; UTF-8 passes through.
 pub fn quote(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
@@ -218,6 +262,31 @@ test "launchCommand: the template's {prompt} takes the quoted prompt" {
     defer gpa.free(line3);
     try std.testing.expectEqualStrings("tool --go $'a'", line3);
     try std.testing.expect(byId("nonsense") == null);
+}
+
+test "askArgv: the program, the agent's own arguments, the prompt last" {
+    const gpa = std.testing.allocator;
+    const claude = byId("claude").?;
+    const argv = (try askArgv(gpa, claude, "/x/bin/claude", "what now?")).?;
+    defer gpa.free(argv);
+    try std.testing.expectEqual(@as(usize, 6), argv.len);
+    try std.testing.expectEqualStrings("/x/bin/claude", argv[0]);
+    // The empty tool list sits before `-p`, never right before the prompt.
+    try std.testing.expectEqualStrings("--tools", argv[1]);
+    try std.testing.expectEqualStrings("", argv[2]);
+    try std.testing.expectEqualStrings("-p", argv[4]);
+    try std.testing.expectEqualStrings("what now?", argv[5]);
+    // Not found by the scan: PATH resolves the name.
+    const gemini = (try askArgv(gpa, byId("gemini").?, null, "x")).?;
+    defer gpa.free(gemini);
+    try std.testing.expectEqualStrings("gemini", gemini[0]);
+    // An agent whose one-shot mode acts on its own is never asked.
+    try std.testing.expect(try askArgv(gpa, byId("goose").?, null, "x") == null);
+
+    const env = try pathEnv(gpa, "/x/bin/claude");
+    defer gpa.free(env);
+    try std.testing.expect(std.mem.startsWith(u8, env, "PATH=/x/bin:"));
+    try std.testing.expect(std.mem.endsWith(u8, env, ":/usr/bin:/bin"));
 }
 
 test "scanDirs: finds executables by name, first folder wins, skips non-executables and folders" {

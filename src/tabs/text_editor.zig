@@ -9,6 +9,11 @@
 //! editor, with draggable bars on both axes and a drag past an edge pulling
 //! the view along. Only the visible lines are lexed and drawn, every frame,
 //! from the document's per-line syntax state.
+//!
+//! A comparison (`diff_tab.zig`) shows one side of itself in an editor: it
+//! hands over the number each row carries in the gutter (`numbers`) and
+//! how each row is marked (`marks`: a tint for a line that went or came,
+//! with the part that changed picked out).
 const std = @import("std");
 const ui_mod = @import("../ui/ui.zig");
 const theme = @import("../ui/theme.zig");
@@ -27,6 +32,27 @@ pub const line_h = theme.output_line_h;
 const tab_width: usize = 4;
 const default_pad_top: f32 = 10;
 const default_pad_bottom: f32 = 24;
+
+/// How a comparison marks a row: the tint behind it, and the bytes of the
+/// line (`from`..`to`) that are the change itself.
+pub const RowMark = struct {
+    tint: Tint = .none,
+    from: u32 = 0,
+    to: u32 = 0,
+
+    /// `blank` is a row the other side has a line for and this one does not.
+    pub const Tint = enum(u8) { none, removed, added, blank };
+
+    fn color(self: RowMark, strong: bool) ui_mod.Color {
+        const a: f32 = if (strong) 0.3 else 0.13;
+        return switch (self.tint) {
+            .none => ui_mod.Color.transparent,
+            .removed => theme.red.alpha(a),
+            .added => theme.ansi[2].alpha(a),
+            .blank => theme.text.alpha(0.035),
+        };
+    }
+};
 
 pub const TextEditor = struct {
     gpa: std.mem.Allocator,
@@ -60,6 +86,11 @@ pub const TextEditor = struct {
     /// date from the lines that get drawn. It never shrinks, which costs
     /// nothing but a little slack at the right; a reload measures afresh.
     max_cols: usize = 0,
+    /// A comparison's rows (see `RowMark`), one entry per line, owned by
+    /// whoever set them: the gutter shows `numbers[i]` for line i (0 = no
+    /// number) instead of i + 1, and `marks[i]` tints it.
+    numbers: ?[]const u32 = null,
+    marks: ?[]const RowMark = null,
 
     pub fn init(gpa: std.mem.Allocator, salt: usize) TextEditor {
         return .{ .gpa = gpa, .doc = Document.init(gpa), .salt = salt };
@@ -470,6 +501,16 @@ pub const TextEditor = struct {
             if (ly + line_h > body.y and ly < body.bottom()) dl.rect(.{ .x = body.x, .y = ly, .w = body.w, .h = line_h }, theme.line_highlight);
         }
 
+        // A comparison's tints.
+        if (self.marks) |marks| {
+            var i = first;
+            while (i < n and i < marks.len) : (i += 1) {
+                const y = y0 + @as(f32, @floatFromInt(i)) * line_h;
+                if (y > body.bottom()) break;
+                if (marks[i].tint != .none) dl.rect(.{ .x = body.x, .y = y, .w = body.w, .h = line_h }, marks[i].color(false));
+            }
+        }
+
         // Gutter.
         if (self.gutter) {
             var i = first;
@@ -477,7 +518,9 @@ pub const TextEditor = struct {
                 const y = y0 + @as(f32, @floatFromInt(i)) * line_h;
                 if (y > body.bottom()) break;
                 var num_buf: [16]u8 = undefined;
-                const num = std.fmt.bufPrint(&num_buf, "{d}", .{i + 1}) catch "";
+                const shown = if (self.numbers) |nums| (if (i < nums.len) nums[i] else 0) else i + 1;
+                if (shown == 0) continue;
+                const num = std.fmt.bufPrint(&num_buf, "{d}", .{shown}) catch "";
                 const color = if (i == caret_line and focused) theme.text_2 else theme.text_3.alpha(0.7);
                 _ = dl.textRight(font, px + gutter_w - 8, y + line_h / 2, num, color);
             }
@@ -499,6 +542,7 @@ pub const TextEditor = struct {
             const line = doc.lineText(i);
             const ls = doc.lineStartOf(i);
             doc.lexInto(i, &self.spans);
+            const mark: RowMark = if (self.marks) |marks| (if (i < marks.len) marks[i] else .{}) else .{};
             var cur: usize = 0;
             const baseline_px = @round(ui.text.baselineForCenter(font, y + line_h / 2) * scale);
             var col: usize = 0;
@@ -518,6 +562,7 @@ pub const TextEditor = struct {
                 }
                 const visible = cx + cw >= text_area.x;
                 if (visible) {
+                    if (at >= mark.from and at < mark.to) dl.rect(.{ .x = cx, .y = y, .w = cw, .h = line_h }, mark.color(true));
                     if (sel) |s| if (ls + at >= s[0] and ls + at < s[1]) {
                         dl.rect(.{ .x = cx, .y = y + 1, .w = cw, .h = line_h - 2 }, theme.selection());
                     };

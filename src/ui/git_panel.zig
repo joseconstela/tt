@@ -2,7 +2,9 @@
 //! of VS Code's — the branch, a message box, a Commit button, and the
 //! changes in lists (merge conflicts, staged, not yet) with stage /
 //! unstage / discard buttons on each row and each list. A row opens its
-//! file. Discards ask first: the panel hands the app a question, the app
+//! change as a side-by-side comparison (`tabs/diff_tab.zig`): what is
+//! staged against the last commit, what is not against the index.
+//! Discards ask first: the panel hands the app a question, the app
 //! shows the box and calls `discardConfirmed` when it is accepted.
 const std = @import("std");
 const ui_mod = @import("ui.zig");
@@ -41,14 +43,18 @@ pub const Menu = struct {
 };
 
 pub const Result = struct {
-    /// A row was clicked: the file's absolute path (valid this frame).
-    open_file: ?[]const u8 = null,
+    /// A row was clicked: the change to show side by side (valid this frame).
+    open_diff: ?Diff = null,
     /// A discard was asked for: the app shows this and confirms it back.
     confirm: ?Confirm = null,
     /// The branch button was clicked: the app opens this menu and hands
     /// the picked row back to `menuPicked`.
     menu: ?Menu = null,
 };
+
+/// A row's change: the file's absolute path, which half of it the row
+/// stands for, and where a staged rename came from (root-relative).
+pub const Diff = struct { path: []const u8, staged: bool, orig: ?[]const u8 = null };
 
 const MenuKind = enum { fetch, local, remote };
 
@@ -559,12 +565,13 @@ pub const Panel = struct {
         lx += nw + 8;
         if (!std.mem.eql(u8, dir, ".") and lx < right) _ = dl.textEllipsis(theme.font_hint, lx, row.centerY(), dir, right - lx, theme.text_3);
 
-        if (st.clicked and letter != 'D' and self.repo.snapshot.isRepo()) {
+        // A folder git lists as one row (all of it new) has no two sides.
+        if (st.clicked and !e.is_dir and self.repo.snapshot.isRepo()) {
             self.out_path.clearRetainingCapacity();
             self.out_path.appendSlice(self.gpa, self.repo.snapshot.root) catch return;
             self.out_path.append(self.gpa, '/') catch return;
             self.out_path.appendSlice(self.gpa, e.path) catch return;
-            res.open_file = self.out_path.items;
+            res.open_diff = .{ .path = self.out_path.items, .staged = section == .staged, .orig = if (section == .staged) e.orig else null };
         }
     }
 

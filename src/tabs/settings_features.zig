@@ -1,7 +1,9 @@
 //! Settings › AI › Features: what the agents are used for. One card per
 //! feature — Unrecognised commands, Explain, Fix with agent — and each card
 //! holds both halves of its setting: which agent does the job, and, in the
-//! same card, the prompt that agent is told first. Explain and Fix with
+//! same card, the prompt that agent is told first. Unrecognised commands
+//! picks from both kinds of agent: the APIs, then the installed coding
+//! agents that can answer a question through their CLI (`agent_cli.zig`). Explain and Fix with
 //! agent also say whether a failed notebook cell gets the button (it does
 //! unless switched off here). Everything lives in `config.features` and is
 //! written as it changes.
@@ -22,7 +24,7 @@ const Rect = ui_mod.Rect;
 
 /// The features, in the order of their cards.
 pub const Feature = enum {
-    /// A line the shell does not know goes to an API agent.
+    /// A line the shell does not know goes to an API or a coding agent.
     fallback,
     /// "Explain" on a failed block asks an API agent why.
     explain,
@@ -39,7 +41,7 @@ pub const Feature = enum {
 
     pub fn hint(self: Feature) []const u8 {
         return switch (self) {
-            .fallback => "When the shell does not know a command, the line goes to this agent instead.",
+            .fallback => "A line the shell does not know goes to this API or coding agent instead.",
             .explain => "Explain, on a failed command or notebook cell, asks this agent why it failed. The answer stays under the error.",
             .fix => "Fix with agent, on a failed command or notebook cell, hands the failure to this coding agent. AI › Agents lists the installed ones.",
         };
@@ -590,7 +592,7 @@ pub const Page = struct {
 
         var ry = card.y + card_head;
         ry = switch (feature) {
-            .fallback => drawApiPicker(ui, feature, card, ry, &config.get().features.command_fallback_agent),
+            .fallback => drawCodingPicker(ui, card, drawApiPicker(ui, feature, card, ry, &config.get().features.command_fallback_agent)),
             .explain => drawApiPicker(ui, feature, card, ry, &config.get().features.explain_agent),
             .fix => drawFixPicker(ui, card, ry),
         };
@@ -625,10 +627,16 @@ pub const Page = struct {
     fn pickerRows(feature: Feature) usize {
         const cfg = config.get();
         switch (feature) {
-            .fallback, .explain => {
-                const current = if (feature == .fallback) cfg.features.command_fallback_agent else cfg.features.explain_agent;
-                const missing = if (current) |name| cfg.findAgentByName(name) == null else false;
-                return 1 + cfg.agents.items.len + @intFromBool(missing) + @intFromBool(feature == .explain);
+            .fallback => {
+                const f = &cfg.features;
+                // A coding agent, when one is chosen, is the choice.
+                const coding = f.command_fallback_coding_agent;
+                const missing_api = if (coding.len > 0) false else if (f.command_fallback_agent) |name| cfg.findAgentByName(name) == null else false;
+                return 1 + cfg.agents.items.len + @intFromBool(missing_api) + askable() + @intFromBool(codingMissing(coding));
+            },
+            .explain => {
+                const missing = if (cfg.features.explain_agent) |name| cfg.findAgentByName(name) == null else false;
+                return 1 + cfg.agents.items.len + @intFromBool(missing) + 1;
             },
             .fix => {
                 const scan = coding_agents.get();
@@ -643,7 +651,8 @@ pub const Page = struct {
     fn pickerNote(feature: Feature) ?[]const u8 {
         const cfg = config.get();
         switch (feature) {
-            .fallback, .explain => return if (cfg.agents.items.len == 0) "No APIs yet: add one under AI › APIs." else null,
+            .fallback => return if (cfg.agents.items.len == 0 and askable() == 0) "No APIs yet, and no coding agent that can answer: see AI › APIs and AI › Agents." else null,
+            .explain => return if (cfg.agents.items.len == 0) "No APIs yet: add one under AI › APIs." else null,
             .fix => return if (coding_agents.get().found.items.len == 0) "No coding agent found on this Mac: AI › Agents says how to install one." else null,
         }
     }
@@ -657,13 +666,19 @@ pub const Page = struct {
         const n: usize = @as(usize, @backingInt(feature)) * 64;
         // `current` points into the config: a click below replaces that
         // string, so it is re-read after one (and a stale choice is gone).
-        var current: ?[]const u8 = slot.*;
+        // On the fallback card a chosen coding agent is the choice (its
+        // rows follow, see `drawCodingPicker`): no row here is selected
+        // then, and picking one takes the coding agent's place.
+        const coding: *[]u8 = &cfg.features.command_fallback_coding_agent;
+        const by_coding = feature == .fallback and coding.len > 0;
+        var current: ?[]const u8 = if (by_coding) null else slot.*;
         var missing = if (current) |name| cfg.findAgentByName(name) == null else false;
 
         var ry = y;
         const off_detail: []const u8 = if (feature == .fallback) "Unknown commands stay errors." else "The button says so when pressed.";
-        if (radioRow(ui, Ui.id("settings.features.pick", n), card, ry, "Off", off_detail, current == null, true)) {
+        if (radioRow(ui, Ui.id("settings.features.pick", n), card, ry, "Off", off_detail, current == null and !by_coding, true)) {
             cfg.setOptString(slot, null);
+            if (feature == .fallback) cfg.setString(coding, "");
             cfg.touch();
             current = null;
             missing = false;
@@ -675,6 +690,7 @@ pub const Page = struct {
             const detail = if (a.model.len == 0) a.provider.label() else std.fmt.bufPrint(&detail_buf, "{s} · {s}", .{ a.provider.label(), a.model }) catch a.provider.label();
             if (radioRow(ui, Ui.id("settings.features.pick", n + 1 + i), card, ry, a.name, detail, selected, true)) {
                 cfg.setOptString(slot, a.name);
+                if (feature == .fallback) cfg.setString(coding, "");
                 cfg.touch();
                 current = slot.*;
                 missing = false;
@@ -683,6 +699,40 @@ pub const Page = struct {
         }
         if (missing) {
             _ = radioRow(ui, 0, card, ry, current.?, "No longer set up: pick another.", true, false);
+            ry += row_h;
+        }
+        return ry;
+    }
+
+    /// The second half of the fallback card's picker: one row per installed
+    /// coding agent that can answer a question through its CLI. A chosen
+    /// one that is gone (uninstalled, or not askable) stays listed until
+    /// another is picked.
+    fn drawCodingPicker(ui: *Ui, card: Rect, y: f32) f32 {
+        const cfg = config.get();
+        const f = &cfg.features;
+        const scan = coding_agents.get();
+        const n: usize = @as(usize, @backingInt(Feature.fallback)) * 64 + 32;
+        var ry = y;
+        var i: usize = 0;
+        for (scan.found.items) |found| {
+            if (found.known.ask == null) continue;
+            var path_buf: [256]u8 = undefined;
+            var detail_buf: [300]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buf, "Coding agent · {s}", .{sys.abbreviateHome(found.path, &path_buf)}) catch "Coding agent";
+            const selected = std.mem.eql(u8, f.command_fallback_coding_agent, found.known.id);
+            if (radioRow(ui, Ui.id("settings.features.pick", n + i), card, ry, found.known.label, detail, selected, true)) {
+                cfg.setString(&f.command_fallback_coding_agent, found.known.id);
+                cfg.touch();
+            }
+            ry += row_h;
+            i += 1;
+        }
+        const coding = f.command_fallback_coding_agent;
+        if (codingMissing(coding)) {
+            const k = coding_agents.byId(coding);
+            const why: []const u8 = if (k != null and k.?.ask == null) "Cannot answer questions: pick another." else "Not installed: pick another.";
+            _ = radioRow(ui, 0, card, ry, if (k) |x| x.label else coding, why, true, false);
             ry += row_h;
         }
         return ry;
@@ -728,6 +778,24 @@ pub const Page = struct {
         return ry;
     }
 };
+
+/// How many installed coding agents can answer a question (the fallback
+/// card lists those).
+fn askable() usize {
+    var n: usize = 0;
+    for (coding_agents.get().found.items) |found| {
+        if (found.known.ask != null) n += 1;
+    }
+    return n;
+}
+
+/// True when the coding agent chosen for the fallback (`id`, "" = none)
+/// has no row of its own: not installed, or not one that can be asked.
+fn codingMissing(id: []const u8) bool {
+    if (id.len == 0) return false;
+    const found = coding_agents.get().find(id) orelse return true;
+    return found.known.ask == null;
+}
 
 /// An on/off row: the label and a dim detail, a switch at the right.
 /// True when clicked.

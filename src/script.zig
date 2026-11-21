@@ -26,6 +26,11 @@
 //!   action new_tab         any App.Action
 //!   project /path          add a folder as a project
 //!   open /path/file        open a file in a viewer tab
+//!   cli /path              what `tt /path` does (`App.openPath`): a folder or a
+//!                          file, in the default project. Paths after the script
+//!                          on the command line open the same way before line 1,
+//!                          and with `TT_SOCKET=<file>` set the run also takes the
+//!                          paths of a `tt <path>` started with the same variable
 //!   web https://…          open a website tab (no web view headless: the chrome only)
 //!   web_ask camera https://meet.example   the website tab on show asks (camera,
 //!                          microphone, both, notifications): the bar under the
@@ -227,6 +232,8 @@ pub fn runHeadless(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
             app.addProject(rest);
         } else if (std.mem.eql(u8, cmd, "open")) {
             app.openFile(rest);
+        } else if (std.mem.eql(u8, cmd, "cli")) {
+            app.openPath(rest);
         } else if (std.mem.eql(u8, cmd, "web")) {
             _ = app.tabs.openWith("web", .{ .url = if (rest.len > 0) rest else null }) catch |err| {
                 std.debug.print("script: could not open a website tab: {s}\n", .{@errorName(err)});

@@ -42,7 +42,7 @@ pub const EditMenuOpts = struct {
 
 /// What a confirm box leads to when it is accepted (`close_others` and
 /// `close_right` are the tab menu's "Close Others" / "Close to the Right").
-pub const ConfirmKind = enum { close_tab, close_others, close_right, git_discard, delete_file, search_replace };
+pub const ConfirmKind = enum { close_tab, close_others, close_right, git_discard, delete_file, search_replace, install_cli, notice };
 
 /// What a files-panel menu is about: a file, a folder, or the folder on
 /// show itself (a click on the panel's blank space).
@@ -106,6 +106,10 @@ pub const Outcome = union(enum) {
     list_picked: usize,
     /// The Search view's "Replace All" box accepted: the view rewrites the files.
     replace_confirmed: void,
+    /// The "Install CLI Tools…" box accepted.
+    install_cli_confirmed: void,
+    /// A notice was read: nothing follows.
+    dismissed: void,
     /// Project menu → "Rename…": open the rename box for this project.
     rename_project: u32,
     /// Rename box confirmed for a project (`name` as in `renamed`; blank
@@ -503,7 +507,7 @@ pub const Overlay = struct {
         if (!self.isOpen() or self.subject != .tab or self.mode == .list) return null;
         if (self.mode == .confirm) switch (self.confirm_kind) {
             .close_tab, .close_others, .close_right => {},
-            .git_discard, .delete_file, .search_replace => return null,
+            .git_discard, .delete_file, .search_replace, .install_cli, .notice => return null,
         };
         return self.id;
     }
@@ -620,6 +624,11 @@ pub const Overlay = struct {
         self.title_len = copyInto(&self.title_buf, heading);
         self.reason_len = copyInto(&self.reason_buf, reason);
         self.ok_len = copyInto(&self.ok_buf, ok);
+    }
+
+    /// A box that only tells: `heading`, `detail` under it, and OK.
+    pub fn openNotice(self: *Overlay, heading: []const u8, detail: []const u8) void {
+        self.openConfirmAction(.notice, 0, heading, detail, "OK");
     }
 
     // ── per-tick ────────────────────────────────────────────────────────
@@ -863,6 +872,8 @@ pub const Overlay = struct {
             .git_discard => .discard_confirmed,
             .delete_file => .delete_confirmed,
             .search_replace => .replace_confirmed,
+            .install_cli => .install_cli_confirmed,
+            .notice => .dismissed,
             .close_tab => .{ .close_confirmed = uid },
             .close_others => .{ .close_others_confirmed = uid },
             .close_right => .{ .close_right_confirmed = uid },
@@ -1195,8 +1206,12 @@ pub const Overlay = struct {
 
         var out: ?Outcome = null;
         var right = box.right() - box_pad;
-        if (boxButton(ui, Ui.id("overlay.ok", 0), &right, y, self.ok_buf[0..self.ok_len], .destructive)) out = self.confirmClose();
-        if (boxButton(ui, Ui.id("overlay.cancel", 0), &right, y, "Cancel", .plain)) self.close();
+        // Nothing is lost by installing, and a notice has nothing to cancel.
+        const harmless = self.confirm_kind == .install_cli or self.confirm_kind == .notice;
+        if (boxButton(ui, Ui.id("overlay.ok", 0), &right, y, self.ok_buf[0..self.ok_len], if (harmless) .primary else .destructive)) out = self.confirmClose();
+        if (self.confirm_kind != .notice) {
+            if (boxButton(ui, Ui.id("overlay.cancel", 0), &right, y, "Cancel", .plain)) self.close();
+        }
         return out;
     }
 

@@ -20,6 +20,7 @@ const EditCommand = @import("../events.zig").EditCommand;
 const sys = @import("../sys.zig");
 const block_codec = @import("../term/block_codec.zig");
 const agent = @import("../agent.zig");
+const agent_cli = @import("../agent_cli.zig");
 const config = @import("../config.zig");
 const coding_agents = @import("../coding_agents.zig");
 const settings_features = @import("settings_features.zig");
@@ -66,7 +67,7 @@ const max_output_bytes: usize = 4 * 1024;
 /// shell did not know (into the block's output) or the explanation of a
 /// failure (into `Block.explanation`).
 const PendingKind = enum { answer, explain };
-const Pending = struct { block_id: u32, req: *agent.Request, kind: PendingKind = .answer };
+const Pending = struct { block_id: u32, req: agent_cli.Reply, kind: PendingKind = .answer };
 const note_fullscreen = "Ran full-screen; it left nothing on the screen when it ended.";
 
 pub const TerminalTab = struct {
@@ -525,7 +526,7 @@ pub const TerminalTab = struct {
     /// a block headed `label` asks the agent `question`, as a `# question`
     /// typed here would.
     pub fn askAgent(self: *TerminalTab, label: []const u8, question: []const u8) void {
-        if (config.get().features.command_fallback_agent == null) {
+        if (!config.get().features.fallbackOn()) {
             self.session.addNote(label, note_no_agent);
             return;
         }
@@ -541,7 +542,7 @@ pub const TerminalTab = struct {
             self.session.addNote(cmd, note_empty_question);
             return;
         }
-        if (config.get().features.command_fallback_agent == null) {
+        if (!config.get().features.fallbackOn()) {
             self.session.addNote(cmd, note_no_agent);
             return;
         }
@@ -558,7 +559,7 @@ pub const TerminalTab = struct {
             if (!b.unrecognised or !b.finished() or b.agent) continue;
             b.unrecognised = false;
             if (b.exit_code != 127) continue;
-            if (config.get().features.command_fallback_agent == null) continue;
+            if (!config.get().features.fallbackOn()) continue;
             self.ask(b, b.command);
             changed = true;
         }
@@ -580,37 +581,37 @@ pub const TerminalTab = struct {
         b.t_end = 0;
         if (self.sel_block == b.id) self.sel_block = 0;
 
-        const cfg = config.get();
-        const name = cfg.features.command_fallback_agent orelse {
-            self.failAgent(b, note_no_agent);
-            return;
-        };
-        const a = cfg.findAgentByName(name) orelse {
-            self.failAgent(b, "The agent chosen under Settings › AI › Features is no longer set up.");
-            return;
-        };
-
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const system = self.systemPrompt(arena) catch "";
         var messages: std.ArrayList(agent.Message) = .empty;
         self.conversation(arena, &messages, b, question) catch {
             self.failAgent(b, "Out of memory.");
             return;
         };
-        var prepared = agent.prepare(self.gpa, a, system, messages.items, .{ .tools = true }) catch |err| {
-            var buf: [256]u8 = undefined;
-            self.failAgent(b, prepareFailure(err, a, &buf));
-            return;
+        const reply: agent_cli.Reply = switch (agent_cli.answerer(config.get())) {
+            .off => return self.failAgent(b, note_no_agent),
+            .api_gone => return self.failAgent(b, "The agent chosen under Settings › AI › Features is no longer set up."),
+            .cli_gone => return self.failAgent(b, agent_cli.note_cli_gone),
+            .api => |a| blk: {
+                const system = self.systemPrompt(arena, .tool) catch "";
+                var prepared = agent.prepare(self.gpa, a, system, messages.items, .{ .tools = true }) catch |err| {
+                    var buf: [256]u8 = undefined;
+                    self.failAgent(b, prepareFailure(err, a, &buf));
+                    return;
+                };
+                defer prepared.deinit(self.gpa);
+                break :blk .{ .api = agent.Request.start(&prepared) catch return self.failAgent(b, "Out of memory.") };
+            },
+            // A coding agent: one prompt to its CLI, run in the tab's directory.
+            .cli => |who| blk: {
+                const system = self.systemPrompt(arena, .fenced) catch "";
+                const prompt = agent_cli.flatten(arena, system, messages.items) catch return self.failAgent(b, "Out of memory.");
+                break :blk .{ .cli = agent_cli.Request.start(who, self.session.cwd.items, prompt) catch return self.failAgent(b, "The coding agent could not be started.") };
+            },
         };
-        defer prepared.deinit(self.gpa);
-        const req = agent.Request.start(&prepared) catch {
-            self.failAgent(b, "Out of memory.");
-            return;
-        };
-        self.pending.append(self.gpa, .{ .block_id = b.id, .req = req }) catch {
-            req.release();
+        self.pending.append(self.gpa, .{ .block_id = b.id, .req = reply }) catch {
+            reply.release();
             self.failAgent(b, "Out of memory.");
         };
     }
@@ -741,7 +742,7 @@ pub const TerminalTab = struct {
             self.explainFailed(b, "Out of memory.");
             return;
         };
-        self.pending.append(self.gpa, .{ .block_id = b.id, .req = req, .kind = .explain }) catch {
+        self.pending.append(self.gpa, .{ .block_id = b.id, .req = .{ .api = req }, .kind = .explain }) catch {
             req.release();
             self.explainFailed(b, "Out of memory.");
         };
@@ -936,12 +937,19 @@ pub const TerminalTab = struct {
 
     /// What the agent is told before the conversation: the prompt from
     /// Settings › AI › Features (or the default), then where the user is.
-    fn systemPrompt(self: *TerminalTab, arena: std.mem.Allocator) ![]u8 {
+    fn systemPrompt(self: *TerminalTab, arena: std.mem.Allocator, how: enum { tool, fenced }) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(arena, settings_features.promptFor(.fallback));
         try out.print(arena, "\n\nContext: the user is in a terminal on macOS running zsh, in the directory {s}", .{self.session.cwd.items});
         if (self.session.branch.items.len > 0) try out.print(arena, " (git branch {s})", .{self.session.branch.items});
-        try out.appendSlice(arena, ". The messages carry a transcript of that terminal: the commands run so far, what they printed (stdout and stderr together, as the terminal showed them) and how they ended; read it before answering. When a command would do what the user wants, call propose_command with it: it lands in the user's input box for them to check and run, so never assume it ran and never make up its output; say in a line what it does. Answer in plain text for a monospaced terminal: no Markdown headings or tables, short lines.");
+        try out.appendSlice(arena, ". The messages carry a transcript of that terminal: the commands run so far, what they printed (stdout and stderr together, as the terminal showed them) and how they ended; read it before answering. ");
+        // An API calls the tool; a coding agent's CLI has none and writes
+        // the command as a fenced block, which `agent_cli.parseReply` takes.
+        try out.appendSlice(arena, switch (how) {
+            .tool => "When a command would do what the user wants, call propose_command with it: it lands in the user's input box for them to check and run, so never assume it ran and never make up its output; say in a line what it does.",
+            .fenced => agent_cli.command_form,
+        });
+        try out.appendSlice(arena, " Answer in plain text for a monospaced terminal: no Markdown headings or tables, short lines.");
         return out.toOwnedSlice(arena);
     }
 

@@ -11,6 +11,9 @@
 //! app asks `kindForFile` which viewer opens a path, so adding a viewer for
 //! a new format is one struct and one `register` call — nothing else in
 //! the app needs to know the new type exists.
+//!
+//! The comparison tab ("diff") is the one kind opened on more than a path:
+//! the Git view hands it `OpenArgs.diff` (which two versions to compare).
 const std = @import("std");
 const ui_mod = @import("../ui/ui.zig");
 const EditCommand = @import("../events.zig").EditCommand;
@@ -51,9 +54,21 @@ pub const OpenArgs = struct {
     web_view: ?*anyopaque = null,
     /// Terminal: spawn the shell right away; false waits for the first command.
     start_shell: bool = true,
+    /// Comparison: which two versions of `path` to show side by side.
+    diff: ?Diff = null,
     /// What the kind's `save` wrote in an earlier run (see workspace.zig),
     /// for the tab to come back from.
     saved: ?[]const u8 = null,
+};
+
+/// What a comparison tab (`diff_tab.zig`) is opened on, with `path`: a
+/// change as the Git view lists it.
+pub const Diff = struct {
+    /// What is staged (the last commit against the index) rather than
+    /// what is not yet (the index against the file on disk).
+    staged: bool = false,
+    /// A staged rename: where the file was, relative to the repository's root.
+    orig: ?[]const u8 = null,
 };
 
 /// Services shared by every tab.
@@ -82,6 +97,12 @@ pub const Env = struct {
     pub fn openUrl(self: *Env, url: []const u8) void {
         const copy = self.gpa.dupe(u8, url) catch return;
         self.requests.append(self.gpa, .{ .open_url = copy }) catch self.gpa.free(copy);
+    }
+
+    /// `path` in the viewer that claims it (or the tab already showing it).
+    pub fn openFile(self: *Env, path: []const u8) void {
+        const copy = self.gpa.dupe(u8, path) catch return;
+        self.requests.append(self.gpa, .{ .open_file = copy }) catch self.gpa.free(copy);
     }
 
     /// `text` into the input box of a shell in the row on show; nothing runs.
@@ -140,6 +161,7 @@ fn noClipboard(_: std.mem.Allocator) ?[]u8 {
 /// the app between ticks (`App.update`). The text is the queue's until then.
 pub const Request = union(enum) {
     open_url: []u8,
+    open_file: []u8,
     send_to_shell: []u8,
     run_in_shell: []u8,
     ask_agent: Ask,
@@ -155,7 +177,7 @@ pub const Request = union(enum) {
     pub fn free(self: Request, gpa: std.mem.Allocator) void {
         switch (self) {
             .adopt_web_view, .close_tab, .reveal_tab => {},
-            .open_url, .send_to_shell, .run_in_shell => |s| gpa.free(s),
+            .open_url, .open_file, .send_to_shell, .run_in_shell => |s| gpa.free(s),
             .ask_agent => |a| {
                 gpa.free(a.label);
                 gpa.free(a.question);

@@ -8,6 +8,23 @@ pub extern "c" fn _NSGetEnviron() *[*:null]?[*:0]u8;
 pub extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
 pub extern "c" fn getuid() c_uint;
 
+// Unix-domain sockets and process detaching, for `cli.zig`.
+pub const SockaddrUn = extern struct { len: u8 = @sizeOf(SockaddrUn), family: u8 = 1, path: [104]u8 = @splat(0) };
+pub const PollFd = extern struct { fd: c_int, events: i16 = 1, revents: i16 = 0 };
+pub extern "c" fn socket(domain: c_int, kind: c_int, protocol: c_int) c_int;
+pub extern "c" fn bind(fd: c_int, addr: *const SockaddrUn, len: u32) c_int;
+pub extern "c" fn connect(fd: c_int, addr: *const SockaddrUn, len: u32) c_int;
+pub extern "c" fn listen(fd: c_int, backlog: c_int) c_int;
+pub extern "c" fn accept(fd: c_int, addr: ?*anyopaque, len: ?*u32) c_int;
+pub extern "c" fn poll(fds: [*]PollFd, count: c_uint, timeout_ms: c_int) c_int;
+pub extern "c" fn fork() c_int;
+pub extern "c" fn setsid() c_int;
+pub extern "c" fn dup2(from: c_int, to: c_int) c_int;
+pub extern "c" fn execv(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+pub extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, size: usize) isize;
+pub extern "c" fn symlink(target: [*:0]const u8, link: [*:0]const u8) c_int;
+pub extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
+
 pub fn getenv(name: [*:0]const u8) ?[]const u8 {
     const v = c.getenv(name) orelse return null;
     return std.mem.span(v);
@@ -302,11 +319,33 @@ pub const RunResult = struct {
     }
 };
 
+/// Lets another thread stop a command `runWatched` is waiting for.
+pub const Watch = struct {
+    /// The child, once it is started (0 before).
+    pid: std.atomic.Value(c.pid_t) = .init(0),
+    stopped: std.atomic.Value(bool) = .init(false),
+
+    /// Ends the command and everything it started; `runWatched` returns
+    /// with status -1. Safe before the command started and after it ended.
+    pub fn stop(self: *Watch) void {
+        self.stopped.store(true, .seq_cst);
+        const pid = self.pid.load(.seq_cst);
+        if (pid > 0) _ = c.kill(-pid, c.SIG.TERM);
+    }
+};
+
 /// Runs `argv` in `cwd` with stdin from /dev/null and collects what it
 /// writes until it exits. `extra_env` (NAME=value) is added to our own
-/// environment. Blocks until the command is done: call it for quick
-/// commands, or from a thread of its own.
+/// environment, taking the place of a variable of the same name. Blocks
+/// until the command is done: call it for quick commands, or from a
+/// thread of its own.
 pub fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, extra_env: []const []const u8) !RunResult {
+    return runWatched(gpa, cwd, argv, extra_env, null);
+}
+
+/// `run` for a command that may take long: with a `watch`, the command
+/// gets a process group of its own and `watch.stop()` ends it.
+pub fn runWatched(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, extra_env: []const []const u8, watch: ?*Watch) !RunResult {
     if (argv.len == 0) return error.NoCommand;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -320,9 +359,17 @@ pub fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, ex
     var env_count: usize = 0;
     while (environ[env_count] != null) env_count += 1;
     const envp = try arena.alloc(?[*:0]const u8, env_count + extra_env.len + 1);
-    for (0..env_count) |i| envp[i] = environ[i];
-    for (extra_env, 0..) |e, i| envp[env_count + i] = (try arena.dupeSentinel(u8, e, 0)).ptr;
-    envp[env_count + extra_env.len] = null;
+    var env_len: usize = 0;
+    for (0..env_count) |i| {
+        if (overridden(std.mem.span(environ[i].?), extra_env)) continue;
+        envp[env_len] = environ[i];
+        env_len += 1;
+    }
+    for (extra_env) |e| {
+        envp[env_len] = (try arena.dupeSentinel(u8, e, 0)).ptr;
+        env_len += 1;
+    }
+    envp[env_len] = null;
     const cwd_z = try arena.dupeSentinel(u8, if (cwd.len == 0) "." else cwd, 0);
 
     var out_pipe: [2]c.fd_t = undefined;
@@ -346,7 +393,10 @@ pub fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, ex
     defer _ = c.posix_spawnattr_destroy(&attr);
     // Only the three standard descriptors reach the child: no pty or pipe
     // of ours leaks into it.
-    _ = c.posix_spawnattr_setflags(&attr, .{ .CLOEXEC_DEFAULT = true, .SETSIGDEF = true });
+    // A watched command leads a process group, so stopping it takes the
+    // processes it started along.
+    _ = c.posix_spawnattr_setflags(&attr, .{ .CLOEXEC_DEFAULT = true, .SETSIGDEF = true, .SETPGROUP = watch != null });
+    if (watch != null) _ = c.posix_spawnattr_setpgroup(&attr, 0);
 
     var pid: c.pid_t = 0;
     const rc = c.posix_spawnp(&pid, argv_z[0].?, &actions, &attr, @ptrCast(argv_z.ptr), @ptrCast(envp.ptr));
@@ -357,6 +407,13 @@ pub fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, ex
         _ = c.close(err_pipe[0]);
         return error.SpawnFailed;
     }
+    if (watch) |w| {
+        w.pid.store(pid, .seq_cst);
+        // A stop that came before the pid was known.
+        if (w.stopped.load(.seq_cst)) _ = c.kill(-pid, c.SIG.TERM);
+    }
+    // The pid is ours until `waitpid` below: nothing may signal it after.
+    defer if (watch) |w| w.pid.store(0, .seq_cst);
 
     var bufs: [2]std.ArrayList(u8) = .{ .empty, .empty };
     errdefer for (&bufs) |*b| b.deinit(gpa);
@@ -402,4 +459,13 @@ pub fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, ex
         .stderr = try bufs[1].toOwnedSlice(gpa),
         .status = code,
     };
+}
+
+/// True when `extra` (NAME=value entries) sets the variable `entry` sets.
+fn overridden(entry: []const u8, extra: []const []const u8) bool {
+    const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return false;
+    for (extra) |e| {
+        if (std.mem.startsWith(u8, e, entry[0 .. eq + 1])) return true;
+    }
+    return false;
 }

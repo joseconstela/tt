@@ -136,6 +136,27 @@ pub fn build(b: *std.Build) void {
     sign.step.dependOn(&install_icon.step);
     app_step.dependOn(&install_icon.step);
 
+    // `zig build install-app` → ~/Applications/tt.app. The old copy is
+    // removed first so files dropped from the bundle do not linger; ditto
+    // keeps the signature's seal intact. A running tt keeps working on its
+    // deleted binary and picks up the new one on relaunch.
+    const install_app_step = b.step("install-app", "Build the app bundle and copy it to ~/Applications/tt.app");
+    const copy_app = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -e
+        \\dest="$HOME/Applications/tt.app"
+        \\mkdir -p "$HOME/Applications"
+        \\rm -rf "$dest"
+        \\ditto "$1" "$dest"
+        \\echo "installed $dest"
+        ,
+        "sh",
+    });
+    copy_app.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "tt.app" } });
+    copy_app.has_side_effects = true;
+    copy_app.step.dependOn(app_step);
+    install_app_step.dependOn(&copy_app.step);
+
     // `zig build test` — pure-Zig logic (terminal parser, buffers, editor …)
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),

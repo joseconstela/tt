@@ -2,6 +2,7 @@
 //! tabs and the projects; receives input events; builds and submits frames.
 const std = @import("std");
 const objc = @import("objc.zig");
+const cli = @import("cli.zig");
 const draw = @import("gfx/draw.zig");
 const text_mod = @import("gfx/text.zig");
 const Renderer = @import("gfx/renderer.zig").Renderer;
@@ -19,6 +20,7 @@ const paths = @import("paths.zig");
 const tab_mod = @import("tabs/tab.zig");
 const TerminalTab = @import("tabs/terminal_tab.zig").TerminalTab;
 const FileTab = @import("tabs/file_tab.zig").FileTab;
+const DiffTab = @import("tabs/diff_tab.zig").DiffTab;
 const MarkdownTab = @import("tabs/markdown_tab.zig").MarkdownTab;
 const NotebookTab = @import("tabs/notebook_tab.zig").NotebookTab;
 const ImageTab = @import("tabs/image_tab.zig").ImageTab;
@@ -41,9 +43,23 @@ pub const LaunchOptions = struct {
     height: f32 = 900,
     scale: f32 = 2,
     script_path: ?[]const u8 = null,
+    /// Absolute paths named on the command line, opened once the tabs of
+    /// the last run are back (`App.openPath`).
+    open_paths: []const []const u8 = &.{},
 };
 
 pub const Chrome = sidebar_mod.Chrome;
+
+const CliInstall = struct {
+    gpa: std.mem.Allocator,
+    result: cli.Install = .failed,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *CliInstall) void {
+        self.result = cli.install(self.gpa, cli.linkPath());
+        self.done.store(true, .release);
+    }
+};
 
 pub const Action = enum {
     /// A terminal tab; with a resource on show, another shell in its folder.
@@ -68,6 +84,9 @@ pub const Action = enum {
     /// The files panel's Search view, its box focused (⌘⇧F).
     find_in_files,
     open_settings,
+    /// The app menu's "Install CLI Tools…": asks, then links `tt` into the
+    /// PATH (`cli.install`).
+    install_cli,
     clear,
     /// ⌘K: the palette in command mode.
     command_palette,
@@ -139,6 +158,16 @@ pub const App = struct {
     quit_requested: bool = false,
     /// Set by `.add_project`; the platform layer runs the picker and calls `addProject`.
     folder_pick_requested: bool = false,
+    /// Set when a `tt <path>` typed in a shell reached this app; the
+    /// platform layer brings the window forward and clears it.
+    front_requested: bool = false,
+    /// Where a `tt <path>` typed in a shell finds this app (`cli.zig`).
+    /// Null in a second instance, and in test runs unless `TT_SOCKET` names
+    /// a socket of their own.
+    cli_server: ?cli.Server = null,
+    /// "Install CLI Tools…" at work on its own thread (it may be waiting
+    /// for a password); `update` reports how it went.
+    cli_install: ?*CliInstall = null,
     /// Project the user last touched (where pinned files go when the
     /// directory does not decide).
     selected_project: ?u32 = null,
@@ -229,15 +258,25 @@ pub const App = struct {
         self.tabs.register(.{ .name = "markdown", .label = "Markdown", .create = MarkdownTab.create, .accepts = MarkdownTab.accepts });
         self.tabs.register(.{ .name = "notebook", .label = "Notebook", .create = NotebookTab.create, .accepts = NotebookTab.accepts });
         self.tabs.register(.{ .name = "file", .label = "File", .create = FileTab.create, .accepts = FileTab.accepts });
+        self.tabs.register(.{ .name = "diff", .label = "Diff", .create = DiffTab.create });
         self.tabs.register(.{ .name = "settings", .label = "Settings", .create = SettingsTab.create, .singleton = true, .renamable = false });
         self.tabs.register(.{ .name = "web", .label = "Website", .create = WebTab.create });
         // The tabs of the last run come back; a first run starts with one shell.
         _ = self.workspace.restore(&self.tabs, &self.projects);
         self.keepShowingSomething();
+        for (opts.open_paths) |path| self.openPath(path);
+        if (sys.getenv("TT_SOCKET") != null or (opts.script_path == null and sys.getenv("TT_SELFTEST") == null)) {
+            var buf: [256]u8 = undefined;
+            if (cli.socketPath(&buf)) |path| {
+                sys.mkdir(gpa, sys.dirname(path));
+                self.cli_server = cli.Server.listen(path);
+            }
+        }
         return self;
     }
 
     pub fn destroy(self: *App) void {
+        if (self.cli_server) |*s| s.deinit();
         self.workspace.save(&self.tabs, &self.projects);
         self.workspace.deinit();
         self.tabs.deinit();
@@ -325,6 +364,8 @@ pub const App = struct {
             }
         }
         self.serveRequests();
+        self.serveCli();
+        self.reportCliInstall();
         self.keepShowingSomething();
         // A menu or box about a tab that has since closed itself has nothing left to act on.
         if (self.overlay.aboutTab()) |uid| if (self.tabs.byUid(uid) == null) self.overlay.close();
@@ -425,6 +466,7 @@ pub const App = struct {
         // The files panel owns the splitter on its left edge, so it goes before the panes.
         const fr = self.files.draw(ui, files_rect, true, dragged);
         if (fr.open_file) |path| self.openFile(path);
+        if (fr.open_diff) |d| self.openDiff(d);
         if (fr.open_at) |o| self.openFileAt(o);
         if (fr.pin_file) |path| self.pinFile(path);
         if (fr.confirm) |c| self.overlay.openConfirmAction(.git_discard, 0, c.heading, c.reason, "Discard");
@@ -795,6 +837,11 @@ pub const App = struct {
             .toggle_files => self.files.toggle(),
             .find_in_files => self.files.openSearch(self.now),
             .open_settings => _ = self.tabs.open("settings") catch {},
+            .install_cli => {
+                var buf: [200]u8 = undefined;
+                const reason = std.fmt.bufPrint(&buf, "Links {s} to this app. macOS may ask for your password.", .{cli.linkPath()}) catch "";
+                self.overlay.openConfirmAction(.install_cli, 0, "Install the tt command?", reason, "Install");
+            },
             .clear => if (self.tabs.current()) |t| t.vtable.onCtrl(t.ptr, 'l'),
             .add_project => self.folder_pick_requested = true,
             .add_project_here => self.addProject(self.currentCwd()),
@@ -895,6 +942,7 @@ pub const App = struct {
                 .open_url => |url| _ = self.tabs.openWith("web", .{ .url = url }) catch |err| {
                     std.log.err("could not open a website tab: {s}", .{@errorName(err)});
                 },
+                .open_file => |path| self.openFile(path),
                 .send_to_shell => |text| if (self.shellTab()) |t| {
                     t.vtable.paste(t.ptr, text);
                     if (self.env.host) |h| h.focusApp();
@@ -1176,6 +1224,8 @@ pub const App = struct {
             },
             .discard_confirmed => self.files.discardConfirmed(),
             .replace_confirmed => self.files.replaceConfirmed(),
+            .install_cli_confirmed => self.startCliInstall(),
+            .dismissed => {},
             .list_picked => |i| self.files.menuPicked(i),
             .rename_project => |pid| if (self.projects.find(pid)) |p| {
                 self.overlay.openRename(.project, pid, p.name);
@@ -1599,6 +1649,69 @@ pub const App = struct {
         self.invalidate();
     }
 
+    fn startCliInstall(self: *App) void {
+        if (self.cli_install != null) return;
+        const job = self.gpa.create(CliInstall) catch return;
+        job.* = .{ .gpa = self.gpa };
+        // Never joined: quitting must not wait for a password prompt.
+        const thread = std.Thread.spawn(.{}, CliInstall.run, .{job}) catch {
+            self.gpa.destroy(job);
+            self.overlay.openNotice("Could not install the tt command", "The installer could not be started.");
+            return;
+        };
+        thread.detach();
+        self.cli_install = job;
+    }
+
+    /// Says how "Install CLI Tools…" went once its thread is done.
+    fn reportCliInstall(self: *App) void {
+        const job = self.cli_install orelse return;
+        if (!job.done.load(.acquire)) return;
+        self.cli_install = null;
+        defer self.gpa.destroy(job);
+        var buf: [200]u8 = undefined;
+        const link = cli.linkPath();
+        switch (job.result) {
+            .installed => self.overlay.openNotice("The tt command is installed", "In any terminal: tt . opens a folder, tt notes.md a file."),
+            .already => self.overlay.openNotice("The tt command is already installed", std.fmt.bufPrint(&buf, "{s} points at this app.", .{link}) catch ""),
+            .taken => self.overlay.openNotice("Could not install the tt command", std.fmt.bufPrint(&buf, "{s} exists and is not a link. Move it away first.", .{link}) catch ""),
+            .failed => self.overlay.openNotice("Could not install the tt command", std.fmt.bufPrint(&buf, "{s} could not be written.", .{link}) catch ""),
+            .cancelled => {},
+        }
+        self.invalidate();
+    }
+
+    /// Paths a `tt <path>` typed in a shell handed over since the last tick.
+    fn serveCli(self: *App) void {
+        const server = if (self.cli_server) |*s| s else return;
+        while (server.accept(self.gpa)) |message| {
+            defer self.gpa.free(message);
+            var it = cli.paths(message);
+            while (it.next()) |path| self.openPath(path);
+            self.front_requested = true;
+            self.invalidate();
+        }
+    }
+
+    /// A path from the command line (`tt .`, `tt notes.md`), absolute: it
+    /// opens in the default project whatever row is on show. A folder gets
+    /// a shell in it (the files panel follows), unless the tab in front is
+    /// already a shell there; a file opens in its viewer.
+    pub fn openPath(self: *App, path: []const u8) void {
+        self.tabs.show(tab_mod.TabManager.default_group) catch |err| {
+            std.log.err("could not show the default project: {s}", .{@errorName(err)});
+            return;
+        };
+        self.invalidate();
+        if (!sys.isDirectory(self.gpa, path)) return self.openFile(path);
+        if (self.tabs.current()) |t| {
+            if (t.vtable.path(t.ptr).len == 0 and std.mem.eql(u8, t.vtable.cwd(t.ptr), path)) return;
+        }
+        _ = self.tabs.openWith("terminal", .{ .cwd = path }) catch |err| {
+            std.log.err("could not open terminal tab: {s}", .{@errorName(err)});
+        };
+    }
+
     /// Opens a file in the viewer that claims it — by its first bytes, then
     /// its extension — or focuses the tab already showing it in any pane of
     /// the group on show.
@@ -1618,6 +1731,24 @@ pub const App = struct {
             std.log.err("could not open {s} as {s}: {s}", .{ path, kind.name, @errorName(err) });
         };
         self.invalidate();
+    }
+
+    /// A change picked in the Git view: its two versions side by side, or
+    /// the tab already comparing them in any pane of the group on show.
+    fn openDiff(self: *App, d: files_mod.Diff) void {
+        defer self.invalidate();
+        for (self.tabs.group().layout.owned.items) |p| {
+            for (p.tabs.items) |t| {
+                if (!std.mem.eql(u8, t.kind, "diff")) continue;
+                const tab: *DiffTab = @ptrCast(@alignCast(t.ptr));
+                if (!tab.shows(d.path, d.staged)) continue;
+                _ = self.tabs.focus(t.uid);
+                return;
+            }
+        }
+        _ = self.tabs.openWith("diff", .{ .path = d.path, .diff = .{ .staged = d.staged, .orig = d.orig } }) catch |err| {
+            std.log.err("could not compare {s}: {s}", .{ d.path, @errorName(err) });
+        };
     }
 
     /// A Search match: opens (or focuses) the file and selects the match.
