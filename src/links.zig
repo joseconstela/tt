@@ -184,7 +184,7 @@ pub fn markdownAt(line: []const u8, at: usize) ?Target {
                 const inner = line[i + 1 .. close];
                 if (inner.len > 2 and (inner[0] == 'a' or inner[0] == 'A') and (inner[1] == ' ' or inner[1] == '\t')) {
                     // <a href="…">text</a>
-                    const end_tag = std.ascii.indexOfIgnoreCasePos(line, close + 1, "</a>") orelse line.len;
+                    const end_tag = std.ascii.findIgnoreCasePos(line, close + 1, "</a>") orelse line.len;
                     const span: Span = .{ .start = i, .end = @min(line.len, end_tag + 4) };
                     if (span.contains(at)) {
                         const href = attr(inner, "href") orelse return null;
@@ -210,7 +210,7 @@ pub fn markdownAt(line: []const u8, at: usize) ?Target {
 /// The value of `name="…"` (or '…', or bare) in a tag's inside.
 fn attr(inner: []const u8, name: []const u8) ?[]const u8 {
     var from: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(inner, from, name)) |p| {
+    while (std.ascii.findIgnoreCasePos(inner, from, name)) |p| {
         from = p + name.len;
         if (p > 0 and inner[p - 1] != ' ' and inner[p - 1] != '\t') continue;
         var k = p + name.len;

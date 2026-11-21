@@ -274,7 +274,7 @@ fn drawDefaults(ui: *Ui, cfg: *config.Config, x: f32, y: f32, col_w: f32, featur
         const current = cfg.browser.default(f);
         for (choices, 0..) |c, k| {
             const cw = field.chipWidth(ui, c.label());
-            if (field.chip(ui, Ui.id("settings.perm.default", @as(usize, @intFromEnum(f)) * 4 + k), .{ .x = cx, .y = cy - 13, .w = cw, .h = 26 }, c.label(), current == c)) {
+            if (field.chip(ui, Ui.id("settings.perm.default", @as(usize, @backingInt(f)) * 4 + k), .{ .x = cx, .y = cy - 13, .w = cw, .h = 26 }, c.label(), current == c)) {
                 cfg.setDefaultPermission(f, c);
                 cfg.save();
             }
@@ -314,7 +314,7 @@ fn drawSites(ui: *Ui, cfg: *config.Config, x: f32, y: f32, col_w: f32, features:
         const label = "Remove all";
         const w = ui.text.measure(theme.font_hint, label) + 20;
         const r: Rect = .{ .x = card.right() - card_pad - w, .y = card.y + 16, .w = w, .h = 24 };
-        if (field.textButton(ui, Ui.id("settings.perm.remove_all", @intFromEnum(features[0])), r, label, theme.text_2)) {
+        if (field.textButton(ui, Ui.id("settings.perm.remove_all", @backingInt(features[0])), r, label, theme.text_2)) {
             cfg.removeAllSitePermissions(features);
             cfg.save();
             return card.bottom();
@@ -332,7 +332,7 @@ fn drawSites(ui: *Ui, cfg: *config.Config, x: f32, y: f32, col_w: f32, features:
         rx -= fw;
         const remove: Rect = .{ .x = rx, .y = cy - 12, .w = fw, .h = 24 };
         var remove_clicked = false;
-        if (field.textButton(ui, Ui.id("settings.perm.remove", row * 8 + @as(usize, @intFromEnum(features[0]))), remove, "Remove", theme.text_2)) remove_clicked = true;
+        if (field.textButton(ui, Ui.id("settings.perm.remove", row * 8 + @as(usize, @backingInt(features[0]))), remove, "Remove", theme.text_2)) remove_clicked = true;
         rx -= 14;
         var set: ?struct { f: config.SiteFeature, p: config.Permission } = null;
         var fi = features.len;
@@ -345,7 +345,7 @@ fn drawSites(ui: *Ui, cfg: *config.Config, x: f32, y: f32, col_w: f32, features:
             const chips_x = cx;
             for (choices, 0..) |c, k| {
                 const cw = field.chipWidth(ui, c.label());
-                if (field.chip(ui, Ui.id("settings.perm.site", (row * 4 + @as(usize, @intFromEnum(f))) * 4 + k), .{ .x = cx, .y = cy - 13, .w = cw, .h = 26 }, c.label(), st.get(f) == c)) set = .{ .f = f, .p = c };
+                if (field.chip(ui, Ui.id("settings.perm.site", (row * 4 + @as(usize, @backingInt(f))) * 4 + k), .{ .x = cx, .y = cy - 13, .w = cw, .h = 26 }, c.label(), st.get(f) == c)) set = .{ .f = f, .p = c };
                 cx += cw + 6;
             }
             rx = chips_x - 6;

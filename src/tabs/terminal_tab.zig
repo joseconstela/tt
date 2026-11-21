@@ -255,7 +255,7 @@ pub const TerminalTab = struct {
             h.update(std.mem.asBytes(&b.id));
             h.update(std.mem.asBytes(&b.buf.version));
             h.update(std.mem.asBytes(&b.exit_code));
-            h.update(&[_]u8{ @intFromEnum(b.state), @intFromEnum(b.explain_state) });
+            h.update(&[_]u8{ @backingInt(b.state), @backingInt(b.explain_state) });
             // An explanation counts once it is settled (the codec skips one
             // still coming in), so streaming does not rewrite the file.
             if (b.explain_state == .done or b.explain_state == .failed) h.update(b.explanation.items);
@@ -2167,7 +2167,7 @@ fn paletteColor(rs: *const screen_mod.RenderState, i: u8) Color {
 
 /// A screen style's colour for `role`, as the theme shows it (`theme.ink`).
 fn styleColor(rs: *const screen_mod.RenderState, c: anytype, role: theme.InkRole) ?Color {
-    return switch (c) {
+    return switch (c.value()) {
         .none => null,
         .palette => |i| if (i < 16 and role == .fg) theme.ansi[i] else theme.ink(paletteColor(rs, i), role),
         .rgb => |rgb| theme.ink(Color.fromRgb8(rgb.r, rgb.g, rgb.b), role),

@@ -1,0 +1,88 @@
+# CI for tt: formatting, unit tests, Debug + ReleaseSafe builds and the app
+# bundle, on every push and every pull request.
+#
+# Nothing here opens a window, starts a shell session, a notebook kernel, the
+# camera or the microphone: no TT_SELFTEST_* legs and no `--script` runs (those
+# drive a real zsh and need Metal). The only network use is fetching Zig and
+# the dependency pinned in build.zig.zon.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer run of the same ref (a branch, or a pull request's merge ref)
+# replaces the one still in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # One job on purpose: macOS minutes are billed per job, rounded up, at a
+  # multiple of the Linux rate on private repositories, and every step below
+  # shares one checkout, one Zig install and one compile cache. Each check is
+  # its own step, and the checks do not gate each other, so one run reports
+  # every failure by name.
+  check:
+    name: fmt · test · build · app
+    # macos-26 is the Apple Silicon image (what macos-latest points at today),
+    # named explicitly so an image change is a commit here. Its default Xcode
+    # is a 26.x, which `zig build app` needs: actool compiles icon.icon (an
+    # Icon Composer file) from Xcode 26 on.
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No `version:` input: the action reads minimum_zig_version from
+      # build.zig.zon, the one place the Zig version is written. It also
+      # restores and saves Zig's global cache (with the local cache redirected
+      # into it), which holds the fetched ghostty tarball and the compiled
+      # objects, so a warm run neither downloads nor rebuilds them.
+      - name: Install Zig (version from build.zig.zon)
+        id: zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Toolchain versions
+        run: |
+          zig version
+          sw_vers
+          xcodebuild -version
+
+      - name: Formatting (zig fmt --check)
+        if: ${{ !cancelled() && steps.zig.outcome == 'success' }}
+        run: zig fmt --check src build.zig
+
+      - name: Unit tests
+        if: ${{ !cancelled() && steps.zig.outcome == 'success' }}
+        run: zig build test --summary all
+
+      - name: Build (Debug)
+        if: ${{ !cancelled() && steps.zig.outcome == 'success' }}
+        run: zig build --summary all
+
+      - name: Build (ReleaseSafe)
+        if: ${{ !cancelled() && steps.zig.outcome == 'success' }}
+        run: zig build -Doptimize=ReleaseSafe --summary all
+
+      - name: App bundle (zig build app)
+        if: ${{ !cancelled() && steps.zig.outcome == 'success' }}
+        run: zig build app --summary all
+
+      - name: Verify the app bundle
+        if: ${{ !cancelled() && steps.zig.outcome == 'success' }}
+        run: |
+          app=zig-out/tt.app
+          test -x "$app/Contents/MacOS/tt"
+          test -f "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          # What actool made of icon.icon.
+          test -f "$app/Contents/Resources/Assets.car"
+          test -f "$app/Contents/Resources/icon.icns"
+          codesign --verify --deep --strict --verbose=2 "$app"

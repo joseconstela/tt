@@ -65,13 +65,13 @@ pub const Pty = struct {
         }
         for (opts.env_overrides) |ov| {
             if (std.mem.indexOfScalar(u8, ov, '=') == null) continue;
-            try env.append(arena, (try arena.dupeZ(u8, ov)).ptr);
+            try env.append(arena, (try arena.dupeSentinel(u8, ov, 0)).ptr);
         }
         try env.append(arena, null);
         const envp: [*:null]const ?[*:0]const u8 = @ptrCast(env.items.ptr);
 
         const argv = [_:null]?[*:0]const u8{opts.argv0.ptr};
-        const cwd_z = try arena.dupeZ(u8, opts.cwd);
+        const cwd_z = try arena.dupeSentinel(u8, opts.cwd, 0);
 
         var ws: Winsize = .{ .row = opts.rows, .col = opts.cols };
         var master: c_int = -1;

@@ -1,0 +1,3 @@
+# Paths pre-commit lets in as NEW files even though they are over 1 MB.
+# One per line, relative to the repo root; shell globs work (assets/fonts/*.ttf).
+# Files that are already tracked never need an entry: only additions are checked.

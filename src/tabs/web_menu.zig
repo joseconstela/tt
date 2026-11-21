@@ -101,7 +101,7 @@ pub fn fill(tab: *WebTab, view: id, menu: id) void {
                 objc.nsString(e.title), objc.sel("ttMenuAction:"), objc.nsString(""),
             }));
             msg(void, it, "setTarget:", .{view});
-            msg(void, it, "setTag:", .{@as(NSInteger, @intFromEnum(e.action))});
+            msg(void, it, "setTag:", .{@as(NSInteger, @backingInt(e.action))});
             break :blk it;
         };
         msg(void, menu, "insertItem:atIndex:", .{ item, @as(NSInteger, @intCast(i)) });
@@ -112,8 +112,8 @@ pub fn fill(tab: *WebTab, view: id, menu: id) void {
 /// rest of the app is queued on the tab's `Env`; the app serves it on the
 /// next tick.
 pub fn perform(tab: *WebTab, tag: NSInteger) void {
-    if (tag < 0 or tag > @intFromEnum(Action.open_link)) return;
-    const action: Action = @enumFromInt(tag);
+    if (tag < 0 or tag > @backingInt(Action.open_link)) return;
+    const action: Action = @fromBackingInt(@intCast(tag));
     const sel = std.mem.trim(u8, tab.selection.items, " \t\r\n");
     switch (action) {
         .separator => {},

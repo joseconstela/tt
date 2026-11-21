@@ -375,7 +375,7 @@ fn readGroupFrom(gpa: std.mem.Allocator, field: *std.ArrayList(u8), projects: *P
 }
 
 fn dirExists(gpa: std.mem.Allocator, path: []const u8) bool {
-    const path_z = gpa.dupeZ(u8, path) catch return false;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return false;
     defer gpa.free(path_z);
     const dir = std.c.opendir(path_z.ptr) orelse return false;
     _ = std.c.closedir(dir);

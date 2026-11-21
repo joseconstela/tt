@@ -19,7 +19,7 @@ pub fn home() []const u8 {
 
 /// Reads at most the last `max_bytes` of a file.
 pub fn readFileTail(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
     const fd = c.open(path_z.ptr, .{ .ACCMODE = .RDONLY });
     if (fd < 0) return error.OpenFailed;
@@ -44,7 +44,7 @@ pub fn readFileTail(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) 
 
 /// Size of a file in bytes, or null if it cannot be opened.
 pub fn fileSize(gpa: std.mem.Allocator, path: []const u8) ?usize {
-    const path_z = gpa.dupeZ(u8, path) catch return null;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return null;
     defer gpa.free(path_z);
     const fd = c.open(path_z.ptr, .{ .ACCMODE = .RDONLY });
     if (fd < 0) return null;
@@ -58,7 +58,7 @@ pub const FileHead = struct { data: []u8, total: usize };
 
 /// Reads at most the first `max_bytes` of a file; `total` is its full size.
 pub fn readFileHead(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) !FileHead {
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
     const fd = c.open(path_z.ptr, .{ .ACCMODE = .RDONLY });
     if (fd < 0) return error.OpenFailed;
@@ -105,7 +105,7 @@ pub fn abbreviateHome(path: []const u8, buf: []u8) []const u8 {
 }
 
 pub fn writeFile(gpa: std.mem.Allocator, path: []const u8, data: []const u8, append: bool) !void {
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
     const fd = c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = !append, .APPEND = append }, @as(c_uint, 0o600));
     if (fd < 0) return error.OpenFailed;
@@ -119,13 +119,13 @@ pub fn writeFile(gpa: std.mem.Allocator, path: []const u8, data: []const u8, app
 }
 
 pub fn mkdir(gpa: std.mem.Allocator, path: []const u8) void {
-    const path_z = gpa.dupeZ(u8, path) catch return;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return;
     defer gpa.free(path_z);
     _ = c.mkdir(path_z.ptr, 0o700);
 }
 
 pub fn deleteFile(gpa: std.mem.Allocator, path: []const u8) void {
-    const path_z = gpa.dupeZ(u8, path) catch return;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return;
     defer gpa.free(path_z);
     _ = c.unlink(path_z.ptr);
 }
@@ -134,13 +134,13 @@ pub fn deleteFile(gpa: std.mem.Allocator, path: []const u8) void {
 const EEXIST: c_int = 17;
 
 pub fn exists(gpa: std.mem.Allocator, path: []const u8) bool {
-    const path_z = gpa.dupeZ(u8, path) catch return false;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return false;
     defer gpa.free(path_z);
     return c.access(path_z.ptr, c.F_OK) == 0;
 }
 
 pub fn isDirectory(gpa: std.mem.Allocator, path: []const u8) bool {
-    const path_z = gpa.dupeZ(u8, path) catch return false;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return false;
     defer gpa.free(path_z);
     const d = c.opendir(path_z.ptr) orelse return false;
     _ = c.closedir(d);
@@ -151,16 +151,16 @@ pub fn isDirectory(gpa: std.mem.Allocator, path: []const u8) bool {
 /// is already at `to` (`error.Exists`), except for a change of case only.
 pub fn renamePath(gpa: std.mem.Allocator, from: []const u8, to: []const u8) !void {
     if (!std.ascii.eqlIgnoreCase(from, to) and exists(gpa, to)) return error.Exists;
-    const from_z = try gpa.dupeZ(u8, from);
+    const from_z = try gpa.dupeSentinel(u8, from, 0);
     defer gpa.free(from_z);
-    const to_z = try gpa.dupeZ(u8, to);
+    const to_z = try gpa.dupeSentinel(u8, to, 0);
     defer gpa.free(to_z);
     if (c.rename(from_z.ptr, to_z.ptr) != 0) return error.RenameFailed;
 }
 
 /// A new, empty file; `error.Exists` when something is there already.
 pub fn createFile(gpa: std.mem.Allocator, path: []const u8) !void {
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
     const fd = c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(c_uint, 0o644));
     if (fd < 0) return if (__error().* == EEXIST) error.Exists else error.OpenFailed;
@@ -169,7 +169,7 @@ pub fn createFile(gpa: std.mem.Allocator, path: []const u8) !void {
 
 /// A new folder; `error.Exists` when something is there already.
 pub fn createDir(gpa: std.mem.Allocator, path: []const u8) !void {
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
     if (c.mkdir(path_z.ptr, 0o755) != 0) return if (__error().* == EEXIST) error.Exists else error.MkdirFailed;
 }
@@ -179,7 +179,7 @@ pub const DirEntry = struct { name: []const u8, is_dir: bool };
 /// Iterates a directory, calling `visit(ctx, entry)` for every entry except
 /// "." and "..". Entry names are only valid during the callback.
 pub fn listDir(gpa: std.mem.Allocator, path: []const u8, ctx: anytype, comptime visit: fn (@TypeOf(ctx), DirEntry) void) void {
-    const path_z = gpa.dupeZ(u8, if (path.len == 0) "." else path) catch return;
+    const path_z = gpa.dupeSentinel(u8, if (path.len == 0) "." else path, 0) catch return;
     defer gpa.free(path_z);
     const dir = c.opendir(path_z.ptr) orelse return;
     defer _ = c.closedir(dir);
@@ -217,7 +217,7 @@ pub const FileStat = struct {
 };
 
 pub fn statFile(gpa: std.mem.Allocator, path: []const u8) ?FileStat {
-    const path_z = gpa.dupeZ(u8, path) catch return null;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return null;
     defer gpa.free(path_z);
     var st: c.Stat = undefined;
     if (c_stat(path_z.ptr, &st) != 0) return null;
@@ -232,10 +232,10 @@ pub fn statFile(gpa: std.mem.Allocator, path: []const u8) ?FileStat {
 /// True when the file can be written (or, for a file that does not exist
 /// yet, when its directory can be).
 pub fn isWritable(gpa: std.mem.Allocator, path: []const u8) bool {
-    const path_z = gpa.dupeZ(u8, path) catch return false;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return false;
     defer gpa.free(path_z);
     if (c.access(path_z.ptr, c.F_OK) != 0) {
-        const dir_z = gpa.dupeZ(u8, dirname(path)) catch return false;
+        const dir_z = gpa.dupeSentinel(u8, dirname(path), 0) catch return false;
         defer gpa.free(dir_z);
         return c.access(dir_z.ptr, c.W_OK) == 0;
     }
@@ -267,7 +267,7 @@ pub fn writeFileAtomic(gpa: std.mem.Allocator, path: []const u8, data: []const u
         if (c.fsync(fd) != 0) return error.WriteFailed;
         if (statFile(gpa, path)) |st| _ = c.fchmod(fd, st.mode & 0o7777);
     }
-    const path_z = try gpa.dupeZ(u8, path);
+    const path_z = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(path_z);
     if (c.rename(tmpl.ptr, path_z.ptr) != 0) return error.RenameFailed;
     ok = true;
@@ -313,7 +313,7 @@ pub fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, ex
     const arena = arena_state.allocator();
 
     const argv_z = try arena.alloc(?[*:0]const u8, argv.len + 1);
-    for (argv, 0..) |a, i| argv_z[i] = (try arena.dupeZ(u8, a)).ptr;
+    for (argv, 0..) |a, i| argv_z[i] = (try arena.dupeSentinel(u8, a, 0)).ptr;
     argv_z[argv.len] = null;
 
     const environ = _NSGetEnviron().*;
@@ -321,9 +321,9 @@ pub fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, ex
     while (environ[env_count] != null) env_count += 1;
     const envp = try arena.alloc(?[*:0]const u8, env_count + extra_env.len + 1);
     for (0..env_count) |i| envp[i] = environ[i];
-    for (extra_env, 0..) |e, i| envp[env_count + i] = (try arena.dupeZ(u8, e)).ptr;
+    for (extra_env, 0..) |e, i| envp[env_count + i] = (try arena.dupeSentinel(u8, e, 0)).ptr;
     envp[env_count + extra_env.len] = null;
-    const cwd_z = try arena.dupeZ(u8, if (cwd.len == 0) "." else cwd);
+    const cwd_z = try arena.dupeSentinel(u8, if (cwd.len == 0) "." else cwd, 0);
 
     var out_pipe: [2]c.fd_t = undefined;
     var err_pipe: [2]c.fd_t = undefined;

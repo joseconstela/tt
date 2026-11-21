@@ -16,8 +16,6 @@ const TerminalTab = @import("../tabs/terminal_tab.zig").TerminalTab;
 const NotebookTab = @import("../tabs/notebook_tab.zig").NotebookTab;
 const notify = @import("notify.zig");
 const cfg_mod = @import("../config.zig");
-const camera = @import("camera.zig");
-const camera_controller = @import("../physical/camera_controller.zig");
 
 const id = objc.id;
 const SEL = objc.SEL;
@@ -78,7 +76,6 @@ pub fn run(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
     g.nsapp = msg(id, objc.class("NSApplication"), "sharedApplication", .{});
     msg(void, g.nsapp, "setActivationPolicy:", .{@as(NSInteger, 0)});
     g.view_class = registerViewClass();
-    blur_class = registerBlurViewClass();
     const delegate = msg(id, msg(id, registerDelegateClass(), "alloc", .{}), "init", .{});
     msg(void, g.nsapp, "setDelegate:", .{delegate});
     msg(void, g.nsapp, "run", .{});
@@ -165,6 +162,12 @@ fn willTerminate(_: id, _: SEL, _: id) callconv(.c) void {
 fn windowFocusChanged(_: id, _: SEL, _: id) callconv(.c) void {
     const app = g.app orelse return;
     app.chrome.window_focused = msg(bool, g.window, "isKeyWindow", .{});
+    // Keys let go of in another app never reach us: as far as tt knows
+    // they are all up (a ⌥ jump under way ends where it got to).
+    if (!app.chrome.window_focused) {
+        if (g.debug_events) std.debug.print("flags cleared (window resigned key)\n", .{});
+        app.onFlags(.{});
+    }
     app.invalidate();
 }
 
@@ -227,6 +230,7 @@ fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
         app.env.host = &host_impl;
         app.env.getClipboard = getClipboard;
     }
+    installKeyMonitor();
     // The app has read the settings by now: dress the window to match.
     syncWindowAppearance();
 
@@ -556,7 +560,6 @@ fn tick(_: id, _: SEL, _: id) callconv(.c) void {
         pickProjectFolder();
     }
     const dirty = app.update(now);
-    syncBlur(now);
     if (!dirty) return;
     // nextDrawable blocks when the window is not on screen; skip drawing
     // then. The self test still lays the frame out so the hosted views get
@@ -577,133 +580,6 @@ fn tick(_: id, _: SEL, _: id) callconv(.c) void {
 fn windowOnScreen() bool {
     const occlusion = msg(NSUInteger, g.window, "occlusionState", .{});
     return occlusion & (1 << 1) != 0;
-}
-
-// ── the away blur (Settings › Physical interactions) ─────────────────────
-// A blurring view over the whole window — the Metal view and the web
-// views hosted on it — fades in while the camera controller says nobody is
-// looking, and out the moment someone looks again (or types, or clicks).
-// It takes the clicks made on it, so nothing hidden under it is clicked by
-// accident: a click only counts as activity, which clears the blur. Keys
-// still reach the app underneath (and clear it too).
-var blur_class: objc.Class = null;
-var blur_view: id = null;
-var blur_on: bool = false;
-/// When the fade-out is over and the view hides: at alpha 0 it would still
-/// take the clicks.
-var blur_hide_at: f64 = 0;
-
-fn registerBlurViewClass() objc.Class {
-    const b = objc.ClassBuilder.begin("TTBlurView", "NSView");
-    b.method("mouseDown:", blurClicked, "v@:@");
-    b.method("rightMouseDown:", blurClicked, "v@:@");
-    b.method("otherMouseDown:", blurClicked, "v@:@");
-    b.method("scrollWheel:", blurClicked, "v@:@");
-    // The rest of a click stays here too: the app never saw its press.
-    for ([_][:0]const u8{ "mouseUp:", "rightMouseUp:", "otherMouseUp:", "mouseDragged:", "rightMouseDragged:", "otherMouseDragged:" }) |name| {
-        _ = objc.class_addMethod(b.cls, objc.sel_registerName(name.ptr), @ptrCast(&blurSwallow), "v@:@");
-    }
-    b.method("acceptsFirstMouse:", yesWithArg, "B@:@");
-    return b.register();
-}
-
-fn blurClicked(_: id, _: SEL, _: id) callconv(.c) void {
-    camera_controller.get().noteActivity(apple.CACurrentMediaTime());
-}
-
-fn blurSwallow(_: id, _: SEL, _: id) callconv(.c) void {}
-
-/// Shows or hides the blur as the camera controller decided; after each update.
-fn syncBlur(now: f64) void {
-    const want = camera_controller.get().blurred;
-    if (want != blur_on) {
-        blur_on = want;
-        if (blur_view == null) makeBlurView();
-        if (g.debug_events or g.selftest) std.debug.print("blur: {s}\n", .{if (want) "on" else "off"});
-        if (want) {
-            blur_hide_at = 0;
-            raiseBlur();
-            msg(void, blur_view, "setHidden:", .{false});
-            fadeBlur(1, 0.45);
-        } else {
-            fadeBlur(0, 0.18);
-            blur_hide_at = now + 0.25;
-        }
-    }
-    if (blur_on) {
-        // A web view attached since goes on top of it: back under the blur.
-        raiseBlur();
-    } else if (blur_hide_at > 0 and now >= blur_hide_at) {
-        blur_hide_at = 0;
-        msg(void, blur_view, "setHidden:", .{true});
-    }
-}
-
-fn raiseBlur() void {
-    const top = msg(id, msg(id, g.view, "subviews", .{}), "lastObject", .{});
-    // NSWindowAbove, relative to nothing: the front of the subviews.
-    if (top != blur_view) msg(void, g.view, "addSubview:positioned:relativeTo:", .{ blur_view, @as(NSInteger, 1), @as(id, null) });
-}
-
-fn fadeBlur(alpha: f64, seconds: f64) void {
-    const ctx = objc.class("NSAnimationContext");
-    msg(void, ctx, "beginGrouping", .{});
-    msg(void, msg(id, ctx, "currentContext", .{}), "setDuration:", .{seconds});
-    msg(void, msg(id, blur_view, "animator", .{}), "setAlphaValue:", .{alpha});
-    msg(void, ctx, "endGrouping", .{});
-}
-
-fn makeBlurView() void {
-    const bounds = msg(CGRect, g.view, "bounds", .{});
-    const v = msg(id, msg(id, blur_class, "alloc", .{}), "initWithFrame:", .{bounds});
-    msg(void, v, "setWantsLayer:", .{true});
-    // A Gaussian blur of whatever is behind the view: the window's own
-    // content in its own colours, shapes left and words gone. (A visual-
-    // effect material tints it to a flat grey instead.)
-    msg(void, v, "setLayerUsesCoreImageFilters:", .{true});
-    const layer = msg(id, v, "layer", .{});
-    const blur = msg(id, objc.class("CIFilter"), "filterWithName:", .{objc.nsString("CIGaussianBlur")});
-    if (blur != null) {
-        msg(void, blur, "setDefaults", .{});
-        msg(void, blur, "setValue:forKey:", .{ msg(id, objc.class("NSNumber"), "numberWithDouble:", .{@as(f64, 24)}), objc.nsString("inputRadius") });
-        msg(void, layer, "setBackgroundFilters:", .{msg(id, objc.class("NSArray"), "arrayWithObject:", .{blur})});
-    } else {
-        // No Core Image: cover the window instead.
-        const bg = msg(id, objc.class("NSColor"), "windowBackgroundColor", .{});
-        msg(void, layer, "setBackgroundColor:", .{msg(?*anyopaque, bg, "CGColor", .{})});
-    }
-    msg(void, v, "setAutoresizingMask:", .{follows_box});
-    msg(void, v, "setAlphaValue:", .{@as(f64, 0)});
-    msg(void, v, "setHidden:", .{true});
-
-    // An eye with a slash and a line under it, in the middle. The view is
-    // not flipped: y counts up, so the symbol sits above the line.
-    const tint = msg(id, objc.class("NSColor"), "secondaryLabelColor", .{});
-    const flexible_margins: NSUInteger = 1 | 4 | 8 | 32;
-    const mid_x = bounds.size.width / 2;
-    const mid_y = bounds.size.height / 2;
-    const symbol = msg(id, objc.class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ objc.nsString("eye.slash"), objc.nsString("Blurred") });
-    if (symbol != null) {
-        const sym_cfg = msg(id, objc.class("NSImageSymbolConfiguration"), "configurationWithPointSize:weight:", .{ @as(f64, 30), @as(f64, 0) });
-        const img = msg(id, symbol, "imageWithSymbolConfiguration:", .{sym_cfg});
-        const iv = msg(id, objc.class("NSImageView"), "imageViewWithImage:", .{img});
-        msg(void, iv, "setContentTintColor:", .{tint});
-        const size = msg(CGSize, img, "size", .{});
-        msg(void, iv, "setFrame:", .{CGRect.make(mid_x - size.width / 2, mid_y + 10, size.width, size.height)});
-        msg(void, iv, "setAutoresizingMask:", .{flexible_margins});
-        msg(void, v, "addSubview:", .{iv});
-    }
-    const label = msg(id, objc.class("NSTextField"), "labelWithString:", .{objc.nsString("Blurred while you look away")});
-    msg(void, label, "setFont:", .{msg(id, objc.class("NSFont"), "systemFontOfSize:weight:", .{ @as(f64, 15), @as(f64, 0.23) })});
-    msg(void, label, "setTextColor:", .{tint});
-    msg(void, label, "sizeToFit", .{});
-    const ls = msg(CGRect, label, "frame", .{}).size;
-    msg(void, label, "setFrame:", .{CGRect.make(mid_x - ls.width / 2, mid_y - ls.height - 2, ls.width, ls.height)});
-    msg(void, label, "setAutoresizingMask:", .{flexible_margins});
-    msg(void, v, "addSubview:", .{label});
-
-    msg(void, g.view, "addSubview:", .{v});
-    blur_view = v;
 }
 
 // ── native views hosted over the Metal layer (website tabs) ──────────────
@@ -910,6 +786,10 @@ fn hostSync() void {
             }
         }
         if (show != h.shown) {
+            // Hidden with the keyboard (its tab went out of view by a key,
+            // ⌘1 or a ⌥ jump): the app's view takes it back, or typing
+            // would reach nothing but the window.
+            if (!show and hostHasFocus(h.view.?)) hostFocusApp();
             msg(void, h.box, "setHidden:", .{!show});
             h.shown = show;
             changed = true;
@@ -1043,6 +923,7 @@ fn mouseMoved(_: id, _: SEL, event: id) callconv(.c) void {
     const app = g.app orelse return;
     // The modifiers too: a key released while a web view had the keyboard
     // never reached `flagsChanged:`.
+    if (g.debug_events and eventMods(event).alt != app.ui.mods.alt) std.debug.print("flags alt={} (mouse moved)\n", .{eventMods(event).alt});
     app.onFlags(eventMods(event));
     const p = eventPoint(event);
     app.onMouseMove(@floatCast(p.x), @floatCast(p.y));
@@ -1073,6 +954,46 @@ fn scrollWheel(_: id, _: SEL, event: id) callconv(.c) void {
 }
 
 // ── keyboard ─────────────────────────────────────────────────────────────
+/// ⌥ jumps (`jump.zig`) see every key and modifier change of the window
+/// before any view does: a website tab's WKWebView with the keyboard would
+/// otherwise take ⌥-keys for the page and swallow the release of ⌥.
+fn installKeyMonitor() void {
+    const S = struct {
+        var block: objc.Block = undefined;
+        fn call(_: *objc.Block, event: id) callconv(.c) id {
+            return keyMonitor(event);
+        }
+    };
+    S.block = objc.Block.global(@ptrCast(&S.call), @sizeOf(objc.Block));
+    const mask: NSUInteger = (1 << 10) | (1 << 12); // key down, flags changed
+    _ = msg(id, objc.class("NSEvent"), "addLocalMonitorForEventsMatchingMask:handler:", .{ mask, @as(*anyopaque, @ptrCast(&S.block)) });
+}
+
+/// Returns the event to go on with it, null to swallow it (a chord key).
+fn keyMonitor(event: id) id {
+    const app = g.app orelse return event;
+    // Only the main window's: not the folder picker's or another panel's.
+    if (msg(id, event, "window", .{}) != g.window) return event;
+    const mods = eventMods(event);
+    if (msg(NSUInteger, event, "type", .{}) == 12) {
+        if (g.debug_events) std.debug.print("flags alt={} cmd={} (monitor)\n", .{ mods.alt, mods.cmd });
+        app.onFlags(mods);
+        return event;
+    }
+    if (!mods.alt or mods.cmd or mods.ctrl) return event;
+    // The key as if ⌥ were not held ("c" for ⌥C, whatever ⌥C types); with
+    // ⇧ too it is not a chord key, but the chord still hears about it.
+    var c: u8 = 0;
+    if (!mods.shift) {
+        const chars = objc.utf8(msg(id, event, "charactersIgnoringModifiers", .{}));
+        if (chars.len == 1 and std.ascii.isAlphanumeric(chars[0])) c = chars[0];
+    }
+    if (g.debug_events) std.debug.print("alt key '{c}' chord={}\n", .{ if (c == 0) '?' else c, app.jump.active() });
+    if (msg(bool, event, "isARepeat", .{}) and app.jump.active()) return null;
+    if (app.onAltKey(c)) return null;
+    return event;
+}
+
 fn keyDown(self: id, _: SEL, event: id) callconv(.c) void {
     const app = g.app orelse return;
     const mods = eventMods(event);
@@ -1365,6 +1286,24 @@ fn postKey(ch: u8) void {
     postKeyWithMods(ch, 0);
 }
 
+/// A modifier key going down or up: `flags` is what is held afterwards.
+fn postFlags(flags: NSUInteger) void {
+    const empty = objc.nsString("");
+    const ev = msg(id, objc.class("NSEvent"), "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:", .{
+        @as(NSUInteger, 12), // flags changed
+        CGPoint{},
+        flags,
+        apple.CACurrentMediaTime(),
+        msg(NSInteger, g.window, "windowNumber", .{}),
+        @as(id, null),
+        empty,
+        empty,
+        false,
+        @as(c_ushort, 58), // left option
+    });
+    msg(void, g.nsapp, "postEvent:atStart:", .{ ev, false });
+}
+
 fn postKeyWithMods(ch: u8, flags: NSUInteger) void {
     const s = objc.nsString(&[_]u8{ch});
     const ev = msg(id, objc.class("NSEvent"), "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:", .{
@@ -1409,9 +1348,6 @@ fn selftestStep(now: f64) void {
     // hold up the quit.
     if (sys.getenv("TT_SELFTEST_NOTEBOOK") != null) {
         selftestNotebook(t);
-    } else if (sys.getenv("TT_SELFTEST_BLUR") != null) {
-        // No regular steps either: their clicks and keys count as activity.
-        selftestBlur(t);
     } else if (g.selftest_step < steps.len) {
         const s = steps[g.selftest_step];
         if (t >= s.at) {
@@ -1426,6 +1362,8 @@ fn selftestStep(now: f64) void {
             }
             g.selftest_step += 1;
         }
+    } else if (sys.getenv("TT_SELFTEST_JUMP") != null) {
+        selftestJump(t);
     } else if (sys.getenv("TT_SELFTEST_URL")) |url| {
         selftestWeb(t, url);
     } else if (sys.getenv("TT_SELFTEST_FULLSCREEN") != null) {
@@ -1439,6 +1377,56 @@ fn selftestStep(now: f64) void {
         selftestReportButtons();
         msg(void, g.nsapp, "terminate:", .{@as(id, null)});
     }
+}
+
+/// TT_SELFTEST_JUMP=1, with a throwaway HOME whose .tt_projects lists a
+/// project with the letter C and two resources: after the regular steps, a
+/// ⌥ chord made of real events — ⌥ down, "2" (typing: no letter yet), "c",
+/// "2", a capture with the keys on the rows (TT_SELFTEST_WINDOW_PNG
+/// "-chord"), ⌥ up — printing the row on show and the chord after each.
+fn selftestJump(t: f64) void {
+    const app = g.app orelse return;
+    const S = struct {
+        var step: usize = 0;
+        var web_opened = false;
+    };
+    // TT_SELFTEST_JUMP_URL: the chord starts from a website tab, its web
+    // view holding the keyboard (it would take ⌥-keys for the page).
+    const url = sys.getenv("TT_SELFTEST_JUMP_URL");
+    if (url != null and !S.web_opened and t >= 5.6) {
+        S.web_opened = true;
+        _ = app.tabs.openWith("web", .{ .url = url.? }) catch {};
+        app.invalidate();
+    }
+    const delay: f64 = if (url != null) 2.5 else 0;
+    const at = [_]f64{ 5.6, 5.8, 6.0, 6.2, 6.4, 6.8, 7.0, 7.6, 8.0 };
+    if (S.step >= at.len or t < at[S.step] + delay) return;
+    const cur = app.tabs.current();
+    var title_buf: [96]u8 = undefined;
+    const responder = msg(id, g.window, "firstResponder", .{});
+    std.debug.print("selftest: jump step {d}: group={d} tabs={d} tab='{s}' chord={} hints={} responder={s}\n", .{
+        S.step,                                                                               app.tabs.groupId(), app.tabs.group().count(),
+        if (cur) |c| c.title(&title_buf) else "(none)",                                       app.jump.active(),  app.jump.hintsVisible(app.now),
+        if (responder != null) objc.utf8(msg(id, responder, "className", .{})) else "(none)",
+    });
+    switch (S.step) {
+        0 => postFlags(mod_alt),
+        1 => postKeyWithMods('2', mod_alt),
+        2 => postKeyWithMods('c', mod_alt),
+        3 => postKeyWithMods('2', mod_alt),
+        4 => {},
+        5 => if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| selftestCaptureSuffixed(path, "-chord"),
+        6 => postFlags(0),
+        // Typing goes on where the chord ended (the shell's input).
+        7 => postKey('x'),
+        else => {
+            if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
+            // Not `terminate:`: the "2" typed on the way is unsent input,
+            // which would hold the quit up for a confirmation.
+            std.process.exit(0);
+        },
+    }
+    S.step += 1;
 }
 
 /// TT_SELFTEST_NOTEBOOK=1, with TT_WORKSPACE naming a workspace that holds a
@@ -1519,67 +1507,6 @@ fn selftestNotebook(t: f64) void {
 }
 
 /// Captures the window to `path` with `suffix` before its extension.
-/// TT_SELFTEST_BLUR=1 with TT_CAMERA_MOCK=<a picture without a face>,
-/// TT_SELFTEST_BLUR_FACE=<a picture of a face looking at the camera> and a
-/// config.yml with `physical: blur_when_away: true, blur_after: 1`: nobody
-/// in view → the window blurs ("-blurred" capture); the face → it clears
-/// ("-clear"); nobody again → blurred; a click on the blur → clear at once
-/// ("-clicked"). The state is printed at each step. With TT_SELFTEST_URL a
-/// website tab is shown first, to see its web view blur too.
-var selftest_blur_step: u8 = 0;
-var selftest_blur_web = false;
-
-fn selftestBlur(t: f64) void {
-    const ctl = camera_controller.get();
-    // With TT_SELFTEST_URL, a website tab is on show: its web view has to
-    // blur like the rest.
-    if (!selftest_blur_web) {
-        selftest_blur_web = true;
-        if (sys.getenv("TT_SELFTEST_URL")) |url| {
-            if (g.app) |app| _ = app.tabs.openWith("web", .{ .url = url }) catch {};
-        }
-    }
-    const Step = struct { at: f64, what: []const u8 };
-    const steps = [_]Step{
-        .{ .at = 4.0, .what = "nobody in view" },
-        .{ .at = 4.1, .what = "a face looks at the screen" },
-        .{ .at = 6.0, .what = "looking" },
-        .{ .at = 6.1, .what = "nobody again" },
-        .{ .at = 8.5, .what = "nobody, blurred again" },
-        .{ .at = 8.6, .what = "click on the blur" },
-        .{ .at = 9.0, .what = "after the click" },
-    };
-    if (selftest_blur_step >= steps.len) {
-        if (t >= 9.5) msg(void, g.nsapp, "terminate:", .{@as(id, null)});
-        return;
-    }
-    const s = steps[selftest_blur_step];
-    if (t < s.at) return;
-    selftest_blur_step += 1;
-    std.debug.print("selftest: blur leg: {s}: blurred={} gaze={s} stance={s} frames={d} view_alpha={d:.2} hidden={}\n", .{
-        s.what,
-        ctl.blurred,
-        @tagName(ctl.posture.gaze),
-        @tagName(ctl.posture.stance),
-        ctl.obs.seq,
-        if (blur_view != null) msg(f64, blur_view, "alphaValue", .{}) else -1,
-        blur_view == null or msg(bool, blur_view, "isHidden", .{}),
-    });
-    const png = sys.getenv("TT_SELFTEST_WINDOW_PNG");
-    switch (selftest_blur_step) {
-        1 => if (png) |path| selftestCaptureSuffixed(path, "-blurred"),
-        2 => camera.setMock(sys.getenv("TT_SELFTEST_BLUR_FACE") orelse ""),
-        3 => if (png) |path| selftestCaptureSuffixed(path, "-clear"),
-        4 => camera.setMock(sys.getenv("TT_CAMERA_MOCK") orelse ""),
-        6 => {
-            postMouse(1, 700, 450);
-            postMouse(2, 700, 450);
-        },
-        7 => if (png) |path| selftestCaptureSuffixed(path, "-clicked"),
-        else => {},
-    }
-}
-
 fn selftestCaptureSuffixed(path: []const u8, suffix: []const u8) void {
     var buf: [1024]u8 = undefined;
     const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse path.len;
@@ -1931,7 +1858,7 @@ fn selftestInspector(app: *app_mod.App, step: InspectorStep) void {
     const bounds = msg(CGRect, box, "bounds", .{});
     const box_frame = msg(CGRect, box, "frame", .{});
     std.debug.print("selftest: box frame=({d:.0},{d:.0} {d:.0}x{d:.0}) superview={s} window_on_screen={}\n", .{
-        box_frame.origin.x, box_frame.origin.y, box_frame.size.width, box_frame.size.height,
+        box_frame.origin.x,                                                                            box_frame.origin.y, box_frame.size.width, box_frame.size.height,
         objc.utf8(msg(id, msg(id, msg(id, box, "superview", .{}), "class", .{}), "description", .{})), windowOnScreen(),
     });
     const subviews = msg(id, box, "subviews", .{});
@@ -1942,8 +1869,10 @@ fn selftestInspector(app: *app_mod.App, step: InspectorStep) void {
         const f = msg(CGRect, sub, "frame", .{});
         const inside = f.origin.x >= 0 and f.origin.y >= 0 and f.origin.x + f.size.width <= bounds.size.width + 0.5 and f.origin.y + f.size.height <= bounds.size.height + 0.5;
         std.debug.print("selftest: box[{d}] {s} frame=({d:.0},{d:.0} {d:.0}x{d:.0}) inside={}{s}\n", .{
-            i, objc.utf8(msg(id, msg(id, sub, "class", .{}), "description", .{})),
-            f.origin.x, f.origin.y, f.size.width, f.size.height, inside, if (sub == view) " (the page)" else "",
+            i,            objc.utf8(msg(id, msg(id, sub, "class", .{}), "description", .{})),
+            f.origin.x,   f.origin.y,
+            f.size.width, f.size.height,
+            inside,       if (sub == view) " (the page)" else "",
         });
     }
     // Nothing of the inspector's may have landed in the window's own view.

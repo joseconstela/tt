@@ -687,7 +687,7 @@ pub const MarkdownView = struct {
         }
         for (self.tables.items) |t| if (t.sep == sep) return t;
 
-        var t: Table = .{ .sep = sep, .end = sep + 1, .header = null, .cols = 0, .x = 0, .widths = [_]f32{0} ** max_cols, .aligns = [_]markdown.Align{.left} ** max_cols };
+        var t: Table = .{ .sep = sep, .end = sep + 1, .header = null, .cols = 0, .x = 0, .widths = @splat(0), .aligns = @splat(.left) };
         if (sep > 0 and kindOf(doc, sep - 1) == .paragraph) t.header = sep - 1;
         while (t.end < n) : (t.end += 1) {
             const k = kindOf(doc, t.end);
@@ -699,7 +699,7 @@ pub const MarkdownView = struct {
 
         // Natural widths: the widest cell of each column as it renders (the
         // caret's row, showing its syntax, wraps in its cell when wider).
-        var nat = [_]f32{0} ** max_cols;
+        var nat: [max_cols]f32 = @splat(0);
         var j = t.header orelse sep;
         while (j < t.end) : (j += 1) {
             const k = kindOf(doc, j);
@@ -724,7 +724,7 @@ pub const MarkdownView = struct {
         // columns keep theirs and the wide ones share what is left.
         const cols: usize = t.cols;
         const avail = @max(min_col_w * @as(f32, @floatFromInt(cols)), self.width - t.x);
-        var want = [_]f32{0} ** max_cols;
+        var want: [max_cols]f32 = @splat(0);
         var want_sum: f32 = 0;
         for (0..cols) |c| {
             want[c] = @max(min_col_w, nat[c] + 2 * cell_pad_x);
@@ -735,7 +735,7 @@ pub const MarkdownView = struct {
         } else {
             var remaining = avail;
             var left = cols;
-            var done = [_]bool{false} ** max_cols;
+            var done: [max_cols]bool = @splat(false);
             while (left > 0) : (left -= 1) {
                 var best: usize = 0;
                 var found = false;

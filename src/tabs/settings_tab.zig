@@ -16,8 +16,6 @@ const coding_mod = @import("settings_coding_agents.zig");
 const features_mod = @import("settings_features.zig");
 const browser_mod = @import("settings_browser.zig");
 const perms_mod = @import("settings_permissions.zig");
-const physical_mod = @import("settings_physical.zig");
-const voice_mod = @import("settings_voice.zig");
 const mode_mod = @import("settings_mode.zig");
 const EditCommand = @import("../events.zig").EditCommand;
 
@@ -45,10 +43,6 @@ pub const Page = enum {
     media,
     /// … and desktop notifications.
     notifications,
-    /// The camera tt watches with, what it recognises, and the away blur.
-    physical,
-    /// Voice commands: the microphone, the trigger word, what tt hears.
-    voice,
 
     pub fn label(self: Page) []const u8 {
         return switch (self) {
@@ -62,8 +56,6 @@ pub const Page = enum {
             .privacy => "Privacy",
             .media => "Camera & microphone",
             .notifications => "Notifications",
-            .physical => "Camera & posture",
-            .voice => "Voice",
         };
     }
 
@@ -79,8 +71,6 @@ pub const Page = enum {
             .privacy => .lock,
             .media => .camera,
             .notifications => .bell,
-            .physical => .eye,
-            .voice => .mic,
         };
     }
 
@@ -97,15 +87,13 @@ pub const Page = enum {
             .privacy => "What websites may keep, and what tt asks of them.",
             .media => "Which websites may use the camera and the microphone, for calls in a tab.",
             .notifications => "Desktop notifications from websites, with each site's icon.",
-            .physical => "What the camera sees, recognised on this Mac, and what tt does about it.",
-            .voice => "Voice commands: what the microphone hears, recognised on this Mac, and the word that starts one.",
         };
     }
 
     /// False while the page only says "coming up soon".
     pub fn ready(self: Page) bool {
         return switch (self) {
-            .style, .mode, .apis, .agents, .features, .browser, .privacy, .media, .notifications, .physical, .voice => true,
+            .style, .mode, .apis, .agents, .features, .browser, .privacy, .media, .notifications => true,
             .mcps => false,
         };
     }
@@ -130,7 +118,6 @@ pub const sections = [_]Section{
     .{ .title = "UI", .pages = &.{ .style, .mode } },
     .{ .title = "AI", .pages = &.{ .apis, .agents, .mcps, .features } },
     .{ .title = "Browser", .pages = &.{ .browser, .privacy, .media, .notifications } },
-    .{ .title = "Physical interactions", .pages = &.{ .physical, .voice } },
 };
 
 pub const SettingsTab = struct {
@@ -147,8 +134,6 @@ pub const SettingsTab = struct {
     browser: browser_mod.Page,
     media: perms_mod.MediaPage,
     notifications: perms_mod.NotificationsPage,
-    physical: physical_mod.Page,
-    voice: voice_mod.Page,
     /// The page drawn last frame: a switch resets the scroll and the focus.
     shown: Page = .style,
     /// The Style page's dropdowns.
@@ -160,7 +145,7 @@ pub const SettingsTab = struct {
 
     pub fn create(env: *tab_mod.Env, _: tab_mod.OpenArgs) anyerror!tab_mod.Tab {
         const self = try env.gpa.create(SettingsTab);
-        self.* = .{ .gpa = env.gpa, .apis = apis_mod.Page.init(env.gpa), .agents = coding_mod.Page.init(env.gpa), .features = features_mod.Page.init(env.gpa), .browser = browser_mod.Page.init(env.gpa), .media = perms_mod.MediaPage.init(env.gpa), .notifications = perms_mod.NotificationsPage.init(), .physical = physical_mod.Page.init(env.gpa, env.textures), .voice = voice_mod.Page.init(env.gpa) };
+        self.* = .{ .gpa = env.gpa, .apis = apis_mod.Page.init(env.gpa), .agents = coding_mod.Page.init(env.gpa), .features = features_mod.Page.init(env.gpa), .browser = browser_mod.Page.init(env.gpa), .media = perms_mod.MediaPage.init(env.gpa), .notifications = perms_mod.NotificationsPage.init() };
         return tab_mod.Tab.from(SettingsTab, self);
     }
 
@@ -170,8 +155,6 @@ pub const SettingsTab = struct {
         self.features.deinit();
         self.browser.deinit();
         self.media.deinit();
-        self.physical.deinit();
-        self.voice.deinit();
         self.gpa.destroy(self);
     }
 
@@ -194,10 +177,6 @@ pub const SettingsTab = struct {
             // Only while on show: these ask macOS about devices and access.
             .media => active and self.media.tick(now),
             .notifications => active and self.notifications.tick(now),
-            // Only while on show: it keeps the camera's preview coming.
-            .physical => active and self.physical.tick(now, self.dd.isOpen()),
-            // Only while on show: it keeps the microphone's preview coming.
-            .voice => active and self.voice.tick(now, self.dd.isOpen()),
             else => false,
         };
     }
@@ -208,7 +187,6 @@ pub const SettingsTab = struct {
             .apis => self.apis.onText(utf8),
             .features => self.features.onText(utf8),
             .browser => self.browser.onText(utf8),
-            .voice => self.voice.onText(utf8),
             else => {},
         }
     }
@@ -218,7 +196,6 @@ pub const SettingsTab = struct {
             .apis => self.apis.onMarkedText(utf8),
             .features => self.features.onMarkedText(utf8),
             .browser => self.browser.onMarkedText(utf8),
-            .voice => self.voice.onMarkedText(utf8),
             else => {},
         }
     }
@@ -229,7 +206,6 @@ pub const SettingsTab = struct {
             .apis => self.apis.onEdit(cmd),
             .features => self.features.onEdit(cmd),
             .browser => self.browser.onEdit(cmd),
-            .voice => self.voice.onEdit(cmd),
             else => false,
         };
         if (used) return;
@@ -249,7 +225,6 @@ pub const SettingsTab = struct {
         switch (self.page) {
             .apis => _ = self.apis.onCtrl(key),
             .browser => _ = self.browser.onCtrl(key),
-            .voice => _ = self.voice.onCtrl(key),
             else => {},
         }
     }
@@ -259,7 +234,6 @@ pub const SettingsTab = struct {
             .apis => self.apis.paste(utf8),
             .features => self.features.paste(utf8),
             .browser => self.browser.paste(utf8),
-            .voice => self.voice.paste(utf8),
             else => {},
         }
     }
@@ -269,7 +243,6 @@ pub const SettingsTab = struct {
             .apis => self.apis.copy(out, cut),
             .features => self.features.copy(out, cut),
             .browser => self.browser.copy(out, cut),
-            .voice => self.voice.copy(out, cut),
             else => false,
         };
     }
@@ -279,7 +252,6 @@ pub const SettingsTab = struct {
             .apis => self.apis.hasMarkedText(),
             .features => self.features.hasMarkedText(),
             .browser => self.browser.hasMarkedText(),
-            .voice => self.voice.hasMarkedText(),
             else => false,
         };
     }
@@ -289,7 +261,6 @@ pub const SettingsTab = struct {
             .apis => self.apis.caretRect(),
             .features => self.features.caretRect(),
             .browser => self.browser.caretRect(),
-            .voice => self.voice.caretRect(),
             else => .{},
         };
     }
@@ -309,7 +280,6 @@ pub const SettingsTab = struct {
             if (self.shown == .apis) self.apis.blur();
             if (self.shown == .features) self.features.blur();
             if (self.shown == .browser) self.browser.blur();
-            if (self.shown == .voice) self.voice.blur();
             self.shown = self.page;
             self.scroll = 0;
             self.dd.close();
@@ -349,8 +319,6 @@ pub const SettingsTab = struct {
             .privacy => browser_mod.drawPrivacyPage(ui, x, y, col_w),
             .media => self.media.draw(ui, x, y, col_w, ui.now),
             .notifications => self.notifications.draw(ui, x, y, col_w, ui.now),
-            .physical => self.physical.draw(ui, &self.dd, x, y, col_w, ui.now),
-            .voice => self.voice.draw(ui, &self.dd, x, y, col_w, ui.now),
             else => drawSoon(ui, x, y, col_w),
         };
 

@@ -143,7 +143,7 @@ fn isExecutableFile(gpa: std.mem.Allocator, path: []const u8) bool {
     const st = sys.statFile(gpa, path) orelse return false;
     // S_IFMT / S_IFREG: a regular file (or a symlink to one), not a folder.
     if (st.mode & 0o170000 != 0o100000) return false;
-    const path_z = gpa.dupeZ(u8, path) catch return false;
+    const path_z = gpa.dupeSentinel(u8, path, 0) catch return false;
     defer gpa.free(path_z);
     return std.c.access(path_z.ptr, std.c.X_OK) == 0;
 }
@@ -242,7 +242,7 @@ test "scanDirs: finds executables by name, first folder wins, skips non-executab
     var made: std.ArrayList([]u8) = .empty;
     defer {
         for (made.items) |p| {
-            const pz = gpa.dupeZ(u8, p) catch continue;
+            const pz = gpa.dupeSentinel(u8, p, 0) catch continue;
             defer gpa.free(pz);
             _ = std.c.unlink(pz.ptr);
             _ = std.c.rmdir(pz.ptr);
@@ -250,7 +250,7 @@ test "scanDirs: finds executables by name, first folder wins, skips non-executab
         }
         made.deinit(gpa);
         for ([_][]const u8{ a, b, root }) |d| {
-            const dz = gpa.dupeZ(u8, d) catch continue;
+            const dz = gpa.dupeSentinel(u8, d, 0) catch continue;
             defer gpa.free(dz);
             _ = std.c.rmdir(dz.ptr);
         }
@@ -263,7 +263,7 @@ test "scanDirs: finds executables by name, first folder wins, skips non-executab
             continue;
         }
         try sys.writeFile(gpa, p, "#!/bin/sh\n", false);
-        const pz = try gpa.dupeZ(u8, p);
+        const pz = try gpa.dupeSentinel(u8, p, 0);
         defer gpa.free(pz);
         _ = std.c.chmod(pz.ptr, if (f.exec) 0o755 else 0o644);
     }

@@ -111,7 +111,7 @@ pub const Screen = struct {
     // ── effects the program can trigger ─────────────────────────────────
     fn fromHandler(h: *Handler) *Screen {
         const stream: *Stream = @fieldParentPtr("handler", h);
-        return @fieldParentPtr("stream", stream);
+        return @alignCast(@fieldParentPtr("stream", stream));
     }
 
     fn writePty(h: *Handler, bytes: []const u8) void {

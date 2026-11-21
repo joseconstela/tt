@@ -13,8 +13,9 @@ pub const Spec = union(enum) { glyph: icons.Icon, color: Color };
 
 /// The symbols the picker offers, in its order (chrome icons left out).
 pub const glyphs = [_]icons.Icon{
-    .folder, .terminal, .file, .document, .notebook, .image, .globe, .agent,
-    .sparkle, .plug, .cloud, .drop, .sun, .lock, .bell, .search, .settings,
+    .folder,   .terminal, .file,  .document, .notebook, .image, .globe, .agent,
+    .sparkle,  .plug,     .cloud, .drop,     .sun,      .lock,  .bell,  .search,
+    .settings,
 };
 
 pub const NamedColor = struct { name: []const u8, color: Color };

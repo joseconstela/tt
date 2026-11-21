@@ -13,12 +13,6 @@ const frameworks = [_][]const u8{
     // Website tabs: camera and microphone access, desktop notifications.
     "AVFoundation",
     "UserNotifications",
-    // Physical interactions: camera frames and what Vision recognises in them.
-    "CoreMedia",
-    "CoreVideo",
-    "Vision",
-    // Voice commands: speech recognised on this Mac.
-    "Speech",
 };
 
 const info_plist =
@@ -40,9 +34,8 @@ const info_plist =
     \\  <key>CFBundleIconName</key><string>icon</string>
     \\  <key>CFBundleIconFile</key><string>icon</string>
     \\  <!-- Website tabs (video calls): macOS shows these when it asks. -->
-    \\  <key>NSCameraUsageDescription</key><string>tt can notice when you look away from the screen (Settings › Physical interactions: analysed on this Mac, never recorded), and websites open in tt, such as video calls, can use the camera when you allow them.</string>
-    \\  <key>NSMicrophoneUsageDescription</key><string>tt listens for its trigger word when you turn voice commands on (Settings › Physical interactions: recognised on this Mac, never recorded), and websites open in tt, such as video calls, can use the microphone when you allow them.</string>
-    \\  <key>NSSpeechRecognitionUsageDescription</key><string>tt recognises what you say on this Mac to notice its trigger word and your voice commands. Nothing is recorded or sent anywhere.</string>
+    \\  <key>NSCameraUsageDescription</key><string>Websites open in tt, such as video calls, can use the camera when you allow them.</string>
+    \\  <key>NSMicrophoneUsageDescription</key><string>Websites open in tt, such as video calls, can use the microphone when you allow them.</string>
     \\  <key>NSAppTransportSecurity</key>
     \\  <dict>
     \\    <key>NSAllowsArbitraryLoadsInWebContent</key><true/>
@@ -92,7 +85,7 @@ pub fn build(b: *std.Build) void {
     // `zig build run`
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run tt");
     run_step.dependOn(&run_cmd.step);
 
@@ -108,7 +101,8 @@ pub fn build(b: *std.Build) void {
     // notification permissions under the app's signed identity, which needs
     // the whole bundle (its Info.plist) sealed: sign it again, ad hoc.
     const sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-" });
-    sign.addArg(b.getInstallPath(.prefix, "tt.app"));
+    sign.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "tt.app" } });
+    sign.has_side_effects = true;
     sign.step.dependOn(&install_bin.step);
     sign.step.dependOn(&install_plist.step);
     app_step.dependOn(&sign.step);
@@ -137,6 +131,9 @@ pub fn build(b: *std.Build) void {
         .install_dir = .{ .custom = "tt.app/Contents" },
         .install_subdir = "Resources",
     });
+    // Seal the bundle only once its Resources are in place: files added
+    // after signing invalidate the seal.
+    sign.step.dependOn(&install_icon.step);
     app_step.dependOn(&install_icon.step);
 
     // `zig build test` — pure-Zig logic (terminal parser, buffers, editor …)
@@ -150,8 +147,6 @@ pub fn build(b: *std.Build) void {
     test_mod.addAnonymousImport("jupyter_bridge", .{ .root_source_file = b.path("assets/notebook/tt_jupyter.py") });
     // The notebook tab's tests reach the texture code, which talks to Metal through the runtime.
     test_mod.linkSystemLibrary("objc", .{});
-    // The voice tests turn captured sound into PCM buffers.
-    for ([_][]const u8{ "Foundation", "AVFoundation", "CoreMedia" }) |f| test_mod.linkFramework(f, .{});
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

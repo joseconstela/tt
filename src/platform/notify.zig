@@ -349,7 +349,6 @@ fn writeIcon(png: []const u8) id {
     return path;
 }
 
-
 /// Any image macOS can read (PNG, ICO, JPEG, GIF, SVG where supported …),
 /// drawn into a square PNG: 128 px, or up to 256 when the image has more.
 /// Null when the bytes are not an image. The caller frees the result.
@@ -442,7 +441,7 @@ fn didComplete(_: id, _: SEL, _: id, task: id, err: id) callconv(.c) void {
 }
 
 // ── authorization ───────────────────────────────────────────────────────
-var auth_state = std.atomic.Value(u8).init(@intFromEnum(Auth.unknown));
+var auth_state = std.atomic.Value(u8).init(@backingInt(Auth.unknown));
 var auth_block: objc.Block = undefined;
 var settings_block: objc.Block = undefined;
 
@@ -450,7 +449,7 @@ var settings_block: objc.Block = undefined;
 pub fn auth() Auth {
     if (dryRun()) return .authorized;
     if (!available()) return .unavailable;
-    return @enumFromInt(auth_state.load(.acquire));
+    return @fromBackingInt(@intCast(auth_state.load(.acquire)));
 }
 
 /// Asks macOS again what it lets tt do; the answer lands in `auth()` a
@@ -478,11 +477,11 @@ fn settingsArrived(_: *objc.Block, settings: id) callconv(.c) void {
         1 => .denied,
         else => .authorized,
     };
-    auth_state.store(@intFromEnum(a), .release);
+    auth_state.store(@backingInt(a), .release);
 }
 
 fn authAnswered(_: *objc.Block, granted: bool, _: id) callconv(.c) void {
-    auth_state.store(@intFromEnum(if (granted) Auth.authorized else Auth.denied), .release);
+    auth_state.store(@backingInt(if (granted) Auth.authorized else Auth.denied), .release);
 }
 
 /// System Settings › Notifications, at tt's entry when macOS knows it.

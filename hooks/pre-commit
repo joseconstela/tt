@@ -1,0 +1,148 @@
+#!/bin/bash
+# tt pre-commit: quick checks on what is STAGED (never the working files).
+# Enable once per clone with:  git config core.hooksPath hooks
+# Every check runs; the commit is refused if any of them failed.
+
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib.sh"
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+max_lines=2500          # warn above this many lines in a staged .zig file
+max_bytes=1048576       # refuse newly added files above this size
+failures=0
+
+fail() { failures=$((failures + 1)); printf 'pre-commit: FAIL  %s\n' "$1"; }
+warn() { printf 'pre-commit: warn  %s\n' "$1"; }
+detail() { printf '                  %s\n' "$1"; }
+
+# The staged copy of a file, or the working copy when it is not in the index.
+staged_or_file() {
+    git show ":$1" 2>/dev/null || cat "$1" 2>/dev/null
+}
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/tt-pre-commit.XXXXXX") || exit 1
+trap 'rm -rf "$tmp"' EXIT
+
+# --- 1. Zig version ---------------------------------------------------------
+zig_ok=1
+if ! msg=$(zig_version_guard "$(staged_or_file build.zig.zon)"); then
+    fail "$msg"
+    zig_ok=0
+fi
+
+# --- 2. zig fmt on staged .zig files ----------------------------------------
+unformatted=()
+broken=()
+long=()
+if [ "$zig_ok" = 1 ]; then
+    while IFS= read -r -d '' f; do
+        git show ":$f" >"$tmp/blob.zig"
+        zig fmt --stdin --check <"$tmp/blob.zig" >/dev/null 2>"$tmp/fmt.err"
+        case $? in
+            0) ;;
+            1) unformatted+=("$f") ;;
+            *) broken+=("$f: $(head -n 1 "$tmp/fmt.err" | sed 's/^<stdin>://')") ;;
+        esac
+        # --- 4. file-size ceiling (warning only) ---
+        n=$(wc -l <"$tmp/blob.zig" | tr -d ' ')
+        [ "$n" -gt "$max_lines" ] && long+=("$f ($n lines)")
+    done < <(git diff --cached --name-only -z --diff-filter=ACM -- '*.zig')
+else
+    warn "format check skipped (wrong zig)"
+fi
+if [ ${#unformatted[@]} -gt 0 ]; then
+    fail "${#unformatted[@]} staged file(s) not zig fmt clean:"
+    quoted=""
+    for f in "${unformatted[@]}"; do detail "$f"; quoted="$quoted $(printf '%q' "$f")"; done
+    detail "fix: zig fmt$quoted && git add$quoted"
+fi
+if [ ${#broken[@]} -gt 0 ]; then
+    fail "${#broken[@]} staged file(s) do not parse:"
+    for f in "${broken[@]}"; do detail "$f"; done
+fi
+for f in "${long[@]}"; do
+    warn "$f is over $max_lines lines; consider splitting it"
+done
+
+# --- 3. error-swallowing budget ---------------------------------------------
+budget=$(staged_or_file hooks/catch-budget | grep -v '^[[:space:]]*#' | tr -d '[:space:]')
+count=$(git grep --cached -I -o -E 'catch[[:space:]]*\{[[:space:]]*\}|catch[[:space:]]+unreachable' -- 'src/*.zig' | wc -l | tr -d ' ')
+case $budget in
+    '' | *[!0-9]*)
+        fail "hooks/catch-budget must hold one number (found '$budget')"
+        ;;
+    *)
+        if [ "$count" -gt "$budget" ]; then
+            fail "src/ would hold $count 'catch {}' / 'catch unreachable', the budget is $budget"
+            detail "handle or log the error instead; to see what you added:"
+            detail "  git diff --cached -U0 -- src | grep -E '^\\+.*catch (\\{\\}|unreachable)'"
+            detail "if it really is right, raise the number in hooks/catch-budget and git add it"
+        elif [ "$count" -lt "$budget" ]; then
+            warn "catch budget: $count in src/, budget $budget; lower hooks/catch-budget to $count to keep the gain"
+        fi
+        ;;
+esac
+
+# --- 5a. files that must never be committed ----------------------------------
+junk=()
+while IFS= read -r -d '' f; do
+    case "/$f" in
+        */.DS_Store | */zig-out/* | */.zig-cache/* | */zig-pkg/*) junk+=("$f") ;;
+    esac
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+if [ ${#junk[@]} -gt 0 ]; then
+    fail "${#junk[@]} staged path(s) that never belong in the repo (.DS_Store, zig-out/, .zig-cache/, zig-pkg/):"
+    for f in "${junk[@]}"; do detail "$f"; done
+    detail "fix: git rm --cached <path>"
+fi
+
+# --- 5b. new files over 1 MB --------------------------------------------------
+allowed() {
+    [ -f "$here/large-file-allowlist" ] || return 1
+    while IFS= read -r pat; do
+        case $pat in '' | '#'*) continue ;; esac
+        # shellcheck disable=SC2254
+        case $1 in $pat) return 0 ;; esac
+    done <"$here/large-file-allowlist"
+    return 1
+}
+big=()
+while IFS= read -r -d '' f; do
+    size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$max_bytes" ] && ! allowed "$f"; then
+        big+=("$f ($((size / 1024)) KB)")
+    fi
+done < <(git diff --cached --name-only -z --diff-filter=A)
+if [ ${#big[@]} -gt 0 ]; then
+    fail "${#big[@]} new file(s) over 1 MB:"
+    for f in "${big[@]}"; do detail "$f"; done
+    detail "if it is meant to be vendored, add its path to hooks/large-file-allowlist"
+fi
+
+# --- 5c. secrets in added lines ----------------------------------------------
+grep -v -E '^[[:space:]]*(#|$)' "$here/secret-patterns" >"$tmp/patterns" 2>/dev/null
+if [ -s "$tmp/patterns" ]; then
+    # Added lines as "path:line:text", then keep only path:line of the hits so
+    # the secret itself is not echoed into the terminal scrollback.
+    git diff --cached -U0 --no-color --no-ext-diff --diff-filter=ACMR |
+        awk '
+            /^\+\+\+ / { file = substr($0, 5); sub(/^b\//, "", file); next }
+            /^@@ /     { split($3, a, ","); line = substr(a[1], 2) + 0; next }
+            /^\+/      { print file ":" line ":" substr($0, 2); line++ }
+        ' |
+        LC_ALL=C grep -a -E -f "$tmp/patterns" |
+        cut -d: -f1,2 | sort -u >"$tmp/secrets"
+    if [ -s "$tmp/secrets" ]; then
+        fail "added lines that look like a secret (private key or API token):"
+        while IFS= read -r hit; do detail "$hit"; done <"$tmp/secrets"
+        detail "remove it (and revoke it if it was real); patterns live in hooks/secret-patterns"
+    fi
+else
+    fail "hooks/secret-patterns is missing or empty"
+fi
+
+if [ "$failures" -gt 0 ]; then
+    printf 'pre-commit: %d check(s) failed, nothing committed.\n' "$failures"
+    exit 1
+fi
+exit 0

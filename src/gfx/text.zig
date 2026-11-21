@@ -14,7 +14,7 @@ pub const Face = enum(u8) {
     mono_semibold,
 
     pub fn isMono(self: Face) bool {
-        return @intFromEnum(self) >= @intFromEnum(Face.mono);
+        return @backingInt(self) >= @backingInt(Face.mono);
     }
 
     fn weight(self: Face) f64 {
@@ -193,7 +193,7 @@ pub const TextEngine = struct {
     fn instFor(self: *TextEngine, font: Font) u16 {
         const px = font.size * self.scale;
         const q: u32 = @intFromFloat(@round(px * 8));
-        const key: u32 = (@as(u32, @intFromEnum(font.face)) << 24) | (q & 0xFFFFFF);
+        const key: u32 = (@as(u32, @backingInt(font.face)) << 24) | (q & 0xFFFFFF);
         if (self.inst_map.get(key)) |idx| return idx;
 
         const ct = self.createFont(font.face, @as(f64, px));
@@ -414,7 +414,7 @@ pub const TextEngine = struct {
     pub fn iconEntry(self: *TextEngine, which: icons.Icon, size_pt: f32) ?AtlasEntry {
         const size_px: u32 = @intFromFloat(@round(size_pt * self.scale));
         if (size_px == 0) return null;
-        const key: u32 = (@as(u32, @intFromEnum(which)) << 16) | (size_px & 0xFFFF);
+        const key: u32 = (@as(u32, @backingInt(which)) << 16) | (size_px & 0xFFFF);
         if (self.icon_map.get(key)) |e| return e;
 
         const dim = size_px + 2 * icons.pad_px;

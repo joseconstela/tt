@@ -1,0 +1,5 @@
+# How many `catch {}` and `catch unreachable` the tree under src/ may hold.
+# pre-commit fails when a commit would go over this number.
+# Lower it when you remove some. Raise it only on purpose, in the same commit
+# as the code that needs it, and say why in the commit message.
+141

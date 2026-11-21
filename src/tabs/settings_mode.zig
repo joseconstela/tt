@@ -70,4 +70,3 @@ fn switchCard(ui: *Ui, wid: u64, card: Rect, title: []const u8, detail: []const 
     dl.rrect(.{ .x = knob_x, .y = toggle.y + 2, .w = 16, .h = 16 }, 8, if (on) theme.on_accent else if (enabled) theme.text_2 else theme.text_3);
     return clicked;
 }
-

@@ -218,7 +218,7 @@ pub const Panel = struct {
                 if (self.query.items.len > 0) self.remember(self.query.items);
                 self.runNow();
             },
-            .move_up, .move_down => if (self.focus.id == @intFromEnum(Field.query)) {
+            .move_up, .move_down => if (self.focus.id == @backingInt(Field.query)) {
                 self.stepHistory(if (cmd == .move_up) 1 else -1);
             },
             else => _ = self.focus.onEdit(cmd),
@@ -270,7 +270,7 @@ pub const Panel = struct {
 
     fn takeFocus(self: *Panel, f: Field, now: f64) void {
         self.syncFields();
-        self.focus.take(@intFromEnum(f), self.fieldValue(f).items, now);
+        self.focus.take(@backingInt(f), self.fieldValue(f).items, now);
     }
 
     /// Tab / ⇧Tab: the next / previous box on show.
@@ -336,7 +336,7 @@ pub const Panel = struct {
         }
         self.query.clearRetainingCapacity();
         self.query.appendSlice(self.gpa, text) catch return;
-        self.focus.take(@intFromEnum(Field.query), self.query.items, self.focus.blink_t0);
+        self.focus.take(@backingInt(Field.query), self.query.items, self.focus.blink_t0);
         self.focus.editor.setCursor(self.query.items.len, false);
         self.touched();
     }
@@ -411,7 +411,7 @@ pub const Panel = struct {
         self.note_len = 0;
         self.hist_pos = null;
         self.scroll = 0;
-        if (self.focused() == .query) self.focus.take(@intFromEnum(Field.query), "", self.focus.blink_t0);
+        if (self.focused() == .query) self.focus.take(@backingInt(Field.query), "", self.focus.blink_t0);
     }
 
     fn setOut(self: *Panel, rel: []const u8) void {
@@ -458,7 +458,7 @@ pub const Panel = struct {
             }
             const long_hint = "Search (↑↓ for history)";
             const hint: []const u8 = if (ui.text.measure(theme.font_side, long_hint) <= fw - toggles_w - 24) long_hint else "Search";
-            const fr = field.draw(ui, &self.focus, @intFromEnum(Field.query), qr, self.query.items, .{ .placeholder = hint, .font = theme.font_side, .right_pad = toggles_w });
+            const fr = field.draw(ui, &self.focus, @backingInt(Field.query), qr, self.query.items, .{ .placeholder = hint, .font = theme.font_side, .right_pad = toggles_w });
             if (fr.clicked) self.takeFocus(.query, ui.now);
             if (ui.mouseIn(qr)) in_field = true;
             for (switches, 0..) |s, i| {
@@ -478,7 +478,7 @@ pub const Panel = struct {
             const br: Rect = .{ .x = rr.right() - 6 - small, .y = rr.centerY() - small / 2, .w = small, .h = small };
             const can = self.engine.results.match_count > 0 and !self.engine.busy();
             const bst: ui_mod.ButtonState = if (can) ui.button(Ui.id("search.replace_all", 0), br) else .{};
-            const fr = field.draw(ui, &self.focus, @intFromEnum(Field.replace), rr, self.replace.items, .{ .placeholder = "Replace", .font = theme.font_side, .right_pad = small + 8 });
+            const fr = field.draw(ui, &self.focus, @backingInt(Field.replace), rr, self.replace.items, .{ .placeholder = "Replace", .font = theme.font_side, .right_pad = small + 8 });
             if (fr.clicked) self.takeFocus(.replace, ui.now);
             if (ui.mouseIn(rr)) in_field = true;
             self.drawIconButton(ui, br, .replace, bst, can);
@@ -517,14 +517,14 @@ pub const Panel = struct {
         if (self.show_details) {
             y += 2;
             const ir: Rect = .{ .x = fx, .y = y, .w = fw, .h = field.height };
-            const fi = field.draw(ui, &self.focus, @intFromEnum(Field.include), ir, self.include.items, .{ .placeholder = "e.g. *.zig, src/**", .font = theme.font_side });
+            const fi = field.draw(ui, &self.focus, @backingInt(Field.include), ir, self.include.items, .{ .placeholder = "e.g. *.zig, src/**", .font = theme.font_side });
             if (fi.clicked) self.takeFocus(.include, ui.now);
             if (ui.mouseIn(ir)) in_field = true;
             y += field.height + 6;
             _ = dl.textEllipsis(theme.font_hint, fx, y + small / 2, "files to exclude", fw, theme.text_2);
             y += small + 2;
             const er: Rect = .{ .x = fx, .y = y, .w = fw, .h = field.height };
-            const fe = field.draw(ui, &self.focus, @intFromEnum(Field.exclude), er, self.exclude.items, .{ .placeholder = "e.g. node_modules, *.min.js", .font = theme.font_side });
+            const fe = field.draw(ui, &self.focus, @backingInt(Field.exclude), er, self.exclude.items, .{ .placeholder = "e.g. node_modules, *.min.js", .font = theme.font_side });
             if (fe.clicked) self.takeFocus(.exclude, ui.now);
             if (ui.mouseIn(er)) in_field = true;
             y += field.height;

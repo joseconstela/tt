@@ -25,7 +25,7 @@ CoreText, WebKit, AVFoundation and others are driven straight from Zig through t
 
 ## Features
 
-- **Local only.** (except for external AI agents & Apple's voice recognition if you decide to use it). Your shell, your files, your projects and your
+- **Local only.** (except for external AI agents). Your shell, your files, your projects and your
   settings never leave this Mac. There is no account, no sync, no telemetry, no update check. The
   only thing that ever goes out is what you choose to send to an AI agent you configured yourself,
   and with a local model (Ollama) not even that. Nothing is configured out of the box.
@@ -33,6 +33,8 @@ CoreText, WebKit, AVFoundation and others are driven straight from Zig through t
 - **Block-based terminal,** yet compatible with AI agents. Built in support for "fix with agent", explain, etc.
 - **An input box, not a prompt.** You can enter both commands or plain text asking for a commant to run.
 - **Projects.** Add a folder to the sidebar and it becomes a project with tabs of its own. Arrange tabs, split and arrange them, pin files, and others.
+- **⌥ jumps.** Every project has a letter that never changes: hold ⌥ and press `C`, `2`, `3` to land on
+  the third tab of the second resource of **C**ognito. [How it works below.](#keyboard)
 - **Native contents.** Obsidian-style as Markdown editor whose preview stays editable (tables in cells,
   inline HTML and entities rendered), image, PDFs rendered
   page by page.
@@ -42,11 +44,29 @@ CoreText, WebKit, AVFoundation and others are driven straight from Zig through t
   tab on Ghostty's terminal core and hand it back when they exit.
 - **⌘K.** A fully featured command palette over commands, open tabs, shell history, goto file, etc. 
 - **Styles: tt's own, E-ink, and classic terminal themes.** Plus most common themes. Configurable per-monitor.
-- **Physical world interactions.** Blurr the screen when looking away, control with your voice, etc.
+
+## Keyboard
+
+Hold **⌥** and the sidebar and tab strips show their keys. Without letting go of ⌥:
+
+| Keys | Goes to |
+| --- | --- |
+| `⌥C` | the project whose letter is C, its own tabs |
+| `⌥C` `2` | the second resource listed under it |
+| `⌥C` `2` `3` | the third tab of that resource (counting across split panes) |
+| `⌥C` `0` `1` | the first of the project's own tabs |
+
+Every step shows its row at once; letting go of ⌥ ends there (a row with no tabs yet opens its first
+one, as a click would). Letters are handed out once, from the project's name (clashes take the next
+word's initial, then any letter of the name), saved in `~/.tt_projects` and never reshuffled when
+projects are added, renamed or reordered. Pick another one with right-click → **Shortcut Key…**; a
+letter already in use swaps with it. Resource and tab digits follow their order in the sidebar and
+the strip. ⌥ + a digit first, or a letter no project has, types as usual (⌥2 is still `@` on a
+Spanish keyboard). `⌘1`–`⌘9` still pick a tab of the strip in focus.
 
 ## Getting started
 
-Requirements: macOS, [Zig 0.16](https://ziglang.org/download/) and the Xcode command line tools (`zig build app` also needs Xcode itself, whose `actool` compiles the app icon).
+Requirements: macOS, [Zig 0.17.1](https://ziglang.org/download/) and the Xcode command line tools (`zig build app` also needs Xcode itself, whose `actool` compiles the app icon).
 
 ```sh
 git clone git@github.com:joseconstela/tt.git
@@ -65,6 +85,19 @@ zig build -Doptimize=ReleaseFast  # optimised binary
 The first build fetches tt's one dependency, [libghostty-vt](https://github.com/ghostty-org/ghostty),
 pinned by commit in `build.zig.zon` (about 130 MB unpacked into the git-ignored `zig-pkg/`). If that
 first fetch errors out, run `zig build` again.
+
+### Development
+
+The repo carries two git hooks in `hooks/`. Turn them on once per clone:
+
+```sh
+git config core.hooksPath hooks
+```
+
+| Hook | Checks |
+| --- | --- |
+| `pre-commit` | What is staged, in under a second: `zig` matches `minimum_zig_version`, staged `.zig` files are `zig fmt` clean, `src/` holds no more `catch {}` / `catch unreachable` than `hooks/catch-budget` allows, no `.DS_Store` or build output, no new file over 1 MB (unless listed in `hooks/large-file-allowlist`), nothing that looks like a private key or an API token. Files over 2500 lines get a warning. |
+| `pre-push` | `zig build test`, then a full `zig build` into `.zig-cache/hook-out` (the tests compile only part of the code). Both run on the working tree, so uncommitted edits count. |
 
 ## What stays local
 

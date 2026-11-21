@@ -229,4 +229,30 @@ pub const Ui = struct {
             self.dl.rrect(r, radius, theme.hover);
         }
     }
+
+    /// A ⌥ jump key (`jump.zig`) on a row or a tab, as a small keycap with
+    /// its left edge at `x`, centred on `cy`; returns its width.
+    pub fn keycap(self: *Ui, x: f32, cy: f32, label: []const u8, style: KeycapStyle) f32 {
+        const font = theme.font_kbd;
+        const tw = self.text.measure(font, label);
+        const h: f32 = 17;
+        const w = self.keycapWidth(label);
+        const r: Rect = .{ .x = x, .y = cy - h / 2, .w = w, .h = h };
+        const fill, const edge, const ink = switch (style) {
+            .next => .{ theme.accent, theme.accent, theme.on_accent },
+            .normal => .{ theme.bg_panel, theme.line_strong, theme.text },
+            .later => .{ theme.bg_panel, theme.line, theme.text_3 },
+        };
+        self.dl.shape(r, 4, fill, 1, edge);
+        _ = self.dl.textCentered(font, r.x + (w - tw) / 2, cy, label, ink);
+        return w;
+    }
+
+    pub fn keycapWidth(self: *Ui, label: []const u8) f32 {
+        return @max(17, self.text.measure(theme.font_kbd, label) + 9);
+    }
 };
+
+/// How a jump key shows: `next` for the keys the chord under way takes
+/// now, `later` for ones that only count after another key.
+pub const KeycapStyle = enum { next, normal, later };

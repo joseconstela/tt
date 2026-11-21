@@ -1533,7 +1533,7 @@ pub const NotebookTab = struct {
 
     fn realPath(p: []const u8, buf: *[1024]u8) []const u8 {
         var z: [1024]u8 = undefined;
-        const pz = std.fmt.bufPrintZ(&z, "{s}", .{p}) catch return p;
+        const pz = std.fmt.bufPrintSentinel(&z, "{s}", .{p}, 0) catch return p;
         const r = std.c.realpath(pz.ptr, buf) orelse return p;
         return std.mem.span(r);
     }

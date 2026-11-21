@@ -54,7 +54,7 @@ pub const max_groups = 10;
 pub const Span = struct {
     start: usize,
     end: usize,
-    groups: [max_groups]?[2]usize = [_]?[2]usize{null} ** max_groups,
+    groups: [max_groups]?[2]usize = @splat(null),
 };
 
 pub const Matcher = struct {
@@ -72,7 +72,7 @@ pub const Matcher = struct {
         var self: Matcher = .{ .gpa = gpa, .opts = opts, .needle = try gpa.dupe(u8, text) };
         errdefer gpa.free(self.needle);
         if (opts.regex) {
-            const pat = try gpa.dupeZ(u8, text);
+            const pat = try gpa.dupeSentinel(u8, text, 0);
             defer gpa.free(pat);
             const flags = REG_EXTENDED | (if (opts.match_case) 0 else REG_ICASE);
             if (regcomp(&self.re, pat.ptr, flags) != 0) return error.BadPattern;
@@ -91,7 +91,7 @@ pub const Matcher = struct {
     /// What is wrong with `text` as a regex, into `buf` (empty when it compiles).
     pub fn regexProblem(gpa: std.mem.Allocator, text: []const u8, buf: []u8) []const u8 {
         if (text.len == 0) return "";
-        const pat = gpa.dupeZ(u8, text) catch return "";
+        const pat = gpa.dupeSentinel(u8, text, 0) catch return "";
         defer gpa.free(pat);
         var re: regex_t = undefined;
         const code = regcomp(&re, pat.ptr, REG_EXTENDED);
@@ -125,7 +125,7 @@ pub const Matcher = struct {
             const at = if (self.opts.match_case)
                 std.mem.indexOfPos(u8, line, from, self.needle)
             else
-                indexOfIgnoreCasePos(line, from, self.needle);
+                findIgnoreCasePos(line, from, self.needle);
             const s = at orelse return null;
             return .{ .start = s, .end = s + self.needle.len };
         }
@@ -143,7 +143,7 @@ pub const Matcher = struct {
     }
 };
 
-fn indexOfIgnoreCasePos(hay: []const u8, from: usize, needle_lower: []const u8) ?usize {
+fn findIgnoreCasePos(hay: []const u8, from: usize, needle_lower: []const u8) ?usize {
     if (needle_lower.len == 0) return from;
     if (hay.len < needle_lower.len) return null;
     var i = from;
@@ -830,7 +830,7 @@ test "results: lines, columns and previews" {
     defer m.deinit();
     var res = Results.init(testing.allocator);
     defer res.deinit();
-    const data = "first\r\n    needle here\nplain\n" ++ "x" ** 40 ++ " needle needle\n";
+    const data = "first\r\n    needle here\nplain\n" ++ @as([40]u8, @splat('x')) ++ " needle needle\n";
     try testing.expect(res.scan("a/b.txt", &m, data));
     try testing.expectEqual(@as(usize, 1), res.files.items.len);
     const f = res.files.items[0];

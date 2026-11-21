@@ -98,7 +98,7 @@ const Candidate = struct { path: []u8, real: []u8, tier: Tier };
 fn realOf(gpa: std.mem.Allocator, python: []const u8) ![]u8 {
     var z: [1024]u8 = undefined;
     var real_buf: [1024]u8 = undefined;
-    const pz = std.fmt.bufPrintZ(&z, "{s}", .{python}) catch return gpa.dupe(u8, python);
+    const pz = std.fmt.bufPrintSentinel(&z, "{s}", .{python}, 0) catch return gpa.dupe(u8, python);
     const r = c.realpath(pz.ptr, &real_buf) orelse return gpa.dupe(u8, python);
     return gpa.dupe(u8, std.mem.span(r));
 }
@@ -176,7 +176,7 @@ pub fn hasJupyter(gpa: std.mem.Allocator, python: []const u8) bool {
     // A bare `python3` is a link to a `python3.N`: the link says which.
     var real_buf: [1024]u8 = undefined;
     const base = blk: {
-        const z = std.fmt.bufPrintZ(&buf, "{s}", .{python}) catch break :blk sys.basename(python);
+        const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{python}, 0) catch break :blk sys.basename(python);
         const real = c.realpath(z.ptr, &real_buf) orelse break :blk sys.basename(python);
         const resolved = std.mem.span(real);
         break :blk if (versionOf(sys.basename(resolved))) |v| (if (v != 0) sys.basename(resolved) else sys.basename(python)) else sys.basename(python);
@@ -224,7 +224,7 @@ pub fn versionLabel(python: []const u8, buf: []u8) []const u8 {
     // A bare `python3`, or a virtualenv's `python`, is a link to the real
     // `python3.N`: the link says which.
     if ((versionOf(name) orelse 0) == 0) {
-        if (std.fmt.bufPrintZ(&z_buf, "{s}", .{python})) |z| {
+        if (std.fmt.bufPrintSentinel(&z_buf, "{s}", .{python}, 0)) |z| {
             if (c.realpath(z.ptr, &real_buf)) |real| name = sys.basename(std.mem.span(real));
         } else |_| {}
     }
@@ -314,7 +314,7 @@ pub const Install = struct {
         if (self.forced) try argv.append(arena, "--break-system-packages");
         try argv.append(arena, "ipykernel");
         const argv_z = try arena.alloc(?[*:0]const u8, argv.items.len + 1);
-        for (argv.items, 0..) |a, i| argv_z[i] = (try arena.dupeZ(u8, a)).ptr;
+        for (argv.items, 0..) |a, i| argv_z[i] = (try arena.dupeSentinel(u8, a, 0)).ptr;
         argv_z[argv.items.len] = null;
 
         const environ = sys._NSGetEnviron().*;
@@ -323,9 +323,9 @@ pub const Install = struct {
         const extra = [_][]const u8{ "PYTHONUNBUFFERED=1", "PIP_NO_COLOR=1", "PIP_PROGRESS_BAR=off" };
         const envp = try arena.alloc(?[*:0]const u8, env_count + extra.len + 1);
         for (0..env_count) |i| envp[i] = environ[i];
-        for (extra, 0..) |e, i| envp[env_count + i] = (try arena.dupeZ(u8, e)).ptr;
+        for (extra, 0..) |e, i| envp[env_count + i] = (try arena.dupeSentinel(u8, e, 0)).ptr;
         envp[env_count + extra.len] = null;
-        const cwd_z = try arena.dupeZ(u8, if (self.cwd.len == 0) "." else self.cwd);
+        const cwd_z = try arena.dupeSentinel(u8, if (self.cwd.len == 0) "." else self.cwd, 0);
 
         var out_pipe: [2]c.fd_t = undefined;
         if (c.pipe(&out_pipe) != 0) return error.PipeFailed;
@@ -432,7 +432,7 @@ pub const Install = struct {
         var text = std.mem.trimEnd(u8, self.log.items, " \r\n\t");
         while (text.len > 0) {
             const nl = std.mem.lastIndexOfAny(u8, text, "\r\n") orelse 0;
-            const line = std.mem.trim(u8, text[if (nl == 0) 0 else nl + 1 ..], " \t\r\n");
+            const line = std.mem.trim(u8, text[if (nl == 0) 0 else nl + 1..], " \t\r\n");
             if (line.len > 0) return line;
             if (nl == 0) break;
             text = std.mem.trimEnd(u8, text[0..nl], " \r\n\t");
@@ -814,7 +814,7 @@ pub const Kernel = struct {
 
         const argv = [_][]const u8{ python, self.opts.script, "--kernel", self.opts.kernel_name, "--cwd", self.opts.cwd, "--vars" };
         const argv_z = try arena.alloc(?[*:0]const u8, argv.len + 1);
-        for (argv, 0..) |a, i| argv_z[i] = (try arena.dupeZ(u8, a)).ptr;
+        for (argv, 0..) |a, i| argv_z[i] = (try arena.dupeSentinel(u8, a, 0)).ptr;
         argv_z[argv.len] = null;
         // Only the last of `--vars` matters when the inspector is off.
         const argc: usize = if (self.opts.want_vars) argv.len else argv.len - 1;
@@ -826,9 +826,9 @@ pub const Kernel = struct {
         const extra = [_][]const u8{ "PYTHONUNBUFFERED=1", "TT_NOTEBOOK=1" };
         const envp = try arena.alloc(?[*:0]const u8, env_count + extra.len + 1);
         for (0..env_count) |i| envp[i] = environ[i];
-        for (extra, 0..) |e, i| envp[env_count + i] = (try arena.dupeZ(u8, e)).ptr;
+        for (extra, 0..) |e, i| envp[env_count + i] = (try arena.dupeSentinel(u8, e, 0)).ptr;
         envp[env_count + extra.len] = null;
-        const cwd_z = try arena.dupeZ(u8, if (self.opts.cwd.len == 0) "." else self.opts.cwd);
+        const cwd_z = try arena.dupeSentinel(u8, if (self.opts.cwd.len == 0) "." else self.opts.cwd, 0);
 
         var in_pipe: [2]c.fd_t = undefined;
         var out_pipe: [2]c.fd_t = undefined;

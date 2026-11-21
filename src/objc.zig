@@ -64,23 +64,23 @@ pub fn class(comptime name: [:0]const u8) Class {
 }
 
 fn MsgFn(comptime Ret: type, comptime First: type, comptime Args: type) type {
-    const f = @typeInfo(Args).@"struct".fields;
+    const f = @typeInfo(Args).@"struct".field_types;
     inline for (f) |field| {
-        if (field.type == comptime_int or field.type == comptime_float)
+        if (field == comptime_int or field == comptime_float)
             @compileError("objc.msg: cast numeric literals to a concrete C type");
     }
     return switch (f.len) {
         0 => *const fn (First, SEL) callconv(.c) Ret,
-        1 => *const fn (First, SEL, f[0].type) callconv(.c) Ret,
-        2 => *const fn (First, SEL, f[0].type, f[1].type) callconv(.c) Ret,
-        3 => *const fn (First, SEL, f[0].type, f[1].type, f[2].type) callconv(.c) Ret,
-        4 => *const fn (First, SEL, f[0].type, f[1].type, f[2].type, f[3].type) callconv(.c) Ret,
-        5 => *const fn (First, SEL, f[0].type, f[1].type, f[2].type, f[3].type, f[4].type) callconv(.c) Ret,
-        6 => *const fn (First, SEL, f[0].type, f[1].type, f[2].type, f[3].type, f[4].type, f[5].type) callconv(.c) Ret,
-        7 => *const fn (First, SEL, f[0].type, f[1].type, f[2].type, f[3].type, f[4].type, f[5].type, f[6].type) callconv(.c) Ret,
-        8 => *const fn (First, SEL, f[0].type, f[1].type, f[2].type, f[3].type, f[4].type, f[5].type, f[6].type, f[7].type) callconv(.c) Ret,
-        9 => *const fn (First, SEL, f[0].type, f[1].type, f[2].type, f[3].type, f[4].type, f[5].type, f[6].type, f[7].type, f[8].type) callconv(.c) Ret,
-        10 => *const fn (First, SEL, f[0].type, f[1].type, f[2].type, f[3].type, f[4].type, f[5].type, f[6].type, f[7].type, f[8].type, f[9].type) callconv(.c) Ret,
+        1 => *const fn (First, SEL, f[0]) callconv(.c) Ret,
+        2 => *const fn (First, SEL, f[0], f[1]) callconv(.c) Ret,
+        3 => *const fn (First, SEL, f[0], f[1], f[2]) callconv(.c) Ret,
+        4 => *const fn (First, SEL, f[0], f[1], f[2], f[3]) callconv(.c) Ret,
+        5 => *const fn (First, SEL, f[0], f[1], f[2], f[3], f[4]) callconv(.c) Ret,
+        6 => *const fn (First, SEL, f[0], f[1], f[2], f[3], f[4], f[5]) callconv(.c) Ret,
+        7 => *const fn (First, SEL, f[0], f[1], f[2], f[3], f[4], f[5], f[6]) callconv(.c) Ret,
+        8 => *const fn (First, SEL, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]) callconv(.c) Ret,
+        9 => *const fn (First, SEL, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]) callconv(.c) Ret,
+        10 => *const fn (First, SEL, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9]) callconv(.c) Ret,
         else => @compileError("objc.msg: too many arguments"),
     };
 }
@@ -209,16 +209,16 @@ pub fn invokeBlock(block: ?*anyopaque, args: anytype) void {
 }
 
 fn BlockFn(comptime Args: type) type {
-    const f = @typeInfo(Args).@"struct".fields;
+    const f = @typeInfo(Args).@"struct".field_types;
     inline for (f) |field| {
-        if (field.type == comptime_int or field.type == comptime_float)
+        if (field == comptime_int or field == comptime_float)
             @compileError("objc.invokeBlock: cast numeric literals to a concrete C type");
     }
     return switch (f.len) {
         0 => *const fn (*Block) callconv(.c) void,
-        1 => *const fn (*Block, f[0].type) callconv(.c) void,
-        2 => *const fn (*Block, f[0].type, f[1].type) callconv(.c) void,
-        3 => *const fn (*Block, f[0].type, f[1].type, f[2].type) callconv(.c) void,
+        1 => *const fn (*Block, f[0]) callconv(.c) void,
+        2 => *const fn (*Block, f[0], f[1]) callconv(.c) void,
+        3 => *const fn (*Block, f[0], f[1], f[2]) callconv(.c) void,
         else => @compileError("objc.invokeBlock: too many arguments"),
     };
 }

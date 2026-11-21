@@ -46,20 +46,6 @@
 //!       camera: allow                     # allow | block; absent = the default above
 //!       microphone: allow
 //!       notifications: allow
-//!   physical:               # tt's own use of the camera (Settings › Physical interactions)
-//!     camera: ""                          # a camera's name; blank = the macOS default
-//!     blur_when_away: false               # blur the window while nobody looks at it
-//!     blur_after: 3                       # seconds of looking away before it blurs
-//!     sensitivity: normal                 # relaxed | normal | strict
-//!     center_yaw: 0                       # from Calibrate: the head while looking at
-//!     center_pitch: 0                     #   the screen, in degrees …
-//!     face_size: 0                        # … and its size (0 = not calibrated)
-//!     neck: 0
-//!   voice:                  # voice commands (Settings › Physical interactions › Voice)
-//!     enabled: false                      # listen for the trigger word while tt is open
-//!     microphone: ""                      # a microphone's name; blank = the macOS default
-//!     language: ""                        # what is spoken (en-US, es-ES …); blank = the Mac's language
-//!     trigger: tt                         # the word that starts a command
 //!
 //! In the code an "agent" is one of the APIs (a model at a provider); the
 //! coding agents installed on the Mac live in `coding_agents.zig`.
@@ -69,7 +55,6 @@
 const std = @import("std");
 const sys = @import("sys.zig");
 const themes = @import("ui/themes.zig");
-const posture = @import("physical/posture.zig");
 
 /// The UI's style (Settings › Style): tt's own dark or light palette,
 /// following macOS between them, e-ink (black on white, for e-paper
@@ -191,8 +176,8 @@ pub const Provider = enum {
     }
 
     fn parse(s: []const u8) ?Provider {
-        inline for (std.meta.fields(Provider)) |f| {
-            if (std.ascii.eqlIgnoreCase(s, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(Provider).@"enum".field_names, @typeInfo(Provider).@"enum".field_values) |f_name, f_value| {
+            if (std.ascii.eqlIgnoreCase(s, f_name)) return @fromBackingInt(@intCast(f_value));
         }
         return null;
     }
@@ -293,46 +278,6 @@ pub const Browser = struct {
             .microphone => self.microphone,
             .notifications => self.notifications,
         };
-    }
-};
-
-/// Settings › Physical interactions: what tt itself does with the camera
-/// (see physical/camera_controller.zig).
-pub const Physical = struct {
-    /// The camera, by the name macOS gives it; blank = the macOS default.
-    camera: []u8 = "",
-    /// Blur the window while nobody looks at it.
-    blur_when_away: bool = false,
-    /// Seconds of looking away before the blur comes.
-    blur_after: f32 = 3,
-    /// How far the head may turn or nod before it counts as looking away.
-    sensitivity: posture.Sensitivity = .normal,
-    /// The head and shoulders while looking at the screen (Calibrate).
-    calibration: posture.Calibration = .{},
-
-    fn deinit(self: *Physical, gpa: std.mem.Allocator) void {
-        gpa.free(self.camera);
-        self.* = .{};
-    }
-};
-
-/// Settings › Physical interactions › Voice: voice commands, started by a
-/// trigger word (see physical/voice_controller.zig).
-pub const Voice = struct {
-    /// Listen for the trigger word while tt is open.
-    enabled: bool = false,
-    /// The microphone, by the name macOS gives it; blank = the macOS default.
-    microphone: []u8 = "",
-    /// The word that starts a command; blank = "tt".
-    trigger: []u8 = "",
-    /// The language spoken, as a code ("en-US"); blank = the Mac's language.
-    language: []u8 = "",
-
-    fn deinit(self: *Voice, gpa: std.mem.Allocator) void {
-        gpa.free(self.microphone);
-        gpa.free(self.language);
-        gpa.free(self.trigger);
-        self.* = .{};
     }
 };
 
@@ -461,8 +406,6 @@ pub const Config = struct {
     features: Features = .{},
     notebooks: Notebooks = .{},
     browser: Browser = .{},
-    physical: Physical = .{},
-    voice: Voice = .{},
     /// Bumped on every change, so views can notice edits made elsewhere.
     version: u64 = 0,
     /// A change waiting to be written (see `touch` / `saveIfDue`).
@@ -488,8 +431,6 @@ pub const Config = struct {
         self.gpa.free(self.features.fix_agent);
         self.gpa.free(self.features.fix_prompt);
         self.browser.deinit(self.gpa);
-        self.physical.deinit(self.gpa);
-        self.voice.deinit(self.gpa);
         if (self.path) |p| self.gpa.free(p);
         self.* = .{ .gpa = self.gpa };
     }
@@ -888,22 +829,6 @@ pub const Config = struct {
                 }
             }
         }
-        const ph = &self.physical;
-        try out.appendSlice(gpa, "physical:   # tt's own use of the camera (Settings › Physical interactions)\n");
-        try writeField(gpa, out, "camera", ph.camera); // blank = the macOS default
-        try out.print(gpa, "  blur_when_away: {s}\n", .{if (ph.blur_when_away) "true" else "false"});
-        try out.print(gpa, "  blur_after: {d}   # seconds\n", .{ph.blur_after});
-        try out.print(gpa, "  sensitivity: {s}   # relaxed | normal | strict\n", .{@tagName(ph.sensitivity)});
-        try out.print(gpa, "  center_yaw: {d:.1}   # from Calibrate: the head while looking at the screen\n", .{ph.calibration.yaw});
-        try out.print(gpa, "  center_pitch: {d:.1}\n", .{ph.calibration.pitch});
-        try out.print(gpa, "  face_size: {d:.3}   # 0 = not calibrated\n", .{ph.calibration.face_size});
-        try out.print(gpa, "  neck: {d:.3}\n", .{ph.calibration.neck});
-        const vo = &self.voice;
-        try out.appendSlice(gpa, "voice:   # voice commands (Settings › Physical interactions › Voice)\n");
-        try out.print(gpa, "  enabled: {s}\n", .{if (vo.enabled) "true" else "false"});
-        try writeField(gpa, out, "microphone", vo.microphone); // blank = the macOS default
-        try writeField(gpa, out, "language", vo.language); // blank = the Mac's language
-        try writeField(gpa, out, "trigger", if (vo.trigger.len > 0) vo.trigger else "tt");
     }
 
     fn writeField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
@@ -956,14 +881,7 @@ pub const Config = struct {
         return true;
     }
 
-    fn voiceString(vo: *Voice, key: []const u8) ?*[]u8 {
-        if (std.mem.eql(u8, key, "microphone")) return &vo.microphone;
-        if (std.mem.eql(u8, key, "trigger")) return &vo.trigger;
-        if (std.mem.eql(u8, key, "language")) return &vo.language;
-        return null;
-    }
-
-    const Section = enum { none, ui, agents, apis, features, screens, notebooks, browser, sites, physical, voice };
+    const Section = enum { none, ui, agents, apis, features, screens, notebooks, browser, sites };
 
     /// Reads the subset `write` produces (plus hand edits of the same
     /// shape). Anything it does not understand is skipped.
@@ -1069,44 +987,6 @@ pub const Config = struct {
                             .microphone => self.browser.microphone = p,
                             .notifications => self.browser.notifications = p,
                         };
-                    }
-                },
-                .physical => {
-                    const kv = splitKey(body) orelse continue;
-                    const ph = &self.physical;
-                    const bare = std.mem.trim(u8, kv.value, "\"' ");
-                    if (std.mem.eql(u8, kv.key, "camera")) {
-                        const v = try unquote(self.gpa, kv.value);
-                        defer self.gpa.free(v);
-                        self.setString(&ph.camera, v);
-                    } else if (std.mem.eql(u8, kv.key, "blur_when_away")) {
-                        ph.blur_when_away = isTrue(kv.value);
-                    } else if (std.mem.eql(u8, kv.key, "sensitivity")) {
-                        if (posture.Sensitivity.parse(bare)) |v| ph.sensitivity = v;
-                    } else if (std.fmt.parseFloat(f32, bare)) |v| {
-                        if (!std.math.isFinite(v)) continue;
-                        if (std.mem.eql(u8, kv.key, "blur_after")) {
-                            ph.blur_after = std.math.clamp(v, 0.5, 600);
-                        } else if (std.mem.eql(u8, kv.key, "center_yaw")) {
-                            ph.calibration.yaw = std.math.clamp(v, -90, 90);
-                        } else if (std.mem.eql(u8, kv.key, "center_pitch")) {
-                            ph.calibration.pitch = std.math.clamp(v, -90, 90);
-                        } else if (std.mem.eql(u8, kv.key, "face_size")) {
-                            ph.calibration.face_size = std.math.clamp(v, 0, 1);
-                        } else if (std.mem.eql(u8, kv.key, "neck")) {
-                            ph.calibration.neck = std.math.clamp(v, 0, 10);
-                        }
-                    } else |_| {}
-                },
-                .voice => {
-                    const kv = splitKey(body) orelse continue;
-                    const vo = &self.voice;
-                    if (std.mem.eql(u8, kv.key, "enabled")) {
-                        vo.enabled = isTrue(kv.value);
-                    } else if (voiceString(vo, kv.key)) |slot| {
-                        const v = try unquote(self.gpa, kv.value);
-                        defer self.gpa.free(v);
-                        self.setString(slot, std.mem.trim(u8, v, " \t"));
                     }
                 },
                 .sites => {
@@ -1673,68 +1553,19 @@ test "browser: cookies, homepage and do-not-track round trip and default to sess
     try std.testing.expectEqualStrings("", c.browser.homepage);
 }
 
-test "physical: camera, blur and calibration round trip; the blur is off by default" {
+test "sections tt no longer has (physical, voice) are skipped and not written back" {
     const gpa = std.testing.allocator;
-    var a = Config.init(gpa);
-    defer a.deinit();
-    try std.testing.expect(!a.physical.blur_when_away and a.physical.camera.len == 0 and !a.physical.calibration.isSet());
-    a.setString(&a.physical.camera, "Studio Display Camera");
-    a.physical.blur_when_away = true;
-    a.physical.blur_after = 5;
-    a.physical.sensitivity = .strict;
-    a.physical.calibration = .{ .yaw = -12.5, .pitch = 8, .face_size = 0.25, .neck = 0.7 };
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(gpa);
-    try a.write(&text);
-    try std.testing.expect(std.mem.indexOf(u8, text.items, "physical:") != null);
-
-    var b = Config.init(gpa);
-    defer b.deinit();
-    try b.parse(text.items);
-    try std.testing.expectEqualStrings("Studio Display Camera", b.physical.camera);
-    try std.testing.expect(b.physical.blur_when_away);
-    try std.testing.expectEqual(@as(f32, 5), b.physical.blur_after);
-    try std.testing.expectEqual(posture.Sensitivity.strict, b.physical.sensitivity);
-    try std.testing.expectApproxEqAbs(@as(f32, -12.5), b.physical.calibration.yaw, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 8), b.physical.calibration.pitch, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), b.physical.calibration.face_size, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.7), b.physical.calibration.neck, 0.001);
-
-    // Hand edits: a blank camera, nonsense numbers ignored or kept in range.
     var c = Config.init(gpa);
     defer c.deinit();
-    try c.parse("physical:\n  camera: \"\"\n  blur_after: soon\n  sensitivity: RELAXED\n  face_size: 7\n");
-    try std.testing.expectEqualStrings("", c.physical.camera);
-    try std.testing.expectEqual(@as(f32, 3), c.physical.blur_after);
-    try std.testing.expectEqual(posture.Sensitivity.relaxed, c.physical.sensitivity);
-    try std.testing.expectEqual(@as(f32, 1), c.physical.calibration.face_size);
-}
-
-test "voice: off by default, round trips, a blank trigger is written as tt" {
-    const gpa = std.testing.allocator;
-    var a = Config.init(gpa);
-    defer a.deinit();
-    try std.testing.expect(!a.voice.enabled and a.voice.microphone.len == 0 and a.voice.trigger.len == 0);
+    try c.parse("physical:\n  camera: \"Studio Display Camera\"\n  blur_when_away: true\nvoice:\n  enabled: true\n  trigger: hey tt\nbrowser:\n  do_not_track: true\n");
+    // The section after them is still read.
+    try std.testing.expect(c.browser.do_not_track);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    try a.write(&text);
-    try std.testing.expect(std.mem.indexOf(u8, text.items, "  trigger: tt\n") != null);
-
-    a.voice.enabled = true;
-    a.setString(&a.voice.microphone, "MacBook Pro Microphone");
-    a.setString(&a.voice.trigger, "hey tt");
-    a.setString(&a.voice.language, "en-US");
-    text.clearRetainingCapacity();
-    try a.write(&text);
-    var b = Config.init(gpa);
-    defer b.deinit();
-    try b.parse(text.items);
-    try std.testing.expect(b.voice.enabled);
-    try std.testing.expectEqualStrings("MacBook Pro Microphone", b.voice.microphone);
-    try std.testing.expectEqualStrings("hey tt", b.voice.trigger);
-    try std.testing.expectEqualStrings("en-US", b.voice.language);
-    // The physical section before it is still read.
-    try std.testing.expect(!b.physical.blur_when_away);
+    try c.write(&text);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "physical:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "voice:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "blur_when_away") == null);
 }
 
 test "sites: permissions round trip, fall back to the defaults and drop empty sites" {

@@ -1339,7 +1339,7 @@ fn didClose(_: id, _: SEL, web_view: id) callconv(.c) void {
 /// Web views WebKit made for new windows, waiting for their tab, and the
 /// serial of the tab whose page opened each (see `createWebView`).
 const Opener = struct { view: ?*anyopaque = null, serial: u32 = 0 };
-var openers: [8]Opener = [_]Opener{.{}} ** 8;
+var openers: [8]Opener = @splat(.{});
 
 fn noteOpener(view: *anyopaque, serial: u32) void {
     for (&openers) |*o| {
@@ -1382,7 +1382,6 @@ fn requestMedia(_: id, _: SEL, web_view: id, origin: id, frame: id, kind: NSInte
     const site = web_bridge.originOf(&buf, origin);
     self.ask(site, .{ .camera = kind != 1, .microphone = kind != 0 }, block);
 }
-
 
 // ── addresses ───────────────────────────────────────────────────────────
 /// The address a typed string means: as is with a scheme, https:// (http://

@@ -50,6 +50,15 @@ pub const StripOpts = struct {
     focused: bool = true,
     /// The context line ("~/code · on main") when there is room for it.
     show_info: bool = true,
+    /// ⌥ is held: each tab shows its ⌥ jump digit (`jump.zig`), counting
+    /// on from `hint_base` (the tabs of the panes before this one).
+    hints: ?TabHints = null,
+};
+
+pub const TabHints = struct {
+    base: usize = 0,
+    /// A chord has picked this row: the digits are the next keys.
+    next: bool = false,
 };
 
 /// Into a pane's content: on a side (a new pane there) or in the middle
@@ -147,12 +156,19 @@ pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag
     var widths: [64]f32 = undefined;
     const count = @min(tabs.len, 64);
     var total: f32 = 0;
+    // ⌥ held: a tab's digit sits before its title (tabs 1–9 of the row).
+    var digits: [64]u8 = @splat(0);
+    var digit_w: [64]f32 = @splat(0);
     for (0..count) |i| {
         const t = tabs[i];
         titles[i] = t.title(&title_bufs[i]);
         const font = if (i == pane.active) theme.font_tab_active else theme.font_tab;
         widths[i] = @min(max_title_w, ui.text.measure(font, titles[i]));
-        total += tabWidth(widths[i], t.vtable.status(t.ptr) != .none) + tab_gap;
+        if (opts.hints) |h| if (h.base + i < 9) {
+            digits[i] = '1' + @as(u8, @intCast(h.base + i));
+            digit_w[i] = ui.keycapWidth(digits[i .. i + 1]) + 7;
+        };
+        total += tabWidth(widths[i], t.vtable.status(t.ptr) != .none) + digit_w[i] + tab_gap;
     }
     var info_buf: [256]u8 = undefined;
     var info: []const u8 = "";
@@ -177,7 +193,7 @@ pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag
     for (0..count) |i| {
         const t = tabs[i];
         const status = t.vtable.status(t.ptr);
-        const tw = tabWidth(widths[i], status != .none);
+        const tw = tabWidth(widths[i], status != .none) + digit_w[i];
         const r: Rect = .{ .x = x, .y = rect.y, .w = tw, .h = rect.h };
         const active = i == pane.active;
         const being_dragged = if (drag.*) |d| d.uid == t.uid else false;
@@ -207,6 +223,10 @@ pub fn drawStrip(ui: *Ui, rect: Rect, pane: *Pane, opts: StripOpts, drag: *?Drag
         const fade: f32 = if (being_dragged) 0.3 else 1;
         if (st.hover and !active and drag.* == null) dl.rrect(.{ .x = r.x, .y = pill_y, .w = r.w, .h = theme.tab_pill_h }, theme.row_radius, theme.hover);
         var tx = r.x + theme.tab_pad;
+        if (digits[i] != 0) {
+            _ = ui.keycap(tx, r.centerY(), digits[i .. i + 1], if (opts.hints.?.next) .next else .later);
+            tx += digit_w[i];
+        }
         if (status != .none) {
             const c = switch (status) {
                 .running => theme.teal,

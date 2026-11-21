@@ -116,6 +116,12 @@ pub const Outcome = union(enum) {
     new_shells: u32,
     /// Project menu → "Remove Project".
     remove_project: u32,
+    /// Project / default project menu → "Shortcut Key…": open the box for
+    /// its ⌥ jump letter.
+    set_shortcut: struct { subject: Subject, id: u32 },
+    /// That box confirmed (`key` as `name` in `renamed`: whatever was typed,
+    /// the app checks it is one letter).
+    shortcut_set: struct { id: u32, key: []const u8 },
     /// Resource menu → "Rename…": open the rename box for this resource.
     rename_resource: u32,
     /// Rename box confirmed for a resource (`name` as in `renamed`).
@@ -149,7 +155,7 @@ pub const Outcome = union(enum) {
     edit: EditAction,
 };
 
-const MenuItem = enum { rename, split_beside, split_move, close, close_others, close_right, tab_copy_path, tab_copy_rel, new_shells, set_icon, remove, new_file, new_folder, open_external, open_with, reveal, copy_path, copy_abs_path, delete, cut, copy, paste };
+const MenuItem = enum { rename, split_beside, split_move, close, close_others, close_right, tab_copy_path, tab_copy_rel, new_shells, set_icon, shortcut, remove, new_file, new_folder, open_external, open_with, reveal, copy_path, copy_abs_path, delete, cut, copy, paste };
 const MenuEntry = struct {
     item: MenuItem,
     label: []const u8,
@@ -178,15 +184,19 @@ const tab_menu_all = [_]MenuEntry{
 /// The "Split & Move" submenu: one row per side, in this order.
 const split_sides = [_]Side{ .left, .right, .top, .bottom };
 const split_labels = [_][]const u8{ "Left", "Right", "Up", "Down" };
+/// "Shortcut Key…" shows the project's ⌥ letter as its shortcut (filled in
+/// when the menu opens, see `setMenuKey`).
 const project_menu = [_]MenuEntry{
     .{ .item = .rename, .label = "Rename…" },
     .{ .item = .new_shells, .label = "New Shell Group" },
     .{ .item = .set_icon, .label = "Set Icon…" },
+    .{ .item = .shortcut, .label = "Shortcut Key…" },
     .{ .item = .remove, .label = "Remove Project" },
 };
 const default_project_menu = [_]MenuEntry{
     .{ .item = .new_shells, .label = "New Shell Group" },
     .{ .item = .set_icon, .label = "Set Icon…" },
+    .{ .item = .shortcut, .label = "Shortcut Key…" },
 };
 const resource_menu = [_]MenuEntry{
     .{ .item = .rename, .label = "Rename…" },
@@ -271,6 +281,11 @@ pub const Overlay = struct {
     tab_rows_len: usize = 0,
     /// The edit menu, as built for what was right-clicked (see `openEditMenu`).
     edit_rows: [edit_menu_all.len]MenuEntry = edit_menu_all,
+    /// A project's or the default project's menu, with its ⌥ letter on
+    /// the "Shortcut Key…" row (`key_kbd`).
+    group_rows: [project_menu.len]MenuEntry = undefined,
+    group_rows_len: usize = 0,
+    key_kbd: [8]u8 = undefined,
     /// Whether the tab a menu or rename box is about shows a document
     /// (the rename box then says the file keeps its name).
     tab_document: bool = false,
@@ -289,6 +304,8 @@ pub const Overlay = struct {
     // was wrong with the last attempt (blank: nothing).
     editor: Editor,
     name_kind: NameKind = .rename,
+    /// The box asks for a project's ⌥ jump letter, not its name.
+    shortcut_box: bool = false,
     name_error_buf: [120]u8 = undefined,
     name_error_len: usize = 0,
     seen_version: u64 = 0,
@@ -504,6 +521,13 @@ pub const Overlay = struct {
         self.mode = .menu;
         self.subject = subject;
         self.id = id;
+        const rows: []const MenuEntry = switch (subject) {
+            .project => &project_menu,
+            .default_project => &default_project_menu,
+            else => &.{},
+        };
+        @memcpy(self.group_rows[0..rows.len], rows);
+        self.group_rows_len = rows.len;
         self.anchor_x = x;
         self.anchor_y = y;
         self.highlighted = null;
@@ -513,12 +537,20 @@ pub const Overlay = struct {
         self.last_my = -1;
     }
 
+    /// A project's menu: its ⌥ jump letter, shown on "Shortcut Key…".
+    pub fn setMenuKey(self: *Overlay, key: u8) void {
+        if (key == 0) return;
+        const kbd = std.fmt.bufPrint(&self.key_kbd, "⌥{c}", .{key}) catch return;
+        for (self.group_rows[0..self.group_rows_len]) |*row| {
+            if (row.item == .shortcut) row.kbd = kbd;
+        }
+    }
+
     /// The rows of the open menu.
     fn items(self: *const Overlay) []const MenuEntry {
         return switch (self.subject) {
             .tab => self.tab_rows[0..self.tab_rows_len],
-            .project => &project_menu,
-            .default_project => &default_project_menu,
+            .project, .default_project => self.group_rows[0..self.group_rows_len],
             .resource => &resource_menu,
             .file => switch (self.file_kind) {
                 .file => &file_menu,
@@ -554,8 +586,19 @@ pub const Overlay = struct {
         self.mode = .rename;
         self.subject = subject;
         self.id = id;
+        self.name_kind = .rename;
+        self.shortcut_box = false;
+        self.name_error_len = 0;
         self.editor.setText(current);
         if (current.len > 0) self.editor.anchor = 0;
+    }
+
+    /// The box for a project's ⌥ jump letter (the default project's for
+    /// `.default_project`), prefilled with the one it has.
+    pub fn openShortcut(self: *Overlay, subject: Subject, id: u32, current: u8) void {
+        const letter = [1]u8{current};
+        self.openRename(subject, id, if (current != 0) &letter else "");
+        self.shortcut_box = true;
     }
 
     /// The close confirmation; `reason` is the tab's sentence on what would be lost.
@@ -779,6 +822,7 @@ pub const Overlay = struct {
             .tab_copy_rel => .{ .copy_tab_path = .{ .uid = id, .relative = true } },
             .new_shells => .{ .new_shells = id },
             .set_icon => .{ .set_icon = .{ .subject = subject, .id = id } },
+            .shortcut => .{ .set_shortcut = .{ .subject = subject, .id = id } },
             .remove => if (subject == .resource) .{ .remove_resource = id } else .{ .remove_project = id },
             .new_file => .{ .name_file = .new_file },
             .new_folder => .{ .name_file = .new_folder },
@@ -800,7 +844,10 @@ pub const Overlay = struct {
         const name = self.editor.bytes();
         return switch (self.subject) {
             .tab => .{ .renamed = .{ .uid = self.id, .name = name } },
-            .project, .default_project => .{ .project_renamed = .{ .id = self.id, .name = name } },
+            .project, .default_project => if (self.shortcut_box)
+                .{ .shortcut_set = .{ .id = self.id, .key = name } }
+            else
+                .{ .project_renamed = .{ .id = self.id, .name = name } },
             .resource => .{ .resource_renamed = .{ .id = self.id, .name = name } },
             .file => .{ .file_named = .{ .kind = self.name_kind, .name = name } },
             // No rename box is opened about the edit menu.
@@ -1101,7 +1148,10 @@ pub const Overlay = struct {
         var y = box.y + box_pad;
         const title: []const u8, const hint: []const u8, const ok: []const u8 = switch (self.subject) {
             .tab => .{ "Rename tab", if (hint2 != null) "Only the tab is renamed; the file itself keeps its name." else "Leave the name empty to go back to the automatic title.", "Rename" },
-            .project, .default_project => .{ "Rename project", "Leave the name empty to go back to the folder's name.", "Rename" },
+            .project, .default_project => if (self.shortcut_box)
+                .{ "Shortcut key", "⌥ + this letter jumps here. A letter in use is swapped over.", "Set" }
+            else
+                .{ "Rename project", "Leave the name empty to go back to the folder's name.", "Rename" },
             .resource => .{ "Rename", "Only the sidebar label changes; the file or folder keeps its name.", "Rename" },
             .file => switch (self.name_kind) {
                 .rename => .{ if (self.file_kind == .folder) "Rename folder" else "Rename file", self.reason_buf[0..self.reason_len], "Rename" },

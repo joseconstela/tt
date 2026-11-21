@@ -55,7 +55,7 @@ pub fn fuzzy(q: []const u8, hay: []const u8, mask: *u64) ?i32 {
 pub fn substring(q: []const u8, hay: []const u8, mask: *u64) ?i32 {
     mask.* = 0;
     if (q.len == 0) return 0;
-    const at = std.ascii.indexOfIgnoreCase(hay, q) orelse return null;
+    const at = std.ascii.findIgnoreCase(hay, q) orelse return null;
     // Byte offsets → code point indices for the highlight mask.
     var idx: usize = 0;
     var it = gfx_text.Utf8Iter{ .bytes = hay };

@@ -39,7 +39,8 @@ pub const PaneView = struct {
 
     /// `band_inset`: where the first strip may start (past the traffic
     /// lights and the sidebar's toggle while the sidebar is collapsed).
-    pub fn draw(self: *PaneView, ui: *Ui, tabs: *tab_mod.TabManager, band: Rect, content: Rect, band_inset: f32, files_visible: bool, window_focused: bool) Result {
+    /// `hints`: ⌥ is held, the tabs show their jump digits (null: not).
+    pub fn draw(self: *PaneView, ui: *Ui, tabs: *tab_mod.TabManager, band: Rect, content: Rect, band_inset: f32, files_visible: bool, window_focused: bool, hints: ?tabbar.TabHints) Result {
         const dl = ui.dl;
         var res: Result = .{};
         const cluster = tabbar.drawCluster(ui, band, files_visible);
@@ -103,10 +104,19 @@ pub const PaneView = struct {
             const strip = parts[i].strip;
             const body = parts[i].body;
             const focused = p.id == focused_id;
+            // Tabs number on across the panes in reading order.
+            var strip_hints = hints;
+            if (strip_hints) |*h| {
+                for (l.panes().slice()) |other| {
+                    if (other == p) break;
+                    h.base += other.tabs.items.len;
+                }
+            }
             const sr = tabbar.drawStrip(ui, strip, p, .{
                 .left_inset = if (parts[i].first) @max(16, band_inset) else 12,
                 .focused = focused,
                 .show_info = focused,
+                .hints = strip_hints,
             }, &self.drag);
             if (sr.activate) |j| {
                 p.active = j;

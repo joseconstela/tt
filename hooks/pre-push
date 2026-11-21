@@ -1,0 +1,58 @@
+#!/bin/bash
+# tt pre-push: the unit tests and a full build of the executable.
+# Enable once per clone with:  git config core.hooksPath hooks
+#
+# Both run on the WORKING TREE, not on the commits being pushed. No GUI,
+# selftest or --script run happens here: those drive the real shell and screen.
+
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib.sh"
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+# Nothing to check when the push only deletes refs.
+zero=0000000000000000000000000000000000000000
+pushes=0
+deletes=0
+while read -r _ local_sha _ _; do
+    if [ "$local_sha" = "$zero" ]; then deletes=$((deletes + 1)); else pushes=$((pushes + 1)); fi
+done
+if [ "$pushes" -eq 0 ] && [ "$deletes" -gt 0 ]; then exit 0; fi
+
+note() {
+    echo "pre-push: these checks build the working tree, not the commits being pushed;"
+    echo "          uncommitted edits (yours or another session's) can be what broke it."
+    if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null | head -n 1)" ]; then
+        echo "          the working tree has uncommitted changes right now."
+    fi
+}
+
+if ! msg=$(zig_version_guard "$(cat build.zig.zon 2>/dev/null)"); then
+    echo "pre-push: FAIL  $msg"
+    exit 1
+fi
+
+step() {
+    label=$1
+    shift
+    start=$SECONDS
+    echo "pre-push: $label ($*)"
+    if "$@"; then
+        echo "pre-push: ok    $label ($((SECONDS - start))s)"
+        return 0
+    fi
+    echo "pre-push: FAIL  $label ($((SECONDS - start))s)"
+    return 1
+}
+
+failed=0
+step "unit tests" zig build test || failed=1
+# The tests compile only part of the code; the executable compiles all of it.
+# A throwaway prefix keeps zig-out/bin/tt as it was.
+step "build" zig build --prefix .zig-cache/hook-out || failed=1
+
+if [ "$failed" -ne 0 ]; then
+    note
+    echo "pre-push: nothing pushed."
+    exit 1
+fi
+exit 0

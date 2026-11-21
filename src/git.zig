@@ -17,7 +17,7 @@ pub const Kind = enum(u8) {
 
     /// What a folder shows when its files differ: the one that matters most.
     fn rank(k: Kind) u8 {
-        return @intFromEnum(k);
+        return @backingInt(k);
     }
 };
 

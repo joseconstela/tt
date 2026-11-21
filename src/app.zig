@@ -27,6 +27,7 @@ const SettingsTab = @import("tabs/settings_tab.zig").SettingsTab;
 const WebTab = @import("tabs/web_tab.zig").WebTab;
 const History = @import("input/history.zig").History;
 const projects_mod = @import("projects.zig");
+const jump_mod = @import("jump.zig");
 const workspace_mod = @import("workspace.zig");
 const shell_integration = @import("term/shell_integration.zig");
 const EditCommand = @import("events.zig").EditCommand;
@@ -34,8 +35,6 @@ const sys = @import("sys.zig");
 const filetype = @import("filetype.zig");
 const config = @import("config.zig");
 const appearance = @import("appearance.zig");
-const camera_controller = @import("physical/camera_controller.zig");
-const voice_controller = @import("physical/voice_controller.zig");
 
 pub const LaunchOptions = struct {
     width: f32 = 1440,
@@ -143,9 +142,14 @@ pub const App = struct {
     /// Project the user last touched (where pinned files go when the
     /// directory does not decide).
     selected_project: ?u32 = null,
+    /// ⌥ + a project's letter, then digits: the keyboard way to rows and tabs.
+    jump: jump_mod.Jump = .{},
     /// Directory of the last tab that had one; what the files panel shows
     /// while a tab without a directory (Settings) is active.
     last_cwd: std.ArrayList(u8) = .empty,
+    /// The folder the files panel shows for each sidebar element (tab
+    /// group): where its shells are, never where an opened file lives.
+    files_roots: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     /// The path being dragged from the files panel (the ghost is the pane
     /// view's `drag`); empty when none.
     file_drag: std.ArrayList(u8) = .empty,
@@ -234,8 +238,6 @@ pub const App = struct {
     }
 
     pub fn destroy(self: *App) void {
-        camera_controller.get().shutdown();
-        voice_controller.get().shutdown();
         self.workspace.save(&self.tabs, &self.projects);
         self.workspace.deinit();
         self.tabs.deinit();
@@ -250,6 +252,8 @@ pub const App = struct {
         self.files.deinit();
         self.history.deinit();
         self.last_cwd.deinit(self.gpa);
+        self.forgetFilesRoots();
+        self.files_roots.deinit(self.gpa);
         self.file_drag.deinit(self.gpa);
         self.ui.deinit();
         self.dl.deinit();
@@ -320,14 +324,12 @@ pub const App = struct {
                 }
             }
         }
-        // After the tabs: the Settings page asks for the camera's preview in its tick.
-        if (camera_controller.get().tick(now)) self.invalidate();
-        if (voice_controller.get().tick(now)) self.invalidate();
         self.serveRequests();
         self.keepShowingSomething();
         // A menu or box about a tab that has since closed itself has nothing left to act on.
         if (self.overlay.aboutTab()) |uid| if (self.tabs.byUid(uid) == null) self.overlay.close();
         if (self.overlay.tick(now)) self.invalidate();
+        if (self.jump.tick(now)) self.invalidate();
         if (self.files.tick(now)) self.invalidate();
         if (self.palette.tick(now)) self.invalidate();
         // The theme follows the mode set for the display the window is on,
@@ -379,7 +381,7 @@ pub const App = struct {
         self.dl.rect(.{ .x = 0, .y = 0, .w = self.width, .h = self.height }, theme.bg);
 
         const cwd = self.currentCwd();
-        self.files.setRoot(cwd, self.now);
+        self.files.setRoot(self.filesRoot(), self.now);
 
         // A secondary click while a tab menu is open dismisses it first, so
         // the strip underneath can summon another one for that tab.
@@ -404,6 +406,12 @@ pub const App = struct {
         const dragged = self.draggedFile();
         var ctx: sidebar_mod.Context = .{ .projects = &self.projects, .tabs = &self.tabs, .dragging_file = dragged != null };
         if (self.projects.containing(cwd)) |p| ctx.current_project = p.id;
+        const hints_on = self.jump.hintsVisible(self.now);
+        ctx.hints = .{
+            .on = hints_on,
+            .project = if (self.jump.active()) self.jump.project else null,
+            .tabs_next = self.jump.stage == .group,
+        };
         // `inset_left` (where the traffic lights end) comes from the platform in
         // window points; the sidebar lays out in the zoomed logical space, so
         // bring it into that space too or the toggle drifts over the lights.
@@ -428,7 +436,8 @@ pub const App = struct {
 
         // The panes: each one's strip, its active tab, the dividers, and a
         // tab being dragged. Moves are applied to the tab manager inside.
-        const pv = self.panes.draw(ui, &self.tabs, bar, content, side.band_inset, self.files.visible, self.chrome.window_focused);
+        const tab_hints: ?tabbar_mod.TabHints = if (hints_on) .{ .next = self.jump.stage == .group } else null;
+        const pv = self.panes.draw(ui, &self.tabs, bar, content, side.band_inset, self.files.visible, self.chrome.window_focused, tab_hints);
         if (pv.menu) |m| self.openTabMenu(m);
         if (pv.new_tab) |pane| {
             _ = self.tabs.focusPane(pane);
@@ -439,6 +448,7 @@ pub const App = struct {
             self.perform(.new_web_tab);
         }
         if (pv.toggle_files) self.perform(.toggle_files);
+        if (self.jump.active() and self.tabs.group().count() == 0) self.drawJumpEmpty(content);
         if (pv.file_drop) |target| self.openDroppedAt(target);
         if (ui.edit_menu) |m| self.openEditMenu(m);
         self.serveLink(content);
@@ -539,6 +549,7 @@ pub const App = struct {
                 .resource => .resource,
             };
             self.overlay.openMenu(subject, m.id, m.x, m.y);
+            if (m.target != .resource) self.overlay.setMenuKey(self.projects.keyOf(m.id));
         }
         if (side.drop_file) |drop| self.pinDropped(drop);
         if (side.move_project) |m| {
@@ -672,6 +683,69 @@ pub const App = struct {
             break :blk self.tabs.openWith("terminal", .{ .cwd = p.root });
         } else self.tabs.open("terminal");
         _ = opened catch |err| std.log.err("could not open terminal tab: {s}", .{@errorName(err)});
+        self.invalidate();
+    }
+
+    /// A ⌥ chord is on a row with no tabs yet: what letting go will open.
+    fn drawJumpEmpty(self: *App, content: draw.Rect) void {
+        var buf: [160]u8 = undefined;
+        const gid = self.tabs.groupId();
+        const line = if (self.projects.findResource(gid)) |f| switch (f.resource.kind) {
+            .file => std.fmt.bufPrint(&buf, "Let go of ⌥ to open {s}", .{f.resource.name}),
+            .shells => std.fmt.bufPrint(&buf, "Let go of ⌥ to open a shell in {s}", .{f.resource.name}),
+        } else if (self.projects.find(gid)) |p|
+            std.fmt.bufPrint(&buf, "Let go of ⌥ to open a shell in {s}", .{p.name})
+        else
+            std.fmt.bufPrint(&buf, "Let go of ⌥ to open a shell", .{});
+        const text = line catch return;
+        const w = self.ui.text.measure(theme.font_hint, text);
+        _ = self.dl.textCentered(theme.font_hint, content.x + @max(16, (content.w - w) / 2), content.centerY(), text, theme.text_3);
+    }
+
+    /// A ⌥ chord's step onto a row: its tabs go on show as they were left
+    /// (a row with none stays empty until the chord ends there).
+    fn jumpToGroup(self: *App, gid: u32) void {
+        self.tabs.show(gid) catch |err| {
+            std.log.err("could not show the group's tabs: {s}", .{@errorName(err)});
+            return;
+        };
+        if (self.projects.find(gid)) |p| {
+            self.selected_project = p.id;
+        } else if (self.projects.findResource(gid)) |f| {
+            if (f.project) |p| self.selected_project = p.id;
+        }
+    }
+
+    /// A ⌥ chord's last digit: the n-th tab of the row on show, counting
+    /// through its panes in reading order (the numbers the strips show).
+    fn jumpToTab(self: *App, n: usize) void {
+        const list = self.tabs.group().layout.panes();
+        var i = n;
+        for (list.slice()) |p| {
+            if (i < p.tabs.items.len) {
+                _ = self.tabs.focus(p.tabs.items[i].uid);
+                return;
+            }
+            i -= p.tabs.items.len;
+        }
+    }
+
+    /// ⌥ was let go: the chord ends on row `gid`. A row with no tabs gets
+    /// its first, as a click on it would open (a shell, the pinned file),
+    /// and a resource inside a folded project unfolds so it can be seen.
+    fn endJump(self: *App, gid: u32) void {
+        if (self.projects.findResource(gid)) |f| {
+            if (f.project) |p| {
+                if (!p.open) {
+                    p.open = true;
+                    self.projects.save();
+                }
+            } else self.sidebar.default_open = true;
+        }
+        if (self.tabs.groupId() == gid and self.tabs.group().count() == 0) {
+            if (self.projects.findResource(gid) != null) self.openResource(gid) else self.openGroup(gid);
+        }
+        self.keepShowingSomething();
         self.invalidate();
     }
 
@@ -1112,6 +1186,15 @@ pub const App = struct {
             },
             .new_shells => |pid| self.newShellGroup(pid),
             .remove_project => |pid| self.removeProject(pid),
+            .set_shortcut => |t| self.overlay.openShortcut(t.subject, t.id, self.projects.keyOf(t.id)),
+            .shortcut_set => |r| {
+                // One letter, or the box stays open saying so.
+                const key = std.mem.trim(u8, r.key, " \t");
+                if (key.len == 1 and self.projects.setKey(r.id, key[0])) {
+                    self.projects.save();
+                    self.overlay.close();
+                } else self.overlay.setNameError("One letter, A to Z.");
+            },
             .rename_resource => |rid| if (self.projects.findResource(rid)) |f| {
                 self.overlay.openRename(.resource, rid, f.resource.name);
             },
@@ -1251,6 +1334,7 @@ pub const App = struct {
     fn renamePath(self: *App, old: []const u8, new: []const u8) !void {
         try sys.renamePath(self.gpa, old, new);
         self.relocateTabs(old, new);
+        self.forgetFilesRoots();
         if (self.projects.relocate(old, new)) self.projects.save();
     }
 
@@ -1435,6 +1519,9 @@ pub const App = struct {
     /// to the default group, and an empty default group starts a shell.
     fn keepShowingSomething(self: *App) void {
         if (self.tabs.items().len > 0) return;
+        // A ⌥ chord passing through a row with no tabs yet: it gets its
+        // first one when the chord ends there (`endJump`), not before.
+        if (self.jump.active()) return;
         const default_group = tab_mod.TabManager.default_group;
         if (self.tabs.groupId() != default_group) self.tabs.show(default_group) catch {};
         if (self.tabs.items().len == 0) _ = self.tabs.open("terminal") catch {};
@@ -1452,6 +1539,50 @@ pub const App = struct {
         }
         if (self.last_cwd.items.len == 0) return self.env.launch_cwd;
         return self.last_cwd.items;
+    }
+
+    /// The folder the files panel shows: the one the sidebar element on
+    /// show works in. A shell moves it (`cd`); a document tab does not, so
+    /// opening files from the tree leaves the tree where it is. An element
+    /// no shell has spoken for yet starts at its own folder: a resource's,
+    /// a project's root, else the current directory.
+    pub fn filesRoot(self: *App) []const u8 {
+        const cwd = self.currentCwd();
+        const gid = self.tabs.groupId();
+        var dir: []const u8 = "";
+        if (self.tabs.current()) |t| {
+            if (t.vtable.path(t.ptr).len == 0) dir = t.vtable.cwd(t.ptr);
+        }
+        const kept = self.files_roots.getPtr(gid);
+        if (dir.len == 0) {
+            if (kept) |k| return k.*;
+            dir = if (self.projects.findResource(gid)) |f|
+                f.resource.dir()
+            else if (self.projects.find(gid)) |p|
+                p.root
+            else
+                cwd;
+        }
+        if (kept) |k| {
+            if (std.mem.eql(u8, k.*, dir)) return k.*;
+            const copy = self.gpa.dupe(u8, dir) catch return dir;
+            self.gpa.free(k.*);
+            k.* = copy;
+            return copy;
+        }
+        const copy = self.gpa.dupe(u8, dir) catch return dir;
+        self.files_roots.put(self.gpa, gid, copy) catch {
+            self.gpa.free(copy);
+            return dir;
+        };
+        return copy;
+    }
+
+    /// Paths moved on disk: every element works its folder out afresh.
+    fn forgetFilesRoots(self: *App) void {
+        var it = self.files_roots.valueIterator();
+        while (it.next()) |v| self.gpa.free(v.*);
+        self.files_roots.clearRetainingCapacity();
     }
 
     // ── projects ────────────────────────────────────────────────────────
@@ -1549,8 +1680,6 @@ pub const App = struct {
 
     // ── input ───────────────────────────────────────────────────────────
     pub fn onMouseMove(self: *App, x: f32, y: f32) void {
-        // Using the Mac counts as looking at it (the away blur).
-        camera_controller.get().noteActivity(self.now);
         self.ui.mx = x;
         self.ui.my = y;
         self.ui.mouse_inside = true;
@@ -1560,8 +1689,30 @@ pub const App = struct {
     /// ⌘ / ⌃ went down or up: a link under the pointer shows it can be followed.
     pub fn onFlags(self: *App, mods: ui_mod.Mods) void {
         const was = self.ui.linkModifier();
+        const hints = self.jump.hintsVisible(self.now);
         self.ui.mods = mods;
-        if (was != self.ui.linkModifier()) self.invalidate();
+        if (self.jump.flags(mods.alt, mods.cmd or mods.ctrl or mods.shift, self.now)) |gid| self.endJump(gid);
+        if (was != self.ui.linkModifier() or hints != self.jump.hintsVisible(self.now)) self.invalidate();
+    }
+
+    /// A key pressed with ⌥ (no ⌘ or ⌃): `c` is the key without its
+    /// modifiers — a letter or a digit, else 0. True when it was part of a
+    /// jump (`jump.zig`) and must not be typed.
+    pub fn onAltKey(self: *App, c: u8) bool {
+        // Boxes, menus and the palette take their keys as typed; so does
+        // text being composed.
+        if (self.palette.open or self.overlay.isOpen() or self.hasMarkedText()) return false;
+        const hints = self.jump.hintsVisible(self.now);
+        const step = self.jump.key(std.ascii.toLower(c), &self.projects);
+        if (hints != self.jump.hintsVisible(self.now)) self.invalidate();
+        switch (step) {
+            .pass => return false,
+            .none => {},
+            .show_group => |gid| self.jumpToGroup(gid),
+            .tab => |n| self.jumpToTab(n),
+        }
+        self.invalidate();
+        return true;
     }
 
     pub fn onMouseLeave(self: *App) void {
@@ -1578,6 +1729,8 @@ pub const App = struct {
             return;
         }
         self.onMouseMove(x, y);
+        // An ⌥-click is not a jump: no key hints for this press of ⌥.
+        if (mods.alt) self.jump.alt_used = true;
         self.ui.down = true;
         self.ui.pressed = true;
         self.ui.click_count = clicks;
@@ -1610,7 +1763,6 @@ pub const App = struct {
     // menu / boxes while one is open, else to the files panel's commit
     // message while it has the focus, else to the active tab.
     pub fn onText(self: *App, utf8: []const u8) void {
-        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             self.palette.onText(utf8);
         } else if (self.overlay.isOpen()) {
@@ -1622,7 +1774,6 @@ pub const App = struct {
     }
 
     pub fn onMarkedText(self: *App, utf8: []const u8) void {
-        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             self.palette.onMarkedText(utf8);
         } else if (self.overlay.isOpen()) {
@@ -1634,7 +1785,6 @@ pub const App = struct {
     }
 
     pub fn onEdit(self: *App, cmd: EditCommand) void {
-        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             if (self.palette.onEdit(cmd)) |pick| self.executePick(pick);
         } else if (self.overlay.isOpen()) {
@@ -1653,7 +1803,6 @@ pub const App = struct {
     }
 
     pub fn onCtrl(self: *App, key: u8) void {
-        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             if (self.palette.onCtrl(key)) |pick| self.executePick(pick);
             self.invalidate();
@@ -1678,7 +1827,6 @@ pub const App = struct {
     }
 
     pub fn onPaste(self: *App, utf8: []const u8) void {
-        camera_controller.get().noteActivity(self.now);
         if (self.palette.open) {
             self.palette.onPaste(utf8);
         } else if (self.overlay.isOpen()) {

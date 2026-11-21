@@ -280,7 +280,7 @@ const PromptBox = struct {
         const scale = dl.scale;
         const doc = &self.prompt;
         const e = &doc.editor;
-        const n: usize = @intFromEnum(self.feature);
+        const n: usize = @backingInt(self.feature);
         self.text = text;
         self.box_h = box.h;
 
@@ -599,7 +599,7 @@ pub const Page = struct {
             const cfg = config.get();
             const slot: *bool = if (feature == .explain) &cfg.features.explain_notebooks else &cfg.features.fix_notebooks;
             const detail: []const u8 = if (feature == .explain) "Under a failed cell, beside Run again." else "Under a failed cell; the agent starts in a shell of the row.";
-            if (switchRow(ui, Ui.id("settings.features.notebooks", @intFromEnum(feature)), card, ry, "Also in notebooks", detail, slot.*)) {
+            if (switchRow(ui, Ui.id("settings.features.notebooks", @backingInt(feature)), card, ry, "Also in notebooks", detail, slot.*)) {
                 slot.* = !slot.*;
                 cfg.touch();
             }
@@ -654,7 +654,7 @@ pub const Page = struct {
     fn drawApiPicker(ui: *Ui, feature: Feature, card: Rect, y: f32, slot: *?[]u8) f32 {
         const cfg = config.get();
         const agents = cfg.agents.items;
-        const n: usize = @as(usize, @intFromEnum(feature)) * 64;
+        const n: usize = @as(usize, @backingInt(feature)) * 64;
         // `current` points into the config: a click below replaces that
         // string, so it is re-read after one (and a stale choice is gone).
         var current: ?[]const u8 = slot.*;
@@ -695,7 +695,7 @@ pub const Page = struct {
         const cfg = config.get();
         const f = &cfg.features;
         const scan = coding_agents.get();
-        const n: usize = @as(usize, @intFromEnum(Feature.fix)) * 64;
+        const n: usize = @as(usize, @backingInt(Feature.fix)) * 64;
         var ry = y;
 
         var auto_buf: [128]u8 = undefined;

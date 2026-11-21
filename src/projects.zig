@@ -34,6 +34,10 @@ pub const Project = struct {
     root: []u8,
     /// The user's icon (a name for `ui/icon_spec.zig`), null for none.
     icon: ?[]u8 = null,
+    /// The letter that jumps here with ⌥ ('A'–'Z', 0 while none is given
+    /// yet). Handed out once and then kept, whatever the order or the name
+    /// becomes, so the user can learn it (see `assignKeys`).
+    key: u8 = 0,
     open: bool = true,
     resources: std.ArrayList(Resource) = .empty,
 
@@ -55,9 +59,12 @@ pub const Projects = struct {
     /// project's own tabs.
     next_id: u32 = 1,
     file_path: ?[]u8 = null,
-    /// The default project's icon and resources.
+    /// The default project's icon, jump letter and resources.
     default_icon: ?[]u8 = null,
+    default_key: u8 = 0,
     default_resources: std.ArrayList(Resource) = .empty,
+    /// The last `parse` had to hand out letters (worth saving).
+    keys_assigned: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Projects {
         return .{ .gpa = gpa };
@@ -98,9 +105,16 @@ pub const Projects = struct {
     pub fn load(self: *Projects) void {
         self.file_path = std.fmt.allocPrint(self.gpa, "{s}/.tt_projects", .{sys.home()}) catch null;
         const path = self.file_path orelse return;
-        const data = sys.readFileTail(self.gpa, path, 1 << 20) catch return;
+        const data = sys.readFileTail(self.gpa, path, 1 << 20) catch {
+            // No file yet: the default project still gets its letter.
+            _ = self.assignKeys();
+            return;
+        };
         defer self.gpa.free(data);
         self.parse(data);
+        // Letters handed out for the first time are written down at once,
+        // so they never depend on the order things are loaded in again.
+        if (self.keys_assigned) self.save();
     }
 
     pub fn save(self: *Projects) void {
@@ -118,7 +132,10 @@ pub const Projects = struct {
     ///   shells  <tab> name <tab> directory
     ///   icon    <tab> name          the icon of the entry above (of the
     ///                               default project at the very top)
+    ///   key     <tab> letter        the ⌥ letter of the project above (of
+    ///                               the default project at the very top)
     pub fn parse(self: *Projects, data: []const u8) void {
+        defer self.keys_assigned = self.assignKeys();
         // null: the default project.
         var current: ?usize = null;
         // Which entry an `icon` line belongs to: the last resource listed
@@ -154,6 +171,9 @@ pub const Projects = struct {
                     &self.resourcesOf(p).items[ri].icon
                 else if (p) |proj| &proj.icon else &self.default_icon;
                 self.setIcon(slot, name) catch continue;
+            } else if (std.mem.eql(u8, tag, "key")) {
+                const letter = keyLetter(f.rest()) orelse continue;
+                if (self.projectAt(current)) |proj| proj.key = letter else self.default_key = letter;
             }
         }
     }
@@ -164,6 +184,7 @@ pub const Projects = struct {
     }
 
     pub fn serialize(self: *const Projects, out: *std.ArrayList(u8)) !void {
+        try self.writeKey(out, self.default_key);
         try self.writeIcon(out, self.default_icon);
         try self.writeResources(out, self.default_resources.items);
         for (self.items.items) |p| {
@@ -173,6 +194,7 @@ pub const Projects = struct {
             try out.append(self.gpa, '\t');
             try out.appendSlice(self.gpa, p.root);
             try out.append(self.gpa, '\n');
+            try self.writeKey(out, p.key);
             try self.writeIcon(out, p.icon);
             try self.writeResources(out, p.resources.items);
         }
@@ -189,6 +211,13 @@ pub const Projects = struct {
         }
     }
 
+    fn writeKey(self: *const Projects, out: *std.ArrayList(u8), key: u8) !void {
+        if (key == 0) return;
+        try out.appendSlice(self.gpa, "key\t");
+        try out.append(self.gpa, key);
+        try out.append(self.gpa, '\n');
+    }
+
     fn writeIcon(self: *const Projects, out: *std.ArrayList(u8), icon: ?[]const u8) !void {
         const name = icon orelse return;
         try out.appendSlice(self.gpa, "icon\t");
@@ -200,7 +229,9 @@ pub const Projects = struct {
     /// Adds a folder as a project (named after it). Returns the existing
     /// project if the folder is already one.
     pub fn add(self: *Projects, root: []const u8) !*Project {
-        return self.addNamed(sys.basename(root), root);
+        const p = try self.addNamed(sys.basename(root), root);
+        _ = self.assignKeys();
+        return p;
     }
 
     fn addNamed(self: *Projects, name: []const u8, root_in: []const u8) !*Project {
@@ -275,6 +306,120 @@ pub const Projects = struct {
             if (best == null or p.root.len > best.?.root.len) best = p;
         }
         return best;
+    }
+
+    // ── jump letters ────────────────────────────────────────────────────
+    /// Gives every project that has none (or shares one with a project
+    /// above it) a letter of its own; the default project comes last, so
+    /// real projects get first pick of their names' letters. Letters that
+    /// are set are never touched: adding, removing, reordering or renaming
+    /// projects leaves the others' letters as they were. True when any was
+    /// handed out.
+    pub fn assignKeys(self: *Projects) bool {
+        var taken: [26]bool = @splat(false);
+        var changed = false;
+        for (self.items.items) |*p| {
+            if (!claim(&taken, p.key)) {
+                if (p.key != 0) changed = true;
+                p.key = 0;
+            }
+        }
+        if (!claim(&taken, self.default_key)) {
+            if (self.default_key != 0) changed = true;
+            self.default_key = 0;
+        }
+        for (self.items.items) |*p| {
+            if (p.key != 0) continue;
+            p.key = pickKey(&taken, &.{ p.name, sys.basename(p.root) });
+            changed = true;
+        }
+        if (self.default_key == 0) {
+            self.default_key = pickKey(&taken, &.{default_name});
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// The name the sidebar shows for the default project.
+    pub const default_name = "Default project";
+
+    /// Marks `key` as used; false when it is none or already used.
+    fn claim(taken: *[26]bool, key: u8) bool {
+        if (key < 'A' or key > 'Z') return false;
+        if (taken[key - 'A']) return false;
+        taken[key - 'A'] = true;
+        return true;
+    }
+
+    /// The first free letter among: the initials of the words of each of
+    /// `names`, then every letter of them, then A–Z. 0 when all 26 are taken.
+    fn pickKey(taken: *[26]bool, names: []const []const u8) u8 {
+        for (names) |name| {
+            var at_start = true;
+            for (name) |c| {
+                const letter = std.ascii.isAlphabetic(c);
+                if (letter and at_start and claim(taken, std.ascii.toUpper(c))) return std.ascii.toUpper(c);
+                at_start = !std.ascii.isAlphanumeric(c);
+            }
+        }
+        for (names) |name| {
+            for (name) |c| {
+                if (std.ascii.isAlphabetic(c) and claim(taken, std.ascii.toUpper(c))) return std.ascii.toUpper(c);
+            }
+        }
+        var c: u8 = 'A';
+        while (c <= 'Z') : (c += 1) {
+            if (claim(taken, c)) return c;
+        }
+        return 0;
+    }
+
+    /// The group whose letter is `key` (a project's id, or 0 for the
+    /// default project), case-insensitive.
+    pub fn byKey(self: *const Projects, key: u8) ?u32 {
+        const k = std.ascii.toUpper(key);
+        if (k < 'A' or k > 'Z') return null;
+        if (self.default_key == k) return 0;
+        for (self.items.items) |p| {
+            if (p.key == k) return p.id;
+        }
+        return null;
+    }
+
+    /// The letter of a group (0 = the default project); 0 when none.
+    pub fn keyOf(self: *const Projects, gid: u32) u8 {
+        if (gid == 0) return self.default_key;
+        const i = self.indexOf(gid) orelse return 0;
+        return self.items.items[i].key;
+    }
+
+    /// The user picks a group's letter. A letter another project had goes
+    /// to it the other way round (they swap), so every project keeps one.
+    /// False when `letter` is not A–Z.
+    pub fn setKey(self: *Projects, gid: u32, letter: u8) bool {
+        const k = std.ascii.toUpper(letter);
+        if (k < 'A' or k > 'Z') return false;
+        const slot = self.keySlot(gid) orelse return false;
+        const old = slot.*;
+        if (self.byKey(k)) |holder| {
+            if (self.keySlot(holder)) |other| other.* = old;
+        }
+        slot.* = k;
+        _ = self.assignKeys();
+        return true;
+    }
+
+    fn keySlot(self: *Projects, gid: u32) ?*u8 {
+        if (gid == 0) return &self.default_key;
+        const p = self.find(gid) orelse return null;
+        return &p.key;
+    }
+
+    /// A `key` line's letter, if it is one.
+    fn keyLetter(text: []const u8) ?u8 {
+        const t = std.mem.trim(u8, text, " \t");
+        if (t.len != 1 or !std.ascii.isAlphabetic(t[0])) return null;
+        return std.ascii.toUpper(t[0]);
     }
 
     // ── resources ───────────────────────────────────────────────────────
@@ -540,12 +685,12 @@ test "projects: round trip through the file format, icons included" {
     defer out.deinit(std.testing.allocator);
     try ps.serialize(&out);
     try std.testing.expectEqualStrings(
-        "icon\t#E5484D\n" ++
+        "key\tP\nicon\t#E5484D\n" ++
             "shells\tnotes\t/Users/x/notes\nicon\tnotebook\n" ++
-            "project\t0\tdemo\t/tmp/demo\nicon\tcloud\n" ++
+            "project\t0\tdemo\t/tmp/demo\nkey\tD\nicon\tcloud\n" ++
             "file\tREADME.md\t/tmp/demo/README.md\nicon\tdocument\n" ++
             "shells\tShells\t/tmp/demo\n" ++
-            "project\t1\t/\t/\n",
+            "project\t1\t/\t/\nkey\tA\n",
         out.items,
     );
 
@@ -565,6 +710,10 @@ test "projects: round trip through the file format, icons included" {
     try std.testing.expect(bp.resources.items[1].icon == null);
     try std.testing.expect(back.items.items[1].icon == null);
     try std.testing.expectEqualStrings("/", back.items.items[1].root);
+    try std.testing.expectEqual(@as(u8, 'P'), back.default_key);
+    try std.testing.expectEqual(@as(u8, 'D'), back.items.items[0].key);
+    try std.testing.expectEqual(@as(u8, 'A'), back.items.items[1].key);
+    try std.testing.expect(!back.keys_assigned);
 
     // Clearing frees and writes nothing.
     try back.setIcon(&back.items.items[0].icon, null);
@@ -663,4 +812,51 @@ test "projects: move resources within and between projects" {
     // Move it back out to the default project.
     try std.testing.expect(ps.moveResource(d1, 0, null));
     try std.testing.expect(ps.findResource(d1).?.project == null);
+}
+
+test "projects: jump letters are handed out once and kept" {
+    var ps = Projects.init(std.testing.allocator);
+    defer ps.deinit();
+    const cognito = (try ps.add("/w/cognito")).id;
+    // First letter of the name; the default project picks after projects.
+    try std.testing.expectEqual(@as(u8, 'C'), ps.keyOf(cognito));
+    try std.testing.expectEqual(@as(u8, 'D'), ps.default_key);
+    // A clash takes the next word's initial, then any letter of the name.
+    const cloud = (try ps.add("/w/cloud-api")).id;
+    try std.testing.expectEqual(@as(u8, 'A'), ps.keyOf(cloud));
+    const cms = (try ps.add("/w/cms")).id;
+    try std.testing.expectEqual(@as(u8, 'M'), ps.keyOf(cms));
+    // A later "Docs" cannot take D from the default project.
+    const docs = (try ps.add("/w/docs")).id;
+    try std.testing.expectEqual(@as(u8, 'O'), ps.keyOf(docs));
+    try std.testing.expectEqual(cognito, ps.byKey('c').?);
+    try std.testing.expectEqual(@as(u32, 0), ps.byKey('D').?);
+    try std.testing.expect(ps.byKey('z') == null);
+    try std.testing.expect(ps.byKey('1') == null);
+
+    // Reordering, renaming or removing others changes no one's letter.
+    try std.testing.expect(ps.moveProject(docs, cognito));
+    try ps.renameProject(ps.find(cloud).?, "Zebra");
+    ps.remove(cms);
+    try std.testing.expect(!ps.assignKeys());
+    try std.testing.expectEqual(@as(u8, 'C'), ps.keyOf(cognito));
+    try std.testing.expectEqual(@as(u8, 'A'), ps.keyOf(cloud));
+    try std.testing.expectEqual(@as(u8, 'O'), ps.keyOf(docs));
+
+    // Picking a letter someone has swaps the two.
+    try std.testing.expect(ps.setKey(docs, 'd'));
+    try std.testing.expectEqual(@as(u8, 'D'), ps.keyOf(docs));
+    try std.testing.expectEqual(@as(u8, 'O'), ps.default_key);
+    try std.testing.expect(!ps.setKey(docs, '4'));
+
+    // A file without letters (older tt) gets them on load, flagged for
+    // saving; a letter written twice by hand stays with the first project.
+    var back = Projects.init(std.testing.allocator);
+    defer back.deinit();
+    back.parse("project\t1\tbeta\t/b\nkey\tq\nproject\t1\talpha\t/a\nkey\tQ\nproject\t1\tbravo\t/c\n");
+    try std.testing.expect(back.keys_assigned);
+    try std.testing.expectEqual(@as(u8, 'Q'), back.items.items[0].key);
+    try std.testing.expectEqual(@as(u8, 'A'), back.items.items[1].key);
+    try std.testing.expectEqual(@as(u8, 'B'), back.items.items[2].key);
+    try std.testing.expectEqual(@as(u8, 'D'), back.default_key);
 }

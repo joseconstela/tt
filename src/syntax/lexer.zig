@@ -189,8 +189,8 @@ test "every language terminates and covers random lines exactly" {
     const rnd = prng.random();
     var buf: [200]u8 = undefined;
     var out: Spans = .{};
-    inline for (std.meta.fields(Language)) |f| {
-        const lang: Language = @enumFromInt(f.value);
+    inline for (@typeInfo(Language).@"enum".field_values) |f_value| {
+        const lang: Language = @fromBackingInt(@intCast(f_value));
         var state: State = 0;
         var round: usize = 0;
         while (round < 300) : (round += 1) {
@@ -223,8 +223,8 @@ test "state-only pass matches the span pass" {
     const rnd = prng.random();
     var buf: [120]u8 = undefined;
     var out: Spans = .{};
-    inline for (std.meta.fields(Language)) |f| {
-        const lang: Language = @enumFromInt(f.value);
+    inline for (@typeInfo(Language).@"enum".field_values) |f_value| {
+        const lang: Language = @fromBackingInt(@intCast(f_value));
         var a: State = 0;
         var b: State = 0;
         var round: usize = 0;

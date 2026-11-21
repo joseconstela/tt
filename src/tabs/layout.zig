@@ -525,7 +525,7 @@ pub const Layout = struct {
         switch (n.*) {
             .leaf => |id| h.update(std.mem.asBytes(&id)),
             .split => |*s| {
-                h.update(&[_]u8{ '(', @intFromEnum(s.dir) });
+                h.update(&[_]u8{ '(', @backingInt(s.dir) });
                 for (s.children.items, s.weights.items) |c, w| {
                     h.update(std.mem.asBytes(&w));
                     hashNode(c, h);
@@ -587,7 +587,7 @@ pub const Layout = struct {
 
 // ── tests ───────────────────────────────────────────────────────────────
 fn ids(list: PaneList) [max_panes]u32 {
-    var out: [max_panes]u32 = [_]u32{0} ** max_panes;
+    var out: [max_panes]u32 = @splat(0);
     for (list.slice(), 0..) |p, i| out[i] = p.id;
     return out;
 }

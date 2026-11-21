@@ -467,7 +467,7 @@ pub const Panel = struct {
             .staged => "Staged Changes",
             .changes => "Changes",
         };
-        const sid: usize = @intFromEnum(section);
+        const sid: usize = @backingInt(section);
 
         // The header: chevron, title, the count, and on hover what applies to the whole list.
         const row: Rect = .{ .x = panel.x + 6, .y = y.*, .w = panel.w - 12, .h = row_h };
@@ -521,7 +521,7 @@ pub const Panel = struct {
         const row: Rect = .{ .x = panel.x + 6, .y = y.*, .w = panel.w - 12, .h = row_h };
         y.* += row_h;
         if (row.bottom() <= clip.y or row.y >= clip.bottom()) return;
-        const key = i * 4 + @intFromEnum(section);
+        const key = i * 4 + @backingInt(section);
         const hovered = ui.mouseIn(row);
         var right = row.right() - 8;
 

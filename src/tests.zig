@@ -8,6 +8,7 @@ test {
     _ = @import("input/history.zig");
     _ = @import("input/complete.zig");
     _ = @import("projects.zig");
+    _ = @import("jump.zig");
     _ = @import("filetype.zig");
     _ = @import("syntax/lexer.zig");
     _ = @import("input/document.zig");
@@ -24,9 +25,6 @@ test {
     _ = @import("file_index.zig");
     _ = @import("ui/icon_spec.zig");
     _ = @import("config.zig");
-    _ = @import("physical/posture.zig");
-    _ = @import("physical/trigger.zig");
-    _ = @import("platform/speech.zig");
     _ = @import("objc.zig");
     _ = @import("tabs/web_tab.zig");
     _ = @import("tabs/web_bridge.zig");

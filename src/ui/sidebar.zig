@@ -48,12 +48,25 @@ pub const Context = struct {
     /// A file from the files panel is being dragged: the rows take it
     /// (it is pinned to the project it lands on, see `Result.drop_file`).
     dragging_file: bool = false,
+    /// ⌥ is held: the rows show their jump keys (`jump.zig`).
+    hints: Hints = .{},
 
     /// The Settings tab, when it is the one in front.
     fn settings(self: Context) ?*settings_mod.SettingsTab {
         const t = self.tabs.current() orelse return null;
         return settings_mod.SettingsTab.fromTab(t);
     }
+};
+
+/// What the rows show while ⌥ is held.
+pub const Hints = struct {
+    on: bool = false,
+    /// The project a chord is on (its group id; 0: the default project).
+    /// It shows open while the chord lasts, its resources' digits being
+    /// the keys that come next.
+    project: ?u32 = null,
+    /// The chord has picked its row: digits go to that row's tabs now.
+    tabs_next: bool = false,
 };
 
 pub const MenuTarget = enum { project, default_project, resource };
@@ -282,16 +295,16 @@ pub const Sidebar = struct {
         // The default project and its resources.
         {
             const hy = cy;
-            cy = self.groupRow(ui, cy, w, ctx, res, .{ .gid = default_group, .name = "Default project", .icon = ctx.projects.default_icon, .open = &self.default_open, .target = .default_project, .id = 0 });
+            cy = self.groupRow(ui, cy, w, ctx, res, .{ .gid = default_group, .name = projects_mod.Projects.default_name, .icon = ctx.projects.default_icon, .open = &self.default_open, .target = .default_project, .id = 0, .key = ctx.projects.default_key });
             if (drag_kind == .resource and pointerInBand(ui, hy, theme.side_row_h)) {
                 const first: ?u32 = if (ctx.projects.default_resources.items.len > 0) ctx.projects.default_resources.items[0].id else null;
                 rd.onto(default_group, first, hy + theme.side_row_h);
             }
         }
-        if (self.default_open) {
-            for (ctx.projects.default_resources.items) |*r| {
+        if (self.default_open or ctx.hints.project == default_group) {
+            for (ctx.projects.default_resources.items, 0..) |*r, i| {
                 if (drag_kind == .resource) rd.gap(default_group, r.id, cy);
-                cy = self.resourceRow(ui, cy, w, r, default_group, ctx, res);
+                cy = self.resourceRow(ui, cy, w, r, default_group, i, ctx, res);
             }
             if (drag_kind == .resource) rd.gap(default_group, null, cy);
         }
@@ -303,15 +316,15 @@ pub const Sidebar = struct {
         for (ctx.projects.items.items) |*p| {
             const hy = cy;
             if (drag_kind == .project) pd.gap(p.id, hy);
-            cy = self.groupRow(ui, cy, w, ctx, res, .{ .gid = p.id, .name = p.name, .icon = p.icon, .open = &p.open, .current = ctx.current_project == p.id, .target = .project, .id = p.id });
+            cy = self.groupRow(ui, cy, w, ctx, res, .{ .gid = p.id, .name = p.name, .icon = p.icon, .open = &p.open, .current = ctx.current_project == p.id, .target = .project, .id = p.id, .key = p.key });
             if (drag_kind == .resource and pointerInBand(ui, hy, theme.side_row_h)) {
                 const first: ?u32 = if (p.resources.items.len > 0) p.resources.items[0].id else null;
                 rd.onto(p.id, first, hy + theme.side_row_h);
             }
-            if (p.open) {
-                for (p.resources.items) |*r| {
+            if (p.open or ctx.hints.project == p.id) {
+                for (p.resources.items, 0..) |*r, i| {
                     if (drag_kind == .resource) rd.gap(p.id, r.id, cy);
-                    cy = self.resourceRow(ui, cy, w, r, p.id, ctx, res);
+                    cy = self.resourceRow(ui, cy, w, r, p.id, i, ctx, res);
                 }
                 if (drag_kind == .resource) rd.gap(p.id, null, cy);
             }
@@ -375,6 +388,8 @@ pub const Sidebar = struct {
         current: bool = false,
         target: MenuTarget,
         id: u32,
+        /// Its ⌥ jump letter (0: none).
+        key: u8 = 0,
     };
 
     /// A project row: fold chevron (its own target), icon, name and how
@@ -392,6 +407,20 @@ pub const Sidebar = struct {
             shell_st = hoverButton(ui, Ui.id("sidebar.group.shell", spec.gid), right, r.centerY(), .terminal, 15);
             right -= 26;
         }
+        if (ctx.hints.on and spec.key != 0) {
+            // The letter: what comes next until a chord has picked a project,
+            // after that a way to start over. On the picked one, "0" stays on
+            // its own tabs.
+            const letter = [1]u8{spec.key};
+            right -= ui.keycapWidth(&letter);
+            _ = ui.keycap(right, r.centerY(), &letter, if (ctx.hints.project == null) .next else .normal);
+            right -= 5;
+            if (ctx.hints.project == spec.gid and !ctx.hints.tabs_next) {
+                right -= ui.keycapWidth("0");
+                _ = ui.keycap(right, r.centerY(), "0", .next);
+                right -= 5;
+            }
+        }
         const chev: Rect = .{ .x = r.x, .y = r.y, .w = 24, .h = r.h };
         const cs = ui.button(Ui.id("sidebar.group.fold", spec.gid), chev);
         const st = ui.button(Ui.id("sidebar.group", spec.gid), r);
@@ -404,7 +433,8 @@ pub const Sidebar = struct {
         if (src) dl.rrect(r, theme.row_radius, theme.accent.alpha(0.12));
         if (dropTarget(ui, ctx, r)) res.drop_file = .{ .gid = spec.gid };
         if (spec.current) dl.rrect(.{ .x = r.x + 2, .y = r.centerY() - 8, .w = 3, .h = 16 }, 1.5, theme.accent);
-        _ = dl.textCentered(theme.font_section, r.x + 10, r.centerY(), if (spec.open.*) "▾" else "▸", if (cs.hover) theme.text else theme.text_3);
+        const unfolded = spec.open.* or ctx.hints.project == spec.gid;
+        _ = dl.textCentered(theme.font_section, r.x + 10, r.centerY(), if (unfolded) "▾" else "▸", if (cs.hover) theme.text else theme.text_3);
         const color = if (shown or spec.current or hovered) theme.text else theme.text_2;
         const lx = drawRowIcon(dl, spec.icon, r.x + 28, r.centerY(), color);
         if (!hovered) right = tabsBadge(ui, ctx, spec.gid, 1, lx, right, r.centerY());
@@ -442,7 +472,8 @@ pub const Sidebar = struct {
     /// A resource under its project: a group of shells or a file, with its
     /// own set of tabs. Selected while those are in the strip; a click
     /// shows them, a right-click asks for its menu (rename, icon, remove).
-    fn resourceRow(self: *Sidebar, ui: *Ui, y: f32, w: f32, r: *Resource, owner: u32, ctx: Context, res: *Result) f32 {
+    /// `index` is its place under the project: its ⌥ digit is `index + 1`.
+    fn resourceRow(self: *Sidebar, ui: *Ui, y: f32, w: f32, r: *Resource, owner: u32, index: usize, ctx: Context, res: *Result) f32 {
         const dl = ui.dl;
         const row: Rect = .{ .x = theme.side_inset, .y = y, .w = w - 2 * theme.side_inset, .h = theme.side_res_h };
         // No buttons: a new tab comes from the strip (or ⌘T) while the
@@ -464,8 +495,18 @@ pub const Sidebar = struct {
             icon_spec.drawSpec(dl, spec, ix, row.centerY(), 14, icon_color);
         } else dl.icon(if (r.kind == .file) .file else .terminal, ix, row.centerY() - 7, 14, icon_color);
         const lx = ix + 14 + 8;
+        var right = row.right() - 6;
+        // Its ⌥ digit: the next key once a chord is on its project; before a
+        // letter, what would follow one.
+        const h = ctx.hints;
+        if (h.on and index < 9 and (h.project == null or h.project == owner)) {
+            const digit = [1]u8{'1' + @as(u8, @intCast(index))};
+            right -= ui.keycapWidth(&digit);
+            _ = ui.keycap(right, row.centerY(), &digit, if (h.project == null or h.tabs_next) .later else .next);
+            right -= 5;
+        }
         // Tab count: a group's shells; for a file only once it has more than its viewer.
-        const right = tabsBadge(ui, ctx, r.id, if (r.kind == .shells) 1 else 2, lx, row.right() - 6, row.centerY());
+        right = tabsBadge(ui, ctx, r.id, if (r.kind == .shells) 1 else 2, lx, right, row.centerY());
         _ = dl.textEllipsis(theme.font_side, lx, row.centerY(), r.name, right - 4 - lx, if (selected or st.hover) theme.text else theme.text_2);
 
         if (st.clicked and !src) res.open_resource = r.id;
@@ -527,7 +568,7 @@ pub const Sidebar = struct {
             y += head.h + 2;
             for (sec.pages) |page| {
                 const row: Rect = .{ .x = theme.side_inset, .y = y, .w = w - 2 * theme.side_inset, .h = theme.side_res_h };
-                const st = ui.button(Ui.id("sidebar.settings.page", @intFromEnum(page)), row);
+                const st = ui.button(Ui.id("sidebar.settings.page", @backingInt(page)), row);
                 const selected = s.page == page;
                 if (selected) dl.rrect(row, theme.row_radius, theme.accent.alpha(0.14)) else ui.feedback(row, theme.row_radius, st);
 

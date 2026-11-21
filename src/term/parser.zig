@@ -21,7 +21,7 @@ pub const Csi = struct {
 
 pub const Parser = struct {
     state: State = .ground,
-    params: [max_params]u16 = [_]u16{0} ** max_params,
+    params: [max_params]u16 = @splat(0),
     nparams: usize = 0,
     param_open: bool = false,
     private: u8 = 0,

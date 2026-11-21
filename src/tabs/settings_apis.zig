@@ -30,7 +30,7 @@ const FieldRef = struct {
     kind: FieldKind,
 
     fn id(self: FieldRef) u64 {
-        return Ui.id("apis.field", @as(usize, self.uid) * 8 + @intFromEnum(self.kind));
+        return Ui.id("apis.field", @as(usize, self.uid) * 8 + @backingInt(self.kind));
     }
 
     fn slot(self: FieldRef, cfg: *config.Config) ?*[]u8 {
