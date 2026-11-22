@@ -20,7 +20,9 @@ const paths = @import("paths.zig");
 const tab_mod = @import("tabs/tab.zig");
 const TerminalTab = @import("tabs/terminal_tab.zig").TerminalTab;
 const FileTab = @import("tabs/file_tab.zig").FileTab;
-const DiffTab = @import("tabs/diff_tab.zig").DiffTab;
+const diff_feature = @import("features/diff/diff.zig");
+const repo_feature = @import("features/repo/repo.zig");
+const DiffTab = diff_feature.Tab;
 const MarkdownTab = @import("tabs/markdown_tab.zig").MarkdownTab;
 const NotebookTab = @import("tabs/notebook_tab.zig").NotebookTab;
 const ImageTab = @import("tabs/image_tab.zig").ImageTab;
@@ -84,6 +86,12 @@ pub const Action = enum {
     /// The files panel's Search view, its box focused (⌘⇧F).
     find_in_files,
     open_settings,
+    /// The repository tab for the folder the files panel shows: history,
+    /// staging, stashes (the `repo` feature).
+    open_repository,
+    /// ⌘⇧↵ where a commit is being written (the Git view's message box,
+    /// the repository tab's Changes): Amend on, or the amend made.
+    commit_amend,
     /// The app menu's "Install CLI Tools…": asks, then links `tt` into the
     /// PATH (`cli.install`).
     install_cli,
@@ -127,6 +135,9 @@ pub const App = struct {
     /// The context menus (tab, sidebar project / resource) and their
     /// rename / close-confirmation boxes.
     overlay: overlay_mod.Overlay,
+    /// The tab whose question (`Env.askConfirm`, `Env.askMenu`) the overlay
+    /// is showing, and the tag to answer it with.
+    question: ?struct { uid: u32, tag: u32 } = null,
     /// The split panes of the group on show and a tab being dragged.
     panes: panes_mod.PaneView = .{},
     tabs: tab_mod.TabManager,
@@ -258,7 +269,8 @@ pub const App = struct {
         self.tabs.register(.{ .name = "markdown", .label = "Markdown", .create = MarkdownTab.create, .accepts = MarkdownTab.accepts });
         self.tabs.register(.{ .name = "notebook", .label = "Notebook", .create = NotebookTab.create, .accepts = NotebookTab.accepts });
         self.tabs.register(.{ .name = "file", .label = "File", .create = FileTab.create, .accepts = FileTab.accepts });
-        self.tabs.register(.{ .name = "diff", .label = "Diff", .create = DiffTab.create });
+        diff_feature.register(&self.tabs);
+        repo_feature.register(&self.tabs);
         self.tabs.register(.{ .name = "settings", .label = "Settings", .create = SettingsTab.create, .singleton = true, .renamable = false });
         self.tabs.register(.{ .name = "web", .label = "Website", .create = WebTab.create });
         // The tabs of the last run come back; a first run starts with one shell.
@@ -466,12 +478,16 @@ pub const App = struct {
         // The files panel owns the splitter on its left edge, so it goes before the panes.
         const fr = self.files.draw(ui, files_rect, true, dragged);
         if (fr.open_file) |path| self.openFile(path);
-        if (fr.open_diff) |d| self.openDiff(d);
+        if (fr.open_diff) |d| self.openDiff(d.path, .{ .staged = d.staged, .orig = d.orig });
         if (fr.open_at) |o| self.openFileAt(o);
         if (fr.pin_file) |path| self.pinFile(path);
         if (fr.confirm) |c| self.overlay.openConfirmAction(.git_discard, 0, c.heading, c.reason, "Discard");
         if (fr.replace) |c| self.overlay.openConfirmAction(.search_replace, 0, c.heading, c.reason, "Replace");
-        if (fr.menu) |m| self.overlay.openList(m.items, m.checked, m.sep_after, m.x, m.y);
+        if (fr.menu) |m| {
+            self.question = null;
+            self.overlay.openList(m.items, m.checked, m.sep_after, m.x, m.y);
+            self.overlay.list_checks = m.checks;
+        }
         if (fr.file_menu) |m| self.openFileMenu(m);
         if (fr.drag_file) |path| self.startFileDrag(path);
         if (fr.drop_into) |dir| self.moveDroppedInto(dir);
@@ -837,6 +853,8 @@ pub const App = struct {
             .toggle_files => self.files.toggle(),
             .find_in_files => self.files.openSearch(self.now),
             .open_settings => _ = self.tabs.open("settings") catch {},
+            .open_repository => self.openRepository(),
+            .commit_amend => _ = self.commitAmend(),
             .install_cli => {
                 var buf: [200]u8 = undefined;
                 const reason = std.fmt.bufPrint(&buf, "Links {s} to this app. macOS may ask for your password.", .{cli.linkPath()}) catch "";
@@ -968,6 +986,21 @@ pub const App = struct {
                         if (self.projects.find(gid)) |p| self.selected_project = p.id;
                     }
                     _ = self.tabs.focus(uid);
+                },
+                .open_diff => |d| self.openDiff(d.path, .{
+                    .staged = d.staged,
+                    .orig = d.orig,
+                    .revs = if (d.right) |right| .{ .left = d.left, .right = right } else null,
+                }),
+                .question => |q| if (self.tabs.uidOf(q.tab)) |uid| {
+                    self.question = .{ .uid = uid, .tag = q.tag };
+                    switch (q.what) {
+                        .confirm => |c| self.overlay.openConfirmAction(.tab_question, 0, c.heading, c.reason, c.ok),
+                        .menu => |m| {
+                            self.overlay.openList(m.items, m.checked, null, m.x, m.y);
+                            self.overlay.list_checks = m.checks;
+                        },
+                    }
                 },
             }
         }
@@ -1226,7 +1259,14 @@ pub const App = struct {
             .replace_confirmed => self.files.replaceConfirmed(),
             .install_cli_confirmed => self.startCliInstall(),
             .dismissed => {},
-            .list_picked => |i| self.files.menuPicked(i),
+            .list_picked => |i| if (self.question) |q| {
+                self.question = null;
+                if (self.tabs.byUid(q.uid)) |t| t.vtable.answered(t.ptr, q.tag, i);
+            } else self.files.menuPicked(i),
+            .question_confirmed => if (self.question) |q| {
+                self.question = null;
+                if (self.tabs.byUid(q.uid)) |t| t.vtable.answered(t.ptr, q.tag, 0);
+            },
             .rename_project => |pid| if (self.projects.find(pid)) |p| {
                 self.overlay.openRename(.project, pid, p.name);
             },
@@ -1733,21 +1773,52 @@ pub const App = struct {
         self.invalidate();
     }
 
-    /// A change picked in the Git view: its two versions side by side, or
-    /// the tab already comparing them in any pane of the group on show.
-    fn openDiff(self: *App, d: files_mod.Diff) void {
+    /// ⌘⇧↵: to the Git view when its message box has the keyboard, else to
+    /// the tab in front. False when neither is writing a commit, so the
+    /// key is left for whoever else wants it.
+    pub fn commitAmend(self: *App) bool {
+        if (self.overlay.isOpen() or self.palette.open) return false;
+        defer self.invalidate();
+        if (self.files.commitAmend()) return true;
+        const t = self.tabs.current() orelse return false;
+        return t.vtable.command(t.ptr, .amend);
+    }
+
+    /// The repository tab for the folder the files panel shows, or the one
+    /// already open on that repository in any pane of the group on show.
+    fn openRepository(self: *App) void {
+        defer self.invalidate();
+        const dir = self.filesRoot();
+        for (self.tabs.group().layout.owned.items) |p| {
+            for (p.tabs.items) |t| {
+                if (!std.mem.eql(u8, t.kind, "repo")) continue;
+                const tab: *repo_feature.Tab = @ptrCast(@alignCast(t.ptr));
+                if (!tab.shows(dir)) continue;
+                _ = self.tabs.focus(t.uid);
+                return;
+            }
+        }
+        _ = self.tabs.openWith("repo", .{ .cwd = dir }) catch |err| {
+            std.log.err("could not open the repository {s}: {s}", .{ dir, @errorName(err) });
+        };
+    }
+
+    /// A change picked in the Git view, or the file of a commit: its two
+    /// versions side by side, or the tab already comparing them in any
+    /// pane of the group on show.
+    fn openDiff(self: *App, path: []const u8, diff: tab_mod.Diff) void {
         defer self.invalidate();
         for (self.tabs.group().layout.owned.items) |p| {
             for (p.tabs.items) |t| {
                 if (!std.mem.eql(u8, t.kind, "diff")) continue;
                 const tab: *DiffTab = @ptrCast(@alignCast(t.ptr));
-                if (!tab.shows(d.path, d.staged)) continue;
+                if (!tab.shows(path, diff)) continue;
                 _ = self.tabs.focus(t.uid);
                 return;
             }
         }
-        _ = self.tabs.openWith("diff", .{ .path = d.path, .diff = .{ .staged = d.staged, .orig = d.orig } }) catch |err| {
-            std.log.err("could not compare {s}: {s}", .{ d.path, @errorName(err) });
+        _ = self.tabs.openWith("diff", .{ .path = path, .diff = diff }) catch |err| {
+            std.log.err("could not compare {s}: {s}", .{ path, @errorName(err) });
         };
     }
 

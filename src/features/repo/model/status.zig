@@ -1,9 +1,9 @@
-//! Git for the files panel: what `git status` says about the folder on
-//! show, kept fresh on a thread of its own, and the handful of commands the
-//! Git view runs (stage, unstage, commit, discard). The parsing is pure and
-//! tested; the commands go through `sys.run`.
+//! What `git status` says about a folder, as data: the entries of
+//! `git status --porcelain=v1 -z --branch`, the branch and how far it is
+//! ahead of and behind its upstream, the colour each path gets in the tree,
+//! and the local and remote-tracking branches. Pure: nothing here runs git
+//! (`client/git.zig` does) or draws (`view/panel.zig` does).
 const std = @import("std");
-const sys = @import("sys.zig");
 
 /// How a path shows in the tree: the colour it gets.
 pub const Kind = enum(u8) {
@@ -105,6 +105,12 @@ pub const Snapshot = struct {
     /// Local branches, and remote-tracking ones as `origin/x` (no HEAD).
     branches: std.ArrayList([]u8) = .empty,
     remotes: std.ArrayList([]u8) = .empty,
+    /// The remotes themselves, by name, and where each one points (the
+    /// address as written in the repository's config).
+    remote_names: std.ArrayList([]u8) = .empty,
+    remote_urls: std.ArrayList([]u8) = .empty,
+    /// The commit HEAD points at; empty before the first commit.
+    head: []u8 = &.{},
 
     pub fn init(gpa: std.mem.Allocator) Snapshot {
         return .{ .gpa = gpa };
@@ -124,6 +130,11 @@ pub const Snapshot = struct {
         self.branches.deinit(gpa);
         for (self.remotes.items) |b| gpa.free(b);
         self.remotes.deinit(gpa);
+        for (self.remote_names.items) |b| gpa.free(b);
+        self.remote_names.deinit(gpa);
+        for (self.remote_urls.items) |b| gpa.free(b);
+        self.remote_urls.deinit(gpa);
+        gpa.free(self.head);
         gpa.free(self.dir);
         gpa.free(self.root);
         gpa.free(self.branch);
@@ -135,13 +146,15 @@ pub const Snapshot = struct {
         return self.root.len > 0;
     }
 
-    /// `git for-each-ref --format=%(refname) refs/heads refs/remotes`, one
-    /// ref a line, into `branches` and `remotes` (HEAD pointers skipped).
+    /// `git for-each-ref refs/heads refs/remotes`, one ref a line, into
+    /// `branches` and `remotes` (HEAD pointers skipped). Anything after
+    /// the ref's name on its line (the commit it points at) is not read.
     pub fn parseRefs(self: *Snapshot, raw: []const u8) !void {
         const gpa = self.gpa;
         var lines = std.mem.splitScalar(u8, raw, '\n');
         while (lines.next()) |line_raw| {
-            const line = std.mem.trim(u8, line_raw, " \r\t");
+            const whole = std.mem.trim(u8, line_raw, " \r\t");
+            const line = whole[0 .. std.mem.indexOfScalar(u8, whole, ' ') orelse whole.len];
             if (std.mem.startsWith(u8, line, "refs/heads/")) {
                 try self.branches.append(gpa, try gpa.dupe(u8, line["refs/heads/".len..]));
             } else if (std.mem.startsWith(u8, line, "refs/remotes/")) {
@@ -150,6 +163,44 @@ pub const Snapshot = struct {
                 try self.remotes.append(gpa, try gpa.dupe(u8, short));
             }
         }
+    }
+
+    /// `git config --get-regexp ^remote\..*\.url$`: a line per remote,
+    /// `remote.<name>.url <address>`.
+    pub fn parseRemotes(self: *Snapshot, raw: []const u8) !void {
+        const gpa = self.gpa;
+        var lines = std.mem.tokenizeAny(u8, raw, "\r\n");
+        while (lines.next()) |line| {
+            const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const key = line[0..space];
+            if (!std.mem.startsWith(u8, key, "remote.") or !std.mem.endsWith(u8, key, ".url")) continue;
+            const name = key["remote.".len .. key.len - ".url".len];
+            if (name.len == 0) continue;
+            const name_copy = try gpa.dupe(u8, name);
+            errdefer gpa.free(name_copy);
+            const url_copy = try gpa.dupe(u8, std.mem.trim(u8, line[space + 1 ..], " \t"));
+            errdefer gpa.free(url_copy);
+            try self.remote_names.append(gpa, name_copy);
+            self.remote_urls.append(gpa, url_copy) catch |err| {
+                _ = self.remote_names.pop();
+                return err;
+            };
+        }
+    }
+
+    /// Where the remote called `name` points; null when there is none.
+    pub fn remoteUrl(self: *const Snapshot, name: []const u8) ?[]const u8 {
+        for (self.remote_names.items, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) return self.remote_urls.items[i];
+        }
+        return null;
+    }
+
+    /// Where a branch with no upstream is published: `origin` when there
+    /// is a remote by that name, else the first one; null without any.
+    pub fn pushRemote(self: *const Snapshot) ?[]const u8 {
+        for (self.remote_names.items) |r| if (std.mem.eql(u8, r, "origin")) return r;
+        return if (self.remote_names.items.len > 0) self.remote_names.items[0] else null;
     }
 
     /// True when a local branch named `name` exists.
@@ -290,346 +341,20 @@ fn parseBranch(s: *Snapshot, header: []const u8) !void {
     }
 }
 
-// ── the live repository ─────────────────────────────────────────────────
-const refresh_every: f64 = 2.0;
-const status_env = [_][]const u8{ "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0", "LC_ALL=C" };
-/// No prompts and no editor: a command that would need either fails
-/// instead of hanging (a pull's merge message takes git's default).
-const action_env = [_][]const u8{ "GIT_TERMINAL_PROMPT=0", "GIT_EDITOR=true", "LC_ALL=C" };
+/// Last path component ("/" for the root).
+pub fn baseName(path: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    if (trimmed.len == 0) return path;
+    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return trimmed;
+    return trimmed[slash + 1 ..];
+}
 
-/// One `git status` run on its own thread.
-const Job = struct {
-    gpa: std.mem.Allocator,
-    dir: []u8,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    root: []u8 = &.{},
-    status: []u8 = &.{},
-    refs: []u8 = &.{},
-
-    fn run(job: *Job) void {
-        defer job.done.store(true, .release);
-        var top = sys.run(job.gpa, job.dir, &.{ "git", "rev-parse", "--show-toplevel" }, &status_env) catch return;
-        defer top.deinit();
-        if (!top.ok()) return;
-        const root = std.mem.trim(u8, top.stdout, " \r\n");
-        if (root.len == 0) return;
-        var st = sys.run(job.gpa, root, &.{ "git", "status", "--porcelain=v1", "-z", "--branch", "--untracked-files=normal", "--ignored" }, &status_env) catch return;
-        defer st.deinit();
-        if (!st.ok()) return;
-        job.root = job.gpa.dupe(u8, root) catch return;
-        job.status = job.gpa.dupe(u8, st.stdout) catch return;
-        var refs = sys.run(job.gpa, root, &.{ "git", "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes" }, &status_env) catch return;
-        defer refs.deinit();
-        if (refs.ok()) job.refs = job.gpa.dupe(u8, refs.stdout) catch return;
-    }
-
-    fn destroy(job: *Job) void {
-        job.gpa.free(job.dir);
-        job.gpa.free(job.root);
-        job.gpa.free(job.status);
-        job.gpa.free(job.refs);
-        job.gpa.destroy(job);
-    }
-};
-
-/// A command that talks to the network (pull, push) on its own thread;
-/// `Repo.tick` collects what it said.
-const CmdJob = struct {
-    gpa: std.mem.Allocator,
-    root: []u8,
-    argv: []const []const u8,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    ok: bool = false,
-    err: []u8 = &.{},
-
-    fn create(gpa: std.mem.Allocator, root: []const u8, argv: []const []const u8) !*CmdJob {
-        const job = try gpa.create(CmdJob);
-        errdefer gpa.destroy(job);
-        job.* = .{ .gpa = gpa, .root = &.{}, .argv = &.{} };
-        job.root = try gpa.dupe(u8, root);
-        const args = try gpa.alloc([]const u8, argv.len);
-        var n: usize = 0;
-        errdefer {
-            for (args[0..n]) |a| gpa.free(a);
-            gpa.free(args);
-            gpa.free(job.root);
-        }
-        for (argv) |a| {
-            args[n] = try gpa.dupe(u8, a);
-            n += 1;
-        }
-        job.argv = args;
-        return job;
-    }
-
-    fn run(job: *CmdJob) void {
-        defer job.done.store(true, .release);
-        var res = sys.run(job.gpa, job.root, job.argv, &action_env) catch |err| {
-            job.err = job.gpa.dupe(u8, @errorName(err)) catch &.{};
-            return;
-        };
-        defer res.deinit();
-        job.ok = res.ok();
-        if (!job.ok) {
-            const line = res.firstErrorLine();
-            job.err = job.gpa.dupe(u8, if (line.len > 0) line else "git failed") catch &.{};
-        }
-    }
-
-    fn destroy(job: *CmdJob) void {
-        for (job.argv) |a| job.gpa.free(a);
-        job.gpa.free(job.argv);
-        job.gpa.free(job.root);
-        job.gpa.free(job.err);
-        job.gpa.destroy(job);
-    }
-};
-
-pub const Repo = struct {
-    gpa: std.mem.Allocator,
-    /// The folder the status is wanted for.
-    dir: std.ArrayList(u8) = .empty,
-    snapshot: Snapshot,
-    /// What the snapshot was parsed from, to skip readings that say the same.
-    raw_seen: std.ArrayList(u8) = .empty,
-    refs_seen: std.ArrayList(u8) = .empty,
-    /// What the last failed command said (the panel shows it).
-    last_error: std.ArrayList(u8) = .empty,
-    thread: ?std.Thread = null,
-    job: ?*Job = null,
-    last_run: f64 = -1e9,
-    want_refresh: bool = true,
-    /// How long to wait between readings: `refresh_every`, stretched
-    /// (up to 30 s) when the last one took long, so a huge repository
-    /// does not keep a core busy.
-    interval: f64 = refresh_every,
-    /// Set whenever a reading of the repository has come in.
-    generation: u64 = 0,
-    /// The network command under way, if one is, and what to call it
-    /// ("Pulling…") while it runs.
-    cmd: ?*CmdJob = null,
-    cmd_thread: ?std.Thread = null,
-    cmd_label: []const u8 = "",
-
-    pub fn init(gpa: std.mem.Allocator) Repo {
-        return .{ .gpa = gpa, .snapshot = Snapshot.init(gpa) };
-    }
-
-    pub fn deinit(self: *Repo) void {
-        if (self.thread) |t| t.join();
-        if (self.job) |j| j.destroy();
-        if (self.cmd_thread) |t| t.join();
-        if (self.cmd) |j| j.destroy();
-        self.snapshot.deinit();
-        self.dir.deinit(self.gpa);
-        self.raw_seen.deinit(self.gpa);
-        self.refs_seen.deinit(self.gpa);
-        self.last_error.deinit(self.gpa);
-    }
-
-    /// Points the repository at `dir` (a fresh reading follows at once).
-    pub fn setDir(self: *Repo, dir: []const u8) void {
-        if (std.mem.eql(u8, self.dir.items, dir)) return;
-        self.dir.clearRetainingCapacity();
-        self.dir.appendSlice(self.gpa, dir) catch return;
-        self.want_refresh = true;
-    }
-
-    pub fn refreshSoon(self: *Repo) void {
-        self.want_refresh = true;
-    }
-
-    /// True while a reading is on its way.
-    pub fn busy(self: *const Repo) bool {
-        return self.job != null;
-    }
-
-    /// True while a pull or push runs.
-    pub fn cmdRunning(self: *const Repo) bool {
-        return self.cmd != null;
-    }
-
-    /// Whether `dir` is inside the repository last read.
-    pub fn isRepoFor(self: *const Repo, dir: []const u8) bool {
-        return self.snapshot.contains(dir);
-    }
-
-    /// Starts and collects readings. True when the snapshot changed.
-    pub fn tick(self: *Repo, now: f64) bool {
-        var changed = false;
-        if (self.cmd) |job| {
-            if (job.done.load(.acquire)) {
-                if (self.cmd_thread) |t| t.join();
-                self.cmd_thread = null;
-                self.cmd = null;
-                self.cmd_label = "";
-                defer job.destroy();
-                if (job.ok) self.last_error.clearRetainingCapacity() else self.setError(job.err);
-                self.want_refresh = true;
-                changed = true;
-            }
-        }
-        if (self.job) |job| {
-            if (!job.done.load(.acquire)) return changed;
-            if (self.thread) |t| t.join();
-            self.thread = null;
-            self.job = null;
-            defer job.destroy();
-            self.interval = std.math.clamp((now - self.last_run) * 5, refresh_every, 30);
-            if (self.adopt(job)) changed = true;
-        }
-        if (self.dir.items.len > 0 and (self.want_refresh or now - self.last_run >= self.interval)) self.start(now);
-        return changed;
-    }
-
-    fn start(self: *Repo, now: f64) void {
-        const job = self.gpa.create(Job) catch return;
-        job.* = .{ .gpa = self.gpa, .dir = self.gpa.dupe(u8, self.dir.items) catch {
-            self.gpa.destroy(job);
-            return;
-        } };
-        self.thread = std.Thread.spawn(.{}, Job.run, .{job}) catch {
-            job.destroy();
-            return;
-        };
-        self.job = job;
-        self.want_refresh = false;
-        self.last_run = now;
-    }
-
-    fn adopt(self: *Repo, job: *Job) bool {
-        const same_root = std.mem.eql(u8, self.snapshot.root, job.root);
-        const same_dir = std.mem.eql(u8, self.snapshot.dir, job.dir);
-        const same_refs = std.mem.eql(u8, self.refs_seen.items, job.refs);
-        if (same_root and same_dir and same_refs and std.mem.eql(u8, self.raw_seen.items, job.status)) return false;
-        var fresh = parse(self.gpa, job.dir, job.root, job.status) catch return false;
-        fresh.parseRefs(job.refs) catch {};
-        self.snapshot.deinit();
-        self.snapshot = fresh;
-        fresh = undefined;
-        self.raw_seen.clearRetainingCapacity();
-        self.raw_seen.appendSlice(self.gpa, job.status) catch {};
-        self.refs_seen.clearRetainingCapacity();
-        self.refs_seen.appendSlice(self.gpa, job.refs) catch {};
-        self.generation +%= 1;
-        return true;
-    }
-
-    // ── commands ────────────────────────────────────────────────────────
-    /// Runs `argv` in the repository's root; false (with `last_error`
-    /// set) when it failed. A fresh reading follows either way.
-    fn git(self: *Repo, argv: []const []const u8) bool {
-        defer self.want_refresh = true;
-        if (!self.snapshot.isRepo()) return false;
-        var res = sys.run(self.gpa, self.snapshot.root, argv, &action_env) catch |err| {
-            self.setError(@errorName(err));
-            return false;
-        };
-        defer res.deinit();
-        if (!res.ok()) {
-            const line = res.firstErrorLine();
-            self.setError(if (line.len > 0) line else "git failed");
-            return false;
-        }
-        self.last_error.clearRetainingCapacity();
-        return true;
-    }
-
-    fn setError(self: *Repo, msg: []const u8) void {
-        self.last_error.clearRetainingCapacity();
-        // git prefixes with "fatal: " / "error: "; the panel has little room.
-        var m = msg;
-        for ([_][]const u8{ "fatal: ", "error: " }) |p| {
-            if (std.mem.startsWith(u8, m, p)) m = m[p.len..];
-        }
-        self.last_error.appendSlice(self.gpa, m) catch {};
-    }
-
-    /// Starts `argv` on a thread; `label` says what it is meanwhile. One
-    /// at a time: a second request while one runs is refused (and said).
-    fn startCmd(self: *Repo, label: []const u8, argv: []const []const u8) void {
-        if (!self.snapshot.isRepo()) return;
-        if (self.cmd != null) {
-            self.setError("Another command is still running.");
-            return;
-        }
-        const job = CmdJob.create(self.gpa, self.snapshot.root, argv) catch return;
-        self.cmd_thread = std.Thread.spawn(.{}, CmdJob.run, .{job}) catch {
-            job.destroy();
-            return;
-        };
-        self.cmd = job;
-        self.cmd_label = label;
-        self.last_error.clearRetainingCapacity();
-    }
-
-    pub fn fetchAll(self: *Repo) void {
-        self.startCmd("Fetching…", &.{ "git", "fetch", "--all", "--prune" });
-    }
-
-    /// Checks a local branch out.
-    pub fn switchBranch(self: *Repo, name: []const u8) void {
-        self.startCmd("Switching…", &.{ "git", "switch", name });
-    }
-
-    /// Checks a remote branch (`origin/x`) out as a local `x` tracking it.
-    pub fn switchRemote(self: *Repo, remote_short: []const u8) void {
-        self.startCmd("Switching…", &.{ "git", "switch", "--track", remote_short });
-    }
-
-    pub fn pull(self: *Repo) void {
-        self.startCmd("Pulling…", &.{ "git", "pull" });
-    }
-
-    /// Pushes the branch; one without an upstream yet is published to
-    /// `origin` and starts tracking it.
-    pub fn push(self: *Repo) void {
-        const s = &self.snapshot;
-        if (s.upstream.len == 0) {
-            if (s.branch.len == 0 or s.detached or s.unborn) return;
-            self.startCmd("Publishing…", &.{ "git", "push", "-u", "origin", s.branch });
-        } else {
-            self.startCmd("Pushing…", &.{ "git", "push" });
-        }
-    }
-
-    pub fn stage(self: *Repo, rel: []const u8) bool {
-        return self.git(&.{ "git", "add", "-A", "--", rel });
-    }
-
-    pub fn stageAll(self: *Repo) bool {
-        return self.git(&.{ "git", "add", "-A" });
-    }
-
-    pub fn unstage(self: *Repo, rel: []const u8) bool {
-        return self.git(&.{ "git", "reset", "-q", "--", rel });
-    }
-
-    pub fn unstageAll(self: *Repo) bool {
-        return self.git(&.{ "git", "reset", "-q" });
-    }
-
-    /// Throws the worktree changes of `rel` away: a new file is deleted, a
-    /// tracked one goes back to what the index has.
-    pub fn discard(self: *Repo, rel: []const u8, untracked: bool) bool {
-        if (untracked) return self.git(&.{ "git", "clean", "-f", "-d", "-q", "--", rel });
-        return self.git(&.{ "git", "restore", "--worktree", "--", rel });
-    }
-
-    /// Throws every worktree change away, new files included.
-    pub fn discardAll(self: *Repo) bool {
-        const restored = self.git(&.{ "git", "restore", "--worktree", "--", "." });
-        const cleaned = self.git(&.{ "git", "clean", "-f", "-d", "-q" });
-        return restored and cleaned;
-    }
-
-    /// Commits what is staged with `message`; with `all`, everything is
-    /// staged first.
-    pub fn commit(self: *Repo, message: []const u8, all: bool) bool {
-        if (all and !self.stageAll()) return false;
-        return self.git(&.{ "git", "commit", "-q", "-m", message });
-    }
-};
+/// Everything above the last path component ("." when there is none).
+pub fn dirName(path: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return ".";
+    return if (slash == 0) "/" else trimmed[0..slash];
+}
 
 // ── tests ───────────────────────────────────────────────────────────────
 test "porcelain: kinds, sections and folders" {
@@ -683,7 +408,7 @@ test "refs: local and remote branches" {
     const gpa = std.testing.allocator;
     var s = try parse(gpa, "/r", "/r", "## main...origin/main\x00");
     defer s.deinit();
-    try s.parseRefs("refs/heads/feature\nrefs/heads/main\nrefs/remotes/origin/HEAD\nrefs/remotes/origin/main\nrefs/remotes/origin/topic\n");
+    try s.parseRefs("refs/heads/feature\nrefs/heads/main abc123\nrefs/remotes/origin/HEAD\nrefs/remotes/origin/main\nrefs/remotes/origin/topic def456\n");
     try std.testing.expectEqual(@as(usize, 2), s.branches.items.len);
     try std.testing.expectEqualStrings("feature", s.branches.items[0]);
     try std.testing.expectEqualStrings("main", s.branches.items[1]);
@@ -691,6 +416,17 @@ test "refs: local and remote branches" {
     try std.testing.expectEqualStrings("origin/topic", s.remotes.items[1]);
     try std.testing.expect(s.hasBranch("main"));
     try std.testing.expect(!s.hasBranch("topic"));
+    // Where to publish: origin when it is there, else the first remote.
+    try std.testing.expect(s.pushRemote() == null);
+    try s.parseRemotes("remote.fork.url git@github.com:me/repo.git\nremote.origin.url https://github.com/acme/repo.git\nremote.origin.fetch +refs/heads/*:refs/remotes/origin/*\n");
+    try std.testing.expectEqualStrings("origin", s.pushRemote().?);
+    try std.testing.expectEqual(@as(usize, 2), s.remote_names.items.len);
+    try std.testing.expectEqualStrings("https://github.com/acme/repo.git", s.remoteUrl("origin").?);
+    try std.testing.expect(s.remoteUrl("upstream") == null);
+    var other = try parse(gpa, "/r", "/r", "## main\x00");
+    defer other.deinit();
+    try other.parseRemotes("remote.fork.url a:b/c\nremote.upstream.url d:e/f\n");
+    try std.testing.expectEqualStrings("fork", other.pushRemote().?);
 }
 
 test "porcelain: unborn and detached heads" {
@@ -717,4 +453,10 @@ test "entry letters" {
     try std.testing.expectEqual(@as(u8, 'U'), new.unstagedLetter());
     const del: Entry = .{ .path = @constCast("c"), .x = 'D', .y = ' ' };
     try std.testing.expectEqual(Kind.deleted, del.kind());
+}
+
+test "path parts" {
+    try std.testing.expectEqualStrings("b.zig", baseName("a/b.zig"));
+    try std.testing.expectEqualStrings("a", dirName("a/b.zig"));
+    try std.testing.expectEqualStrings(".", dirName("b.zig"));
 }

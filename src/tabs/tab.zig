@@ -14,6 +14,11 @@
 //!
 //! The comparison tab ("diff") is the one kind opened on more than a path:
 //! the Git view hands it `OpenArgs.diff` (which two versions to compare).
+//!
+//! A tab reaches beyond its rect only by queueing a `Request` on `Env`:
+//! another tab opened, text for a shell, and a question for the user (a
+//! confirmation box or a menu, which only the app can show): the answer
+//! comes back through the tab's `answered` hook with the tag it was asked with.
 const std = @import("std");
 const ui_mod = @import("../ui/ui.zig");
 const EditCommand = @import("../events.zig").EditCommand;
@@ -34,7 +39,8 @@ pub const Status = enum { none, running, attention, failed };
 /// Document commands routed to the active tab (menu items, palette, ⌘S …).
 /// back/forward/reload/open_location are for website tabs (history, reload,
 /// focus the address bar); zoom_in/out/reset zoom a website tab's page.
-pub const Command = enum { save, undo, redo, toggle_view, back, forward, reload, open_location, zoom_in, zoom_out, zoom_reset };
+/// `amend` is ⌘⇧↵ where a commit is being written: amend the last commit.
+pub const Command = enum { save, undo, redo, toggle_view, back, forward, reload, open_location, zoom_in, zoom_out, zoom_reset, amend };
 
 /// Where a text document's caret is, the way "go to line" counts:
 /// 1-based line and column, and how many lines there are.
@@ -61,7 +67,7 @@ pub const OpenArgs = struct {
     saved: ?[]const u8 = null,
 };
 
-/// What a comparison tab (`diff_tab.zig`) is opened on, with `path`: a
+/// What a comparison tab (the `diff` feature) is opened on, with `path`: a
 /// change as the Git view lists it.
 pub const Diff = struct {
     /// What is staged (the last commit against the index) rather than
@@ -69,6 +75,13 @@ pub const Diff = struct {
     staged: bool = false,
     /// A staged rename: where the file was, relative to the repository's root.
     orig: ?[]const u8 = null,
+    /// Two commits instead (a commit against its parent, a pull request's
+    /// head against its base): `staged` then says nothing.
+    revs: ?Revs = null,
+
+    /// What `git show <rev>:<path>` takes; no `left` is an empty left
+    /// side (the commit that added the file).
+    pub const Revs = struct { left: ?[]const u8 = null, right: []const u8 };
 };
 
 /// Services shared by every tab.
@@ -137,6 +150,70 @@ pub const Env = struct {
         self.requests.append(self.gpa, .{ .reveal_tab = tab_ptr }) catch {};
     }
 
+    /// The two versions of `path` (absolute) that `diff` names, side by
+    /// side, or the tab already showing them.
+    pub fn openDiff(self: *Env, path: []const u8, diff: Diff) void {
+        const gpa = self.gpa;
+        var req: Request.OpenDiff = .{ .path = gpa.dupe(u8, path) catch return, .staged = diff.staged };
+        const queued = queue: {
+            if (diff.orig) |o| req.orig = gpa.dupe(u8, o) catch break :queue false;
+            if (diff.revs) |r| {
+                if (r.left) |l| req.left = gpa.dupe(u8, l) catch break :queue false;
+                req.right = gpa.dupe(u8, r.right) catch break :queue false;
+            }
+            self.requests.append(gpa, .{ .open_diff = req }) catch break :queue false;
+            break :queue true;
+        };
+        if (!queued) (Request{ .open_diff = req }).free(gpa);
+    }
+
+    /// A box asking the user to agree to something (`ok` names the button
+    /// that does it). Accepted, the tab's `answered(tag, 0)` is called;
+    /// cancelled, nothing is.
+    pub fn askConfirm(self: *Env, tab_ptr: *anyopaque, tag: u32, heading: []const u8, reason: []const u8, ok: []const u8) void {
+        const gpa = self.gpa;
+        const h = gpa.dupe(u8, heading) catch return;
+        const r = gpa.dupe(u8, reason) catch {
+            gpa.free(h);
+            return;
+        };
+        const o = gpa.dupe(u8, ok) catch {
+            gpa.free(h);
+            gpa.free(r);
+            return;
+        };
+        const req: Request = .{ .question = .{ .tab = tab_ptr, .tag = tag, .what = .{ .confirm = .{ .heading = h, .reason = r, .ok = o } } } };
+        self.requests.append(gpa, req) catch req.free(gpa);
+    }
+
+    /// A menu of options: every row whose bit is set in `checks` is ticked,
+    /// and a row written `Label<tab>Hint` shows the hint at its right. A
+    /// pick calls the tab's `answered(tag, row)`.
+    pub fn askChecks(self: *Env, tab_ptr: *anyopaque, tag: u32, items: []const []const u8, checks: u64, x: f32, y: f32) void {
+        const before = self.requests.items.len;
+        self.askMenu(tab_ptr, tag, items, null, x, y);
+        if (self.requests.items.len > before) self.requests.items[before].question.what.menu.checks = checks;
+    }
+
+    /// A menu of `items` with its top-left corner at (x, y), row `checked`
+    /// ticked. A pick calls the tab's `answered(tag, row)`.
+    pub fn askMenu(self: *Env, tab_ptr: *anyopaque, tag: u32, items: []const []const u8, checked: ?usize, x: f32, y: f32) void {
+        const gpa = self.gpa;
+        const copies = gpa.alloc([]u8, items.len) catch return;
+        var n: usize = 0;
+        for (items) |item| {
+            copies[n] = gpa.dupe(u8, item) catch break;
+            n += 1;
+        }
+        if (n < items.len) {
+            for (copies[0..n]) |c| gpa.free(c);
+            gpa.free(copies);
+            return;
+        }
+        const req: Request = .{ .question = .{ .tab = tab_ptr, .tag = tag, .what = .{ .menu = .{ .items = copies, .checked = checked, .x = x, .y = y } } } };
+        self.requests.append(gpa, req) catch req.free(gpa);
+    }
+
     /// `question` to the agent that takes plain-English lines, in a shell
     /// of the row on show, as a block headed `label`.
     pub fn askAgent(self: *Env, label: []const u8, question: []const u8) void {
@@ -171,8 +248,31 @@ pub const Request = union(enum) {
     /// A tab by its object (`Tab.ptr`): to close, to bring forward.
     close_tab: *anyopaque,
     reveal_tab: *anyopaque,
+    /// A comparison tab (`Env.openDiff`).
+    open_diff: OpenDiff,
+    /// A box or a menu for the user (`Env.askConfirm`, `Env.askMenu`).
+    question: Question,
 
     pub const Ask = struct { label: []u8, question: []u8 };
+
+    pub const OpenDiff = struct {
+        path: []u8,
+        staged: bool = false,
+        orig: ?[]u8 = null,
+        left: ?[]u8 = null,
+        right: ?[]u8 = null,
+    };
+
+    /// What a tab asks the user; `tag` is the tab's own name for it and
+    /// comes back with the answer.
+    pub const Question = struct {
+        tab: *anyopaque,
+        tag: u32,
+        what: union(enum) {
+            confirm: struct { heading: []u8, reason: []u8, ok: []u8 },
+            menu: struct { items: [][]u8, checked: ?usize, checks: u64 = 0, x: f32, y: f32 },
+        },
+    };
 
     pub fn free(self: Request, gpa: std.mem.Allocator) void {
         switch (self) {
@@ -181,6 +281,23 @@ pub const Request = union(enum) {
             .ask_agent => |a| {
                 gpa.free(a.label);
                 gpa.free(a.question);
+            },
+            .open_diff => |d| {
+                gpa.free(d.path);
+                if (d.orig) |o| gpa.free(o);
+                if (d.left) |l| gpa.free(l);
+                if (d.right) |r| gpa.free(r);
+            },
+            .question => |q| switch (q.what) {
+                .confirm => |c| {
+                    gpa.free(c.heading);
+                    gpa.free(c.reason);
+                    gpa.free(c.ok);
+                },
+                .menu => |m| {
+                    for (m.items) |item| gpa.free(item);
+                    gpa.free(m.items);
+                },
             },
         }
     }
@@ -293,6 +410,10 @@ pub const Tab = struct {
         /// Changes whenever `save` would write something different, so the
         /// workspace file is only rewritten when needed.
         saveVersion: *const fn (*anyopaque) u64,
+        /// The user answered a question the tab asked (`Env.askConfirm`,
+        /// `Env.askMenu`): `choice` is the menu row picked, 0 for a box
+        /// that was accepted.
+        answered: *const fn (*anyopaque, tag: u32, choice: usize) void,
     };
 
     /// Builds the vtable for `T` at comptime. Only `deinit` and `draw` are
@@ -397,6 +518,9 @@ pub const Tab = struct {
                 if (@hasDecl(T, "saveVersion")) return self(p).saveVersion();
                 return 0;
             }
+            fn answered(p: *anyopaque, tag: u32, choice: usize) void {
+                if (@hasDecl(T, "answered")) self(p).answered(tag, choice);
+            }
             const vtable: VTable = .{
                 .deinit = deinit,
                 .title = kindTitle,
@@ -424,6 +548,7 @@ pub const Tab = struct {
                 .closeWarning = closeWarning,
                 .save = save,
                 .saveVersion = saveVersion,
+                .answered = answered,
             };
         };
         return .{ .ptr = impl, .vtable = &gen.vtable };

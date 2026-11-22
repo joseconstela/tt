@@ -188,6 +188,50 @@ pub const DrawList = struct {
         self.shape(.{ .x = cx - radius, .y = cy - radius, .w = radius * 2, .h = radius * 2 }, radius, color, 0, Color.transparent);
     }
 
+    /// A straight stroke from one point to another, `width` points thick,
+    /// with round ends (a capsule: kind 3 in the shader). Not snapped to
+    /// the pixel grid, so a slanted stroke stays smooth.
+    pub fn line(self: *DrawList, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Color) void {
+        if (width <= 0) return;
+        const half = width / 2;
+        const bounds: Rect = .{ .x = @min(x0, x1) - half - 1, .y = @min(y0, y1) - half - 1, .w = @abs(x1 - x0) + width + 2, .h = @abs(y1 - y0) + width + 2 };
+        if (!self.visible(bounds)) return;
+        const s = self.scale;
+        const bx = @floor(bounds.x * s);
+        const by = @floor(bounds.y * s);
+        self.push(.{
+            .rect = .{ bx, by, @ceil(bounds.right() * s) - bx, @ceil(bounds.bottom() * s) - by },
+            .uv = .{ x0 * s, y0 * s, x1 * s, y1 * s },
+            .color = .{ color.r, color.g, color.b, color.a },
+            .params = .{ half * s, 0, 3, 0 },
+            .clip = self.clipPx(),
+        }, null);
+    }
+
+    /// A cubic Bézier stroke from `p0` to `p3` with control points `p1`
+    /// and `p2` (each `.{ x, y }` in points), drawn as short straight
+    /// strokes. Meant for an opaque colour: the strokes overlap at their
+    /// joints, which a translucent one would show.
+    pub fn curve(self: *DrawList, p0: [2]f32, p1: [2]f32, p2: [2]f32, p3: [2]f32, width: f32, color: Color) void {
+        const steps: usize = 14;
+        var prev = p0;
+        var i: usize = 1;
+        while (i <= steps) : (i += 1) {
+            const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps));
+            const u = 1 - t;
+            const a = u * u * u;
+            const b = 3 * u * u * t;
+            const c = 3 * u * t * t;
+            const d = t * t * t;
+            const at: [2]f32 = .{
+                a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0],
+                a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1],
+            };
+            self.line(prev[0], prev[1], at[0], at[1], width, color);
+            prev = at;
+        }
+    }
+
     // ── text ────────────────────────────────────────────────────────────
     /// Draws `str` with its baseline at `baseline_y`. Returns the advance in points.
     pub fn textAt(self: *DrawList, font: Font, x: f32, baseline_y: f32, str: []const u8, color: Color) f32 {

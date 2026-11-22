@@ -9,7 +9,7 @@
 //! blank row wherever only the other side has a line, so the two always
 //! have the same number of rows and scroll as one. Lines that went are
 //! tinted red on the left, lines that came green on the right, and within
-//! a changed line the part that differs is picked out (`diff.zig` does the
+//! a changed line the part that differs is picked out (`model/rows.zig` does the
 //! comparing). Either side takes the caret, a selection and ⌘C; nothing is
 //! edited here: "Open File" in the strip opens the file itself.
 //!
@@ -17,21 +17,27 @@
 //! the last commit) and from disk, and are read again when the file or the
 //! index changes, so staging, committing or saving shows up on its own.
 //!
-//! Across relaunches the tab keeps one record, `diff <path> <w|s> <orig>`:
-//! the file, whether it is the worktree or the staged comparison, and
-//! where a staged rename came from.
+//! Opened on two revisions instead (`OpenArgs.diff.revs`: a commit against
+//! its parent), both sides come from `git show <rev>:path` and are read
+//! once: a commit does not change.
+//!
+//! Across relaunches the tab keeps one record,
+//! `diff <path> <w|s|r> <orig> <left> <right>`: the file, whether it is the
+//! worktree, the staged or a revision comparison, where a rename came
+//! from, and for `r` the two revisions (`left` blank for none). Records
+//! written before revisions existed have no last two fields.
 const std = @import("std");
-const tab_mod = @import("tab.zig");
-const viewer = @import("viewer.zig");
-const file_tab = @import("file_tab.zig");
-const text_editor = @import("text_editor.zig");
-const ui_mod = @import("../ui/ui.zig");
-const theme = @import("../ui/theme.zig");
-const filetype = @import("../filetype.zig");
-const records = @import("../records.zig");
-const diff = @import("../diff.zig");
-const sys = @import("../sys.zig");
-const EditCommand = @import("../events.zig").EditCommand;
+const tab_mod = @import("../../../tabs/tab.zig");
+const viewer = @import("../../../tabs/viewer.zig");
+const file_tab = @import("../../../tabs/file_tab.zig");
+const text_editor = @import("../../../tabs/text_editor.zig");
+const ui_mod = @import("../../../ui/ui.zig");
+const theme = @import("../../../ui/theme.zig");
+const filetype = @import("../../../filetype.zig");
+const records = @import("../../../records.zig");
+const diff = @import("../model/rows.zig");
+const sys = @import("../../../sys.zig");
+const EditCommand = @import("../../../events.zig").EditCommand;
 
 const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
@@ -90,6 +96,11 @@ pub const DiffTab = struct {
     /// A staged rename's old place, relative to the repository's root.
     orig: ?[]u8 = null,
     staged: bool,
+    /// Two revisions instead of the index and the disk: `right_rev` set
+    /// says so, and no `left_rev` then is an empty left side.
+    left_rev: ?[]u8 = null,
+    right_rev: ?[]u8 = null,
+    label_bufs: [2][12]u8 = undefined,
     /// The repository's index file ("" outside a repository).
     index_path: []u8 = &.{},
     src: Sources,
@@ -118,6 +129,8 @@ pub const DiffTab = struct {
         const path = args.path orelse kept.path orelse return error.MissingPath;
         const staged = if (args.diff) |d| d.staged else kept.staged;
         const orig: ?[]const u8 = if (args.diff) |d| d.orig else kept.orig;
+        const left_rev: ?[]const u8 = if (args.diff) |d| (if (d.revs) |r| r.left else null) else kept.left;
+        const right_rev: ?[]const u8 = if (args.diff) |d| (if (d.revs) |r| r.right else null) else kept.right;
 
         const self = try gpa.create(DiffTab);
         errdefer gpa.destroy(self);
@@ -132,6 +145,10 @@ pub const DiffTab = struct {
         };
         errdefer self.free();
         if (orig) |o| self.orig = try gpa.dupe(u8, o);
+        if (right_rev) |r| {
+            self.right_rev = try gpa.dupe(u8, r);
+            if (left_rev) |l| self.left_rev = try gpa.dupe(u8, l);
+        }
         self.left.read_only = true;
         self.right.read_only = true;
 
@@ -166,6 +183,8 @@ pub const DiffTab = struct {
         self.src.deinit(gpa);
         gpa.free(self.index_path);
         if (self.orig) |o| gpa.free(o);
+        if (self.left_rev) |r| gpa.free(r);
+        if (self.right_rev) |r| gpa.free(r);
         gpa.free(self.file_path);
     }
 
@@ -174,9 +193,24 @@ pub const DiffTab = struct {
         self.gpa.destroy(self);
     }
 
-    /// True when this tab is the comparison the Git view asks for.
-    pub fn shows(self: *const DiffTab, path: []const u8, staged: bool) bool {
-        return self.staged == staged and std.mem.eql(u8, self.file_path, path);
+    /// True when this tab is the comparison asked for.
+    pub fn shows(self: *const DiffTab, path: []const u8, want: tab_mod.Diff) bool {
+        if (!std.mem.eql(u8, self.file_path, path)) return false;
+        const revs = want.revs orelse return self.right_rev == null and self.staged == want.staged;
+        const right = self.right_rev orelse return false;
+        if (!std.mem.eql(u8, right, revs.right)) return false;
+        const mine = self.left_rev orelse return revs.left == null;
+        return std.mem.eql(u8, mine, revs.left orelse return false);
+    }
+
+    /// A revision as a label: the start of a hash, or a short name whole.
+    fn revLabel(buf: *[12]u8, rev: []const u8) []const u8 {
+        const hash = rev.len >= 20 and for (rev) |ch| {
+            if (!std.ascii.isHex(ch)) break false;
+        } else true;
+        const n = @min(rev.len, if (hash) 7 else buf.len);
+        @memcpy(buf[0..n], rev[0..n]);
+        return buf[0..n];
     }
 
     // ── reading the two versions ────────────────────────────────────────
@@ -208,13 +242,24 @@ pub const DiffTab = struct {
         return gitOut(self.gpa, dir, &.{ "git", "show", spec });
     }
 
-    fn fetch(self: *const DiffTab) !Sources {
+    fn fetch(self: *DiffTab) !Sources {
         const gpa = self.gpa;
         var buf: [4096]u8 = undefined;
         const at = self.locate(&buf);
         var out: Sources = .{ .left = &.{}, .right = &.{}, .left_label = "HEAD", .right_label = "Index" };
         errdefer out.deinit(gpa);
-        if (self.staged) {
+        if (self.right_rev) |right| {
+            // A side the revision does not have (a file added, or deleted) is empty.
+            out.right_label = revLabel(&self.label_bufs[1], right);
+            out.right = self.show(at.dir, right, at.rel) orelse try gpa.dupe(u8, "");
+            if (self.left_rev) |left| {
+                out.left_label = revLabel(&self.label_bufs[0], left);
+                out.left = self.show(at.dir, left, self.orig orelse at.rel) orelse try gpa.dupe(u8, "");
+            } else {
+                out.left_label = "Nothing";
+                out.left = try gpa.dupe(u8, "");
+            }
+        } else if (self.staged) {
             // A version that is not there (a new file, a deleted one) is empty.
             out.left = self.show(at.dir, "HEAD", self.orig orelse at.rel) orelse try gpa.dupe(u8, "");
             out.right = self.show(at.dir, "", at.rel) orelse try gpa.dupe(u8, "");
@@ -339,6 +384,7 @@ pub const DiffTab = struct {
     // ── tab interface ───────────────────────────────────────────────────
     pub fn title(self: *DiffTab, buf: []u8) []const u8 {
         const name = sys.basename(self.file_path);
+        if (self.right_rev != null) return std.fmt.bufPrint(buf, "{s} ({s})", .{ name, self.src.right_label }) catch name;
         return std.fmt.bufPrint(buf, "{s} ({s})", .{ name, if (self.staged) "Index" else "Working Tree" }) catch name;
     }
 
@@ -358,7 +404,8 @@ pub const DiffTab = struct {
     pub fn tick(self: *DiffTab, now: f64, active: bool) bool {
         var dirty = self.left.tick(now, active and self.side == .left);
         if (self.right.tick(now, active and self.side == .right)) dirty = true;
-        if (active and now - self.last_check > check_every) {
+        // Two revisions never change; the index and the disk do.
+        if (active and self.right_rev == null and now - self.last_check > check_every) {
             self.last_check = now;
             const stamp = self.readStamp();
             if (!stamp.eql(self.stamp)) {
@@ -386,6 +433,8 @@ pub const DiffTab = struct {
         path: ?[]u8 = null,
         orig: ?[]u8 = null,
         staged: bool = false,
+        left: ?[]u8 = null,
+        right: ?[]u8 = null,
 
         fn parse(gpa: std.mem.Allocator, saved: ?[]const u8) !Kept {
             var out: Kept = .{};
@@ -397,9 +446,16 @@ pub const DiffTab = struct {
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(gpa);
                 out.path = try gpa.dupe(u8, try records.unescape(&buf, gpa, f.next() orelse continue));
-                out.staged = std.mem.eql(u8, f.next() orelse "", "s");
+                const mode = f.next() orelse "";
+                out.staged = std.mem.eql(u8, mode, "s");
                 const orig = try records.unescape(&buf, gpa, f.next() orelse "");
                 if (orig.len > 0) out.orig = try gpa.dupe(u8, orig);
+                if (std.mem.eql(u8, mode, "r")) {
+                    const left = try records.unescape(&buf, gpa, f.next() orelse "");
+                    if (left.len > 0) out.left = try gpa.dupe(u8, left);
+                    const right = try records.unescape(&buf, gpa, f.next() orelse "");
+                    if (right.len > 0) out.right = try gpa.dupe(u8, right);
+                }
                 break;
             }
             return out;
@@ -408,6 +464,8 @@ pub const DiffTab = struct {
         fn deinit(self: *Kept, gpa: std.mem.Allocator) void {
             if (self.path) |p| gpa.free(p);
             if (self.orig) |o| gpa.free(o);
+            if (self.left) |l| gpa.free(l);
+            if (self.right) |r| gpa.free(r);
         }
     };
 
@@ -415,14 +473,20 @@ pub const DiffTab = struct {
         const gpa = self.gpa;
         out.appendSlice(gpa, "diff\t") catch return false;
         records.escape(out, gpa, self.file_path) catch return false;
-        out.appendSlice(gpa, if (self.staged) "\ts\t" else "\tw\t") catch return false;
+        out.appendSlice(gpa, if (self.right_rev != null) "\tr\t" else if (self.staged) "\ts\t" else "\tw\t") catch return false;
         records.escape(out, gpa, self.orig orelse "") catch return false;
+        if (self.right_rev) |right| {
+            out.append(gpa, '\t') catch return false;
+            records.escape(out, gpa, self.left_rev orelse "") catch return false;
+            out.append(gpa, '\t') catch return false;
+            records.escape(out, gpa, right) catch return false;
+        }
         out.append(gpa, '\n') catch return false;
         return true;
     }
 
     pub fn saveVersion(self: *DiffTab) u64 {
-        return viewer.keptVersion(self.file_path, if (self.staged) "s" else "w");
+        return viewer.keptVersion(self.file_path, self.right_rev orelse if (self.staged) "s" else "w");
     }
 
     // ── drawing ─────────────────────────────────────────────────────────
@@ -498,6 +562,17 @@ test "diff tab: what it keeps comes back" {
     defer w.deinit(gpa);
     try std.testing.expect(!w.staged);
     try std.testing.expect(w.orig == null);
+    try std.testing.expect(w.right == null);
+    // Two revisions; an older record has no such fields and reads as before.
+    var r = try DiffTab.Kept.parse(gpa, "diff\t/r/x\tr\t\tabc123\tdef456\n");
+    defer r.deinit(gpa);
+    try std.testing.expect(!r.staged);
+    try std.testing.expectEqualStrings("abc123", r.left.?);
+    try std.testing.expectEqualStrings("def456", r.right.?);
+    var root = try DiffTab.Kept.parse(gpa, "diff\t/r/x\tr\t\t\tdef456\n");
+    defer root.deinit(gpa);
+    try std.testing.expect(root.left == null);
+    try std.testing.expectEqualStrings("def456", root.right.?);
     var none = try DiffTab.Kept.parse(gpa, null);
     defer none.deinit(gpa);
     try std.testing.expect(none.path == null);

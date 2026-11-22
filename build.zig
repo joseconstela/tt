@@ -172,4 +172,30 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // `zig build arch` — the import boundaries of `src/features` (the rules
+    // are at the top of tooling/arch_check.zig). Part of `zig build test`,
+    // so an import across a boundary fails the same run a broken test does.
+    const arch_mod = b.createModule(.{
+        .root_source_file = b.path("tooling/arch_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    arch_mod.addImport("sys", b.createModule(.{
+        .root_source_file = b.path("src/sys.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
+    const arch_exe = b.addExecutable(.{ .name = "arch_check", .root_module = arch_mod });
+    const run_arch = b.addRunArtifact(arch_exe);
+    run_arch.addDirectoryArg(b.path("src"));
+    // The sources it reads are not inputs the build graph knows: run it every time.
+    run_arch.has_side_effects = true;
+    const arch_step = b.step("arch", "Check the import boundaries of src/features");
+    arch_step.dependOn(&run_arch.step);
+    test_step.dependOn(&run_arch.step);
+    const run_arch_tests = b.addRunArtifact(b.addTest(.{ .root_module = arch_mod }));
+    test_step.dependOn(&run_arch_tests.step);
 }

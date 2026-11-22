@@ -48,6 +48,12 @@
 //!       camera: allow                     # allow | block; absent = the default above
 //!       microphone: allow
 //!       notifications: allow
+//!   accounts:               # git hosts, for pull requests (the `repo` feature
+//!     - host: github.com    # owns this section: features/repo/client/accounts.zig)
+//!       kind: github        # github | gitlab | bitbucket | gitea
+//!       user: me            # Bitbucket: the account's e-mail; else optional
+//!       token: "…"          # an access token, or instead of it:
+//!       token_from: gh      # gh | glab | git: ask that tool for the token
 //!
 //! In the code an "agent" is one of the APIs (a model at a provider); the
 //! coding agents installed on the Mac live in `coding_agents.zig`.
@@ -55,6 +61,7 @@
 //! One instance lives for the whole app (`get()`); saves are debounced
 //! (`touch`) so typing into a field does not rewrite the file per keystroke.
 const std = @import("std");
+const repo = @import("features/repo/repo.zig");
 const sys = @import("sys.zig");
 const themes = @import("ui/themes.zig");
 
@@ -414,6 +421,9 @@ pub const Config = struct {
     screens: std.ArrayList(Screen) = .empty,
     /// Websites' remembered answers (camera, microphone, notifications).
     sites: std.ArrayList(Site) = .empty,
+    /// Who tt is on each git host, for pull requests. The `repo` feature
+    /// reads and writes the section; this file only hands it the lines.
+    accounts: repo.Accounts,
     agents: std.ArrayList(Agent) = .empty,
     features: Features = .{},
     notebooks: Notebooks = .{},
@@ -426,7 +436,7 @@ pub const Config = struct {
     next_uid: u32 = 1,
 
     pub fn init(gpa: std.mem.Allocator) Config {
-        return .{ .gpa = gpa };
+        return .{ .gpa = gpa, .accounts = repo.Accounts.init(gpa) };
     }
 
     pub fn deinit(self: *Config) void {
@@ -444,8 +454,9 @@ pub const Config = struct {
         self.gpa.free(self.features.fix_agent);
         self.gpa.free(self.features.fix_prompt);
         self.browser.deinit(self.gpa);
+        self.accounts.deinit();
         if (self.path) |p| self.gpa.free(p);
-        self.* = .{ .gpa = self.gpa };
+        self.* = Config.init(self.gpa);
     }
 
     // ── agents ──────────────────────────────────────────────────────────
@@ -843,6 +854,11 @@ pub const Config = struct {
                 }
             }
         }
+        try self.accounts.write(gpa, out, writeScalarAny);
+    }
+
+    fn writeScalarAny(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) anyerror!void {
+        return writeScalar(gpa, out, s);
     }
 
     fn writeField(gpa: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8, value: []const u8) !void {
@@ -895,7 +911,7 @@ pub const Config = struct {
         return true;
     }
 
-    const Section = enum { none, ui, agents, apis, features, screens, notebooks, browser, sites };
+    const Section = enum { none, ui, agents, apis, features, screens, notebooks, browser, sites, accounts };
 
     /// Reads the subset `write` produces (plus hand edits of the same
     /// shape). Anything it does not understand is skipped.
@@ -1036,6 +1052,16 @@ pub const Config = struct {
                         if (Mode.parse(std.mem.trim(u8, kv.value, "\"' "))) |m| sc.mode = m;
                     }
                 },
+                .accounts => {
+                    const kv = splitKey(body) orelse {
+                        // A bare "-" starts an entry too.
+                        if (new_item) try self.accounts.parseEntry(true, "", "");
+                        continue;
+                    };
+                    const v = try unquote(self.gpa, kv.value);
+                    defer self.gpa.free(v);
+                    try self.accounts.parseEntry(new_item, kv.key, v);
+                },
                 .apis => {
                     if (new_item) {
                         try self.agents.append(self.gpa, .{ .uid = self.takeUid() });
@@ -1087,6 +1113,7 @@ pub const Config = struct {
                 _ = self.screens.orderedRemove(k);
             } else k += 1;
         }
+        self.accounts.tidy();
         // A theme picked for dark (light) mode is the style where that mode was.
         const migrate = struct {
             fn f(m: *Mode, dark: ?Mode, light: ?Mode) void {
@@ -1656,4 +1683,45 @@ test "sites: removing answers, one site or all, keeps the other features" {
     const v2 = a.version;
     a.removeAllSitePermissions(&.{.notifications});
     try std.testing.expectEqual(v2, a.version);
+}
+
+test "accounts: the section goes to the repo feature and comes back" {
+    const gpa = std.testing.allocator;
+    var a = Config.init(gpa);
+    defer a.deinit();
+    try a.parse(
+        \\accounts:
+        \\  - host: github.com
+        \\    kind: github
+        \\    token_from: gh
+        \\  - host: "git.example.com"
+        \\    kind: gitea
+        \\    user: me
+        \\    token: "s3cret: with a colon"
+        \\  -
+        \\ui:
+        \\  compact: true
+        \\
+    );
+    try std.testing.expectEqual(@as(usize, 2), a.accounts.items.items.len);
+    try std.testing.expectEqualStrings("s3cret: with a colon", a.accounts.forHost("git.example.com").?.token);
+    try std.testing.expect(a.compact);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try a.write(&out);
+    var b = Config.init(gpa);
+    defer b.deinit();
+    try b.parse(out.items);
+    try std.testing.expectEqual(@as(usize, 2), b.accounts.items.items.len);
+    try std.testing.expectEqualStrings("s3cret: with a colon", b.accounts.forHost("git.example.com").?.token);
+    try std.testing.expectEqualStrings("me", b.accounts.forHost("git.example.com").?.user);
+    try std.testing.expect(b.accounts.forHost("github.com").?.usable());
+
+    // A file with no account has no such section.
+    var none = Config.init(gpa);
+    defer none.deinit();
+    out.clearRetainingCapacity();
+    try none.write(&out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "accounts:") == null);
 }

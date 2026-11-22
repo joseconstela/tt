@@ -1,0 +1,16 @@
+{
+  "id": 5001, "iid": 142, "project_id": 77, "title": "feat(webhooks): delivery with retries and HMAC signing",
+  "description": "Queue with exponential retries.", "state": "opened",
+  "created_at": "2026-11-19T18:42:00.000Z", "updated_at": "2026-11-21T18:42:00.123Z",
+  "target_branch": "main", "source_branch": "feat/webhooks", "user_notes_count": 8,
+  "author": {"id": 11, "username": "mlado", "name": "María Lado"},
+  "reviewers": [{"id": 12, "username": "arivas", "name": "Anxo Rivas"}, {"id": 14, "username": "speon", "name": "Sara Peón"}],
+  "labels": [{"name": "backend", "color": "#5bd0c0"}], "draft": false, "work_in_progress": false,
+  "sha": "6f6fc36000000000000000000000000000000000", "has_conflicts": false, "detailed_merge_status": "mergeable",
+  "web_url": "https://gitlab.example.com/acme/platform/orchard-api/-/merge_requests/142",
+  "changes_count": "5",
+  "head_pipeline": {"id": 900, "iid": 31, "project_id": 77, "sha": "6f6fc36000000000000000000000000000000000", "ref": "feat/webhooks", "status": "success", "source": "merge_request_event", "created_at": "2026-11-21T18:30:00.000Z", "updated_at": "2026-11-21T18:37:00.000Z", "started_at": "2026-11-21T18:30:05.000Z", "finished_at": "2026-11-21T18:36:57.000Z", "duration": 412, "queued_duration": 3.5, "coverage": null},
+  "pipeline": {"id": 900, "status": "success"},
+  "diff_refs": {"base_sha": "661e9c8000000000000000000000000000000000", "head_sha": "6f6fc36000000000000000000000000000000000", "start_sha": "661e9c8000000000000000000000000000000000"},
+  "merge_error": null, "first_contribution": false, "user": {"can_merge": true}
+}

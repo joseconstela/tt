@@ -1,0 +1,7 @@
+{
+  "values": [
+    {"key": "build", "type": "build", "state": "SUCCESSFUL", "name": "build", "refname": null, "commit": {"hash": "6f6fc36", "type": "commit"}, "url": "https://ci.example.invalid/1", "description": "", "created_on": "2026-11-21T18:40:00.000000+00:00", "updated_on": "2026-11-21T18:42:14.000000+00:00"},
+    {"key": "lint", "type": "build", "state": "FAILED", "name": "lint", "refname": null, "commit": {"hash": "6f6fc36", "type": "commit"}, "url": "https://ci.example.invalid/2", "description": "", "created_on": "2026-11-21T18:40:00.000000+00:00", "updated_on": "2026-11-21T18:40:41.000000+00:00"}
+  ],
+  "pagelen": 100, "size": 2, "page": 1
+}

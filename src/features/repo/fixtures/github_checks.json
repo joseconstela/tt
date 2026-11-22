@@ -1,0 +1,9 @@
+{
+  "total_count": 3,
+  "check_runs": [
+    {"id": 1, "name": "build", "status": "completed", "conclusion": "success", "started_at": "2026-11-21T18:40:00Z", "completed_at": "2026-11-21T18:42:14Z", "head_sha": "6f6fc36000000000000000000000000000000000"},
+    {"id": 2, "name": "tests · node 22", "status": "completed", "conclusion": "success", "started_at": "2026-11-21T18:40:00Z", "completed_at": "2026-11-21T18:44:02Z"},
+    {"id": 3, "name": "e2e", "status": "in_progress", "conclusion": null, "started_at": "2026-11-21T18:40:00Z", "completed_at": null},
+    {"id": 4, "name": "docs", "status": "completed", "conclusion": "skipped", "started_at": "2026-11-21T18:40:00Z", "completed_at": "2026-11-21T18:40:01Z"}
+  ]
+}

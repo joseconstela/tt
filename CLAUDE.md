@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 tt is a block-based terminal / IDE / browser for macOS, written in Zig and drawn with Metal. There are no Swift or Objective-C sources: AppKit, Metal, CoreText, WebKit and the rest are driven from Zig through the Objective-C runtime (`src/objc.zig`, `src/apple.zig`). The one dependency is libghostty-vt, pinned by commit in `build.zig.zon` and unpacked into the git-ignored `zig-pkg/`.
 
-Product constraint from the README: **local only**. No account, sync, telemetry or update check; the only outbound traffic is what the user sends to an AI agent they configured, and the pages they open in website tabs. Assets a feature needs are vendored and embedded (e.g. `assets/notebook/plotly.min.js`), never fetched from a CDN.
+Product constraint from the README: **local only**. No account, sync, telemetry or update check; the only outbound traffic is what the user sends to an AI agent they configured, the pages they open in website tabs, and, for a repository whose git host they added an account for (Settings › Git › Hosting), the pull-request requests to that host and no other. A feature that reaches a server is off until the user configures it, the way these are. Assets a feature needs are vendored and embedded (e.g. `assets/notebook/plotly.min.js`), never fetched from a CDN.
 
 ## Commands
 
@@ -17,13 +17,13 @@ zig build                         # zig-out/bin/tt
 zig build run                     # build and launch (args after `--` are passed through)
 zig build app                     # zig-out/tt.app, ad-hoc signed; needs full Xcode (actool compiles icon.icon)
 zig build install-app             # `app`, then copy it to ~/Applications/tt.app (add -Doptimize=ReleaseFast for a daily driver)
-zig build test                    # unit tests
+zig build test                    # unit tests, and the import boundaries (`zig build arch` alone)
 zig build -Doptimize=ReleaseFast
 ```
 
 If the first build fails while fetching ghostty, run it again.
 
-**Tests.** `src/tests.zig` is the test root: a module's `test` blocks only run if it is imported there, so add new pure-logic modules to that list. `build.zig` wires no test filter, so there is no single-test command; `zig build test` runs everything.
+**Tests.** `src/tests.zig` is the test root: a module's `test` blocks only run if it is imported there, so add new pure-logic modules to that list (a feature is listed once, by its public file, whose own `test` block names the files inside). `build.zig` wires no test filter, so there is no single-test command; `zig build test` runs everything, including `tooling/arch_check.zig`, which fails the run when an `@import` crosses a boundary described under "Features" below. Its messages say which file to import instead.
 
 **Headless UI runs.** These are how UI changes are checked, since unit tests cover logic only:
 
@@ -51,6 +51,34 @@ The script language (`type`, `key`, `click`, `drag`, `open`, `action <App.Action
 
 Because `script.zig` and `cocoa.zig` both drive the same `App`, a feature built in `App` and below is testable headless; anything that only exists in `cocoa.zig` is not.
 
+### Features
+
+New code is organised by feature, after Lauren Tan's Dune architecture: everything one capability needs sits in one folder, the folder has one public file, and the boundaries are checked rather than remembered. Code that predates this (most of `src/`) stays where it is and moves over feature by feature, when it is next reworked.
+
+```text
+src/features/<name>/
+├── <name>.zig   the public surface: the only file code outside the folder may import
+├── hosts.zig    the effects the feature is handed (pointer + function, like `Env`): running a command, HTTP …
+├── model/       data and parsing; imports `std` and `model/` only
+├── client/      everything that reaches outside (git, a hosting API), through `hosts.zig` only
+├── view/        drawing; reads model data, returns what the user asked for as an intent, runs nothing
+└── entry/       what the app mounts (a tab kind, a panel, a settings page): a view and its client put together
+```
+
+- A frame does no I/O: a view never imports `sys.zig`, `http.zig` or its `client/`. It returns an intent and the entry hands it to the client (`features/repo/view/panel.zig` → `entry/panel.zig`).
+- A client takes its effects as parameters, so its tests pass a stand-in (`FakeGit` in `features/repo/client/git.zig`).
+- Framework code (`gfx/`, `input/`, `term/`, `syntax/`, `sys.zig`, `objc.zig`, `apple.zig`, `tabs/tab.zig`, and the core of `ui/`: the exact list is at the top of `tooling/arch_check.zig`) imports no feature and not `app.zig`.
+- One owner per thing: every git command on a repository goes through `features/repo/client/git.zig` (`Repo` for what changes it, `Query` for what only reads); the `accounts:` section of `config.yml` is read and written only by `features/repo/client/accounts.zig`; requests to a hosting API are sent only by `features/repo/client/forge.zig`.
+
+Features so far:
+
+- `repo`: git for a repository. The files panel's Git view and the tree's colours (`entry/panel.zig`); the repository tab (`entry/tab.zig`, kind `repo`, `App.Action.open_repository`): History with its graph, Changes, Stashes, and Pull Requests; Settings › Git › Hosting (`entry/settings.zig`). Pull requests are the same model whichever host they come from (`model/pull_request.zig`): each of `client/github.zig`, `gitlab.zig`, `bitbucket.zig` and `gitea.zig` only builds requests and decodes answers, `client/forge.zig` sends them through `hosts.Http`, and a pull request's files and diffs come from local git (`client/pull_files.zig`), not from the host. A control a host has no answer for is hidden through `Capabilities`. Each backend is tested against JSON in `fixtures/`, written to the shapes the real APIs return.
+- `diff`: the side-by-side comparison tab, of the index and the working tree or of two revisions.
+
+`.ai/features/repos/view.md` names the parts of the repository view (and of the Git view's commit button) and says what each host can do; use those names.
+
+`src/http.zig` is the generic HTTP request (NSURLSession: any method, the whole body, the response headers); `agent.zig` keeps its own streaming transport.
+
 ### Rendering and UI
 
 - `src/gfx/`: `draw.zig` is the draw list (the UI emits shapes and text in points; it converts to device pixels and snaps to the pixel grid), `renderer.zig` encodes one instanced Metal draw per frame plus one per distinct image texture, `text.zig` shapes with CoreText into a glyph atlas. Shaders (`shaders.metal`) and fonts are embedded through `addAnonymousImport` in `build.zig`.
@@ -61,7 +89,7 @@ Because `script.zig` and `cocoa.zig` both drive the same `App`, a feature built 
 
 `src/tabs/tab.zig` defines a tab as pointer + vtable (the shape of `std.mem.Allocator`), built at comptime by `Tab.from(T, ptr)`: only `deinit` and `draw` are required, every other hook (`tick`, `save`, `command`, `closeWarning`, `path`, `relocate` …) has a default. A *kind* is a factory registered with `TabManager.register` in `App.create`. File viewers add an `accepts(path, head)` predicate; registration order is most-specific-first and `file` takes what is left. The header of `tab.zig` lists the steps for adding a kind.
 
-Tabs do not reach into `App`. They get an `Env` (allocator, history, clipboard, textures, native-view host) and ask for app-level effects by queueing a `Request` on it (`openUrl`, `sendToShell`, `runInShell`, `closeTab` …), which `App.update` serves on the next tick. `Env.textures` and `Env.host` are null in tests and headless runs, and tab code must cope with that.
+Tabs do not reach into `App`. They get an `Env` (allocator, history, clipboard, textures, native-view host) and ask for app-level effects by queueing a `Request` on it (`openUrl`, `sendToShell`, `runInShell`, `closeTab`, `openDiff`, and `askConfirm` / `askMenu` for a box or a menu, whose answer comes back through the tab's `answered` hook …), which `App.update` serves on the next tick. `Env.textures` and `Env.host` are null in tests and headless runs, and tab code must cope with that.
 
 Tabs live in *groups*, one per sidebar row (see below). Each group has a pane tree (`tabs/layout.zig`: splits by weight, panes holding an ordered list of tabs); `layout.zig` only computes geometry, `ui/panes.zig` and `ui/tabbar.zig` draw.
 
@@ -88,7 +116,7 @@ Changes to these formats must keep older files readable (see the version and leg
 ### Documents, notebooks, web
 
 - Text editing is shared: `input/editor.zig` (buffer, caret, selection, IME) → `input/document.zig` (line index, undo, per-line syntax state) → `tabs/text_editor.zig`. `syntax/` holds the lexers. The Markdown tab's preview (`tabs/markdown_view.zig`) is itself editable.
-- Comparisons: a row of the files panel's Git view (`ui/git_panel.zig`) opens `tabs/diff_tab.zig`, two read-only `TextEditor`s side by side over the rows `src/diff.zig` computes (the versions come from `git show` and the disk).
+- Comparisons: a row of the files panel's Git view (the `repo` feature, mounted by `ui/files.zig`) opens the `diff` feature's tab (`features/diff/entry/tab.zig`), two read-only `TextEditor`s side by side over the rows `features/diff/model/rows.zig` computes (the versions come from `git show` and the disk).
 - Notebooks: `notebook/bridge.zig` starts `assets/notebook/tt_jupyter.py` with the notebook's Python; that script runs the kernel through jupyter_client and relays messages as one JSON line each over pipes. `tabs/notebook_tab.zig` is tt's own cell frontend; `notebook/ipynb.zig` reads and writes plain nbformat 4. HTML/Plotly/SVG outputs are WKWebViews clipped over the Metal layer.
 - Website tabs (`tabs/web_tab.zig`, `web_bridge.zig`, `web_menu.zig`) host a WKWebView through `Env.host`; permissions and notifications go through `platform/media.zig` and `platform/notify.zig`.
 

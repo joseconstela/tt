@@ -1,4 +1,4 @@
-//! Line diff for the side-by-side comparison (`tabs/diff_tab.zig`): two
+//! Line diff for the side-by-side comparison (`entry/tab.zig`): two
 //! texts in, *rows* out. A row is one line of the comparison: the same line
 //! on both sides, a line that changed (old on the left, new on the right),
 //! or a line only one side has, facing a blank on the other.

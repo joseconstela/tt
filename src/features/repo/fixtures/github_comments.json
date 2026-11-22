@@ -1,0 +1,16 @@
+[
+  {
+    "id": 9001, "pull_request_review_id": 1, "diff_hunk": "@@ -0,0 +1,22 @@", "path": "src/webhooks/sign.js",
+    "commit_id": "6f6fc36000000000000000000000000000000000", "original_commit_id": "6f6fc36000000000000000000000000000000000",
+    "user": {"login": "arivas", "id": 12}, "body": "Should we also check the header's length before `timingSafeEqual`? It throws on different lengths.",
+    "created_at": "2026-11-21T13:42:00Z", "updated_at": "2026-11-21T13:42:00Z",
+    "start_line": null, "original_start_line": null, "start_side": null, "line": 10, "original_line": 10, "side": "RIGHT",
+    "author_association": "MEMBER", "original_position": 10, "position": 10, "subject_type": "line"
+  },
+  {
+    "id": 9002, "pull_request_review_id": 2, "in_reply_to_id": 9001, "path": "src/webhooks/sign.js",
+    "user": {"login": "mlado", "id": 11}, "body": "Good catch, adding it.",
+    "created_at": "2026-11-21T14:00:00Z", "updated_at": "2026-11-21T14:00:00Z",
+    "line": 10, "original_line": 10, "side": "RIGHT"
+  }
+]

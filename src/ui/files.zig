@@ -10,13 +10,13 @@
 //! re-reads its visible folders every couple of seconds so `touch`, `git
 //! checkout` … show up. A Files / Search / Git strip at the top switches
 //! to the Search view (`search_panel.zig`: find in files, VS Code style)
-//! and, inside a git repository, to the Git view (`git_panel.zig`); the
+//! and, inside a git repository, to the Git view (the `repo` feature); the
 //! names in the tree take git's colours there (new, changed …).
 const std = @import("std");
 const ui_mod = @import("ui.zig");
 const theme = @import("theme.zig");
 const sidebar = @import("sidebar.zig");
-const git_panel = @import("git_panel.zig");
+const repo = @import("../features/repo/repo.zig");
 const search_panel = @import("search_panel.zig");
 const sys = @import("../sys.zig");
 const paths = @import("../paths.zig");
@@ -48,7 +48,7 @@ pub const FileMenu = struct { kind: FileKind, x: f32, y: f32 };
 pub const OpenAt = search_panel.Open;
 
 /// A change of the Git view to show side by side.
-pub const Diff = git_panel.Diff;
+pub const Diff = repo.Diff;
 
 pub const Result = struct {
     open_file: ?[]const u8 = null,
@@ -56,9 +56,9 @@ pub const Result = struct {
     /// The Git view: a change to show side by side (valid this frame).
     open_diff: ?Diff = null,
     /// The Git view wants a discard confirmed (see `discardConfirmed`).
-    confirm: ?git_panel.Confirm = null,
+    confirm: ?repo.Confirm = null,
     /// The Git view's branch menu to open (see `menuPicked`).
-    menu: ?git_panel.Menu = null,
+    menu: ?repo.Menu = null,
     /// The Search view: a match to open (valid this frame).
     open_at: ?OpenAt = null,
     /// The Search view wants a Replace All confirmed (see `replaceConfirmed`).
@@ -96,11 +96,11 @@ pub const FileBrowser = struct {
     /// Scratch: path of the row being drawn.
     path: std.ArrayList(u8) = .empty,
     mode: Mode = .files,
-    git: git_panel.Panel,
+    git: repo.Panel,
     search: search_panel.Panel,
 
     pub fn init(gpa: std.mem.Allocator) FileBrowser {
-        return .{ .gpa = gpa, .git = git_panel.Panel.init(gpa), .search = search_panel.Panel.init(gpa) };
+        return .{ .gpa = gpa, .git = repo.Panel.init(gpa), .search = search_panel.Panel.init(gpa) };
     }
 
     pub fn deinit(self: *FileBrowser) void {
@@ -205,6 +205,14 @@ pub const FileBrowser = struct {
             .search => self.search.hasFocus(),
             .files => false,
         };
+    }
+
+    /// ⌘⇧↵: amends, when the Git view's message box has the keyboard.
+    /// False when it was not for this panel.
+    pub fn commitAmend(self: *FileBrowser) bool {
+        if (!self.visible or self.mode != .git or !self.git.hasFocus()) return false;
+        self.git.amend();
+        return true;
     }
 
     pub fn onText(self: *FileBrowser, utf8: []const u8) void {
@@ -383,6 +391,8 @@ pub const FileBrowser = struct {
 
         var y = rect.y;
         // The tabs: Files and Search always, Git inside a repository.
+        // A commit that failed in the Git view: what it printed, in a tab.
+        if (self.git.takeFailure()) |path| res.open_file = path;
         const is_repo = self.git.isRepoFor(self.root.items);
         if (!is_repo and self.mode == .git) self.mode = .files;
         self.drawModeStrip(ui, rect, &y, is_repo);
@@ -468,7 +478,7 @@ pub const FileBrowser = struct {
             const selected = self.mode == m.mode;
             const font = if (selected) theme.font_tab_active else theme.font_tab;
             const lw = ui.text.measure(font, m.label);
-            const cw: f32 = if (count.len > 0) ui.text.measure(git_panel.font_badge, count) + 14 else 0;
+            const cw: f32 = if (count.len > 0) ui.text.measure(repo.font_badge, count) + 14 else 0;
             const r: Rect = .{ .x = x, .y = y.*, .w = lw + 2 * pad + cw, .h = strip_h };
             const st = ui.button(Ui.id("files.mode", i), r);
             if (st.hover and !selected) dl.rrect(.{ .x = r.x, .y = pill_y, .w = r.w, .h = theme.compact_tab_pill_h }, theme.compact_row_radius, theme.hover);
@@ -477,7 +487,7 @@ pub const FileBrowser = struct {
             if (count.len > 0) {
                 const pill: Rect = .{ .x = r.x + pad + lw + 6, .y = r.centerY() - 8, .w = cw - 6, .h = 16 };
                 dl.rrect(pill, 8, if (selected) theme.accent else theme.accent.alpha(0.55));
-                _ = dl.textCentered(git_panel.font_badge, pill.x + 4, pill.centerY(), count, theme.on_accent);
+                _ = dl.textCentered(repo.font_badge, pill.x + 4, pill.centerY(), count, theme.on_accent);
             }
             if (selected) dl.rect(.{ .x = r.x, .y = r.bottom() - 2, .w = r.w, .h = 2 }, theme.accent);
             if (st.clicked) {
@@ -557,13 +567,13 @@ pub const FileBrowser = struct {
                 if (n.is_dir) dl.icon(if (n.expanded) .chevron_down else .chevron_right, x - 2, row.centerY() - 7, 14, theme.text_3);
                 const lx = x + 18;
                 // Git's colours: new, changed, ignored …; files also get the letter.
-                const kind = self.git.repo.snapshot.kindOfPath(self.path.items, n.is_dir);
+                const kind = self.git.kindOfPath(self.path.items, n.is_dir);
                 var color = if (n.is_dir or selected) theme.text else theme.text_2;
                 if (kind == .ignored) {
                     color = theme.text_3;
                 } else if (kind != .none) {
-                    color = git_panel.kindColor(kind);
-                    if (!n.is_dir) right -= dl.textRight(git_panel.font_badge, right, row.centerY(), git_panel.kindLetter(kind), color) + 6;
+                    color = repo.kindColor(kind);
+                    if (!n.is_dir) right -= dl.textRight(repo.font_badge, right, row.centerY(), repo.kindLetter(kind), color) + 6;
                 }
                 _ = dl.textEllipsis(theme.font_side, lx, row.centerY(), n.name, right - lx, color);
 

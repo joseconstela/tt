@@ -1,0 +1,31 @@
+[
+  {
+    "id": 3001, "url": "https://codeberg.org/api/v1/repos/acme/orchard-api/pulls/142", "number": 142,
+    "user": {"id": 11, "login": "mlado", "login_name": "", "source_id": 0, "full_name": "María Lado", "email": "mlado@noreply.example.invalid", "avatar_url": "", "html_url": "https://codeberg.org/mlado", "language": "", "is_admin": false, "restricted": false, "active": false, "prohibit_login": false, "username": "mlado"},
+    "title": "feat(webhooks): delivery with retries and HMAC signing", "body": "Queue with exponential retries.",
+    "labels": [{"id": 1, "name": "backend", "exclusive": false, "is_archived": false, "color": "5bd0c0", "description": "", "url": ""}],
+    "milestone": null, "assignee": null, "assignees": null,
+    "requested_reviewers": [{"id": 14, "login": "speon", "full_name": "Sara Peón"}], "requested_reviewers_teams": [],
+    "state": "open", "draft": false, "is_locked": false, "comments": 5, "review_comments": 3, "additions": 640, "deletions": 210, "changed_files": 5,
+    "html_url": "https://codeberg.org/acme/orchard-api/pulls/142", "diff_url": "", "patch_url": "",
+    "mergeable": true, "merged": false, "merged_at": null, "merge_commit_sha": null, "merged_by": null, "allow_maintainer_edit": false,
+    "base": {"label": "main", "ref": "main", "sha": "661e9c8000000000000000000000000000000000", "repo_id": 9, "repo": {"id": 9, "name": "orchard-api"}},
+    "head": {"label": "feat/webhooks", "ref": "feat/webhooks", "sha": "6f6fc36000000000000000000000000000000000", "repo_id": 9, "repo": {"id": 9, "name": "orchard-api"}},
+    "merge_base": "661e9c8000000000000000000000000000000000", "due_date": null,
+    "created_at": "2026-11-19T18:42:00Z", "updated_at": "2026-11-21T19:42:00+01:00", "closed_at": null, "pin_order": 0, "flow": 0
+  },
+  {
+    "id": 3002, "number": 138, "user": {"id": 10, "login": "jconstela"}, "title": "WIP: chore(ci): dependency cache in pipelines", "body": "",
+    "labels": [], "requested_reviewers": null, "state": "open", "comments": 0, "review_comments": 0, "additions": 44, "deletions": 10,
+    "html_url": "https://codeberg.org/acme/orchard-api/pulls/138", "mergeable": true, "merged": false, "merged_by": null,
+    "base": {"ref": "main", "sha": "661e9c8000000000000000000000000000000000"}, "head": {"ref": "chore/ci-cache", "sha": "1111111000000000000000000000000000000000"},
+    "created_at": "2026-11-15T09:00:00Z", "updated_at": "2026-11-19T09:00:00Z"
+  },
+  {
+    "id": 3003, "number": 134, "user": {"id": 12, "login": "arivas"}, "title": "feat(auth): refresh token rotation", "body": "",
+    "labels": [], "requested_reviewers": [], "state": "closed", "draft": false, "comments": 2, "review_comments": 0, "additions": 120, "deletions": 30,
+    "html_url": "https://codeberg.org/acme/orchard-api/pulls/134", "mergeable": false, "merged": true, "merged_at": "2026-11-19T10:00:00Z", "merged_by": {"id": 10, "login": "jconstela"},
+    "base": {"ref": "main", "sha": "3333333000000000000000000000000000000000"}, "head": {"ref": "feat/token-rotation", "sha": "2222222000000000000000000000000000000000"},
+    "created_at": "2026-11-10T09:00:00Z", "updated_at": "2026-11-19T10:00:00Z"
+  }
+]

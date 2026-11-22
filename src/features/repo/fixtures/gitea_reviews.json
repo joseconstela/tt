@@ -1,0 +1,5 @@
+[
+  {"id": 1, "user": {"id": 12, "login": "arivas", "full_name": "Anxo Rivas"}, "team": null, "state": "APPROVED", "body": "", "commit_id": "6f6fc36000000000000000000000000000000000", "stale": false, "official": true, "dismissed": false, "comments_count": 0, "submitted_at": "2026-11-20T10:00:00Z", "updated_at": "2026-11-20T10:00:00Z"},
+  {"id": 2, "user": {"id": 10, "login": "jconstela"}, "team": null, "state": "APPROVED", "body": "", "stale": true, "official": false, "dismissed": true, "comments_count": 0, "submitted_at": "2026-11-19T10:00:00Z", "updated_at": "2026-11-19T10:00:00Z"},
+  {"id": 3, "user": {"id": 14, "login": "speon"}, "team": null, "state": "REQUEST_REVIEW", "body": "", "stale": false, "official": false, "dismissed": false, "comments_count": 0, "submitted_at": "2026-11-20T09:00:00Z", "updated_at": "2026-11-20T09:00:00Z"}
+]

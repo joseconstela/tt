@@ -1,0 +1,7 @@
+{
+  "id": 5001, "iid": 142, "project_id": 77, "title": "feat(webhooks): delivery with retries and HMAC signing", "state": "opened",
+  "merge_status": "can_be_merged", "approved": false, "approvals_required": 2, "approvals_left": 1, "require_password_to_approve": false,
+  "approved_by": [{"user": {"id": 12, "username": "arivas", "name": "Anxo Rivas", "state": "active"}}],
+  "suggested_approvers": [], "approvers": [], "approver_groups": [], "user_has_approved": false, "user_can_approve": true,
+  "approval_rules_left": [{"id": 1, "name": "Maintainers", "rule_type": "regular"}], "has_approval_rules": true
+}

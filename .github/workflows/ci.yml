@@ -57,7 +57,7 @@ jobs:
 
       - name: Formatting (zig fmt --check)
         if: ${{ !cancelled() && steps.zig.outcome == 'success' }}
-        run: zig fmt --check src build.zig
+        run: zig fmt --check src build.zig tooling
 
       - name: Unit tests
         if: ${{ !cancelled() && steps.zig.outcome == 'success' }}

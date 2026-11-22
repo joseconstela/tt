@@ -1,0 +1,27 @@
+{
+  "values": [
+    {
+      "comment_count": 8, "task_count": 0, "type": "pullrequest", "id": 142,
+      "title": "feat(webhooks): delivery with retries and HMAC signing", "description": "Queue with exponential retries.",
+      "state": "OPEN", "draft": false, "merge_commit": null, "close_source_branch": true, "closed_by": null,
+      "author": {"type": "user", "uuid": "{a}", "account_id": "x1", "kind": "user", "display_name": "María Lado", "account_status": "active", "nickname": "mlado"},
+      "reason": "", "created_on": "2026-11-19T18:42:00.000000+00:00", "updated_on": "2026-11-21T18:42:00.123456+00:00",
+      "destination": {"branch": {"name": "main"}, "commit": {"hash": "661e9c8", "type": "commit"}, "repository": {"type": "repository", "full_name": "acme/orchard-api", "name": "orchard-api", "uuid": "{r}"}},
+      "source": {"branch": {"name": "feat/webhooks", "sync_strategies": ["merge_commit"]}, "commit": {"hash": "6f6fc36", "type": "commit"}, "repository": {"type": "repository", "full_name": "acme/orchard-api", "name": "orchard-api", "uuid": "{r}"}},
+      "links": {"self": {"href": "https://api.bitbucket.org/2.0/repositories/acme/orchard-api/pullrequests/142"}, "html": {"href": "https://bitbucket.org/acme/orchard-api/pull-requests/142"}},
+      "summary": {"type": "rendered", "raw": "Queue with exponential retries.", "markup": "markdown", "html": "<p>Queue with exponential retries.</p>"},
+      "queued": false
+    },
+    {
+      "comment_count": 0, "type": "pullrequest", "id": 138, "title": "chore(ci): dependency cache in pipelines", "description": "",
+      "state": "OPEN", "draft": true, "closed_by": null,
+      "author": {"type": "user", "display_name": "Jose Constela", "nickname": "jconstela"},
+      "created_on": "2026-11-15T09:00:00.000000+00:00", "updated_on": "2026-11-19T09:00:00.000000+00:00",
+      "destination": {"branch": {"name": "main"}, "commit": {"hash": "661e9c8"}},
+      "source": {"branch": {"name": "chore/ci-cache"}, "commit": {"hash": "1111111"}},
+      "links": {"html": {"href": "https://bitbucket.org/acme/orchard-api/pull-requests/138"}}
+    }
+  ],
+  "pagelen": 30, "size": 31, "page": 1,
+  "next": "https://api.bitbucket.org/2.0/repositories/acme/orchard-api/pullrequests?state=OPEN&pagelen=30&page=2"
+}

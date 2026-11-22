@@ -1,0 +1,49 @@
+[
+  {
+    "url": "https://api.github.com/repos/acme/orchard-api/pulls/142",
+    "id": 1001, "node_id": "PR_x1", "html_url": "https://github.com/acme/orchard-api/pull/142",
+    "number": 142, "state": "open", "locked": false,
+    "title": "feat(webhooks): delivery with retries and HMAC signing",
+    "user": {"login": "mlado", "id": 11, "type": "User", "site_admin": false},
+    "body": "Queue with exponential retries.",
+    "labels": [{"id": 1, "name": "backend", "color": "5bd0c0", "default": false, "description": null}, {"id": 2, "name": "webhooks", "color": "8fb3ff", "default": false, "description": ""}],
+    "milestone": null, "active_lock_reason": null,
+    "created_at": "2026-11-19T18:42:00Z", "updated_at": "2026-11-21T18:42:00Z", "closed_at": null, "merged_at": null,
+    "merge_commit_sha": "0000000000000000000000000000000000000001", "assignee": null, "assignees": [],
+    "requested_reviewers": [{"login": "speon", "id": 14, "type": "User", "site_admin": false}], "requested_teams": [],
+    "head": {"label": "acme:feat/webhooks", "ref": "feat/webhooks", "sha": "6f6fc36000000000000000000000000000000000", "user": {"login": "acme"}, "repo": {"id": 5, "name": "orchard-api"}},
+    "base": {"label": "acme:main", "ref": "main", "sha": "661e9c8000000000000000000000000000000000", "user": {"login": "acme"}, "repo": {"id": 5, "name": "orchard-api"}},
+    "_links": {"self": {"href": "https://api.github.com/repos/acme/orchard-api/pulls/142"}},
+    "author_association": "MEMBER", "auto_merge": null, "draft": false
+  },
+  {
+    "number": 138, "state": "open", "title": "chore(ci): dependency cache in pipelines",
+    "html_url": "https://github.com/acme/orchard-api/pull/138",
+    "user": {"login": "jconstela", "id": 10}, "body": null, "labels": [],
+    "created_at": "2026-11-15T09:00:00Z", "updated_at": "2026-11-19T09:00:00Z", "closed_at": null, "merged_at": null,
+    "requested_reviewers": [],
+    "head": {"ref": "chore/ci-cache", "sha": "1111111000000000000000000000000000000000"},
+    "base": {"ref": "main", "sha": "661e9c8000000000000000000000000000000000"},
+    "draft": true
+  },
+  {
+    "number": 134, "state": "closed", "title": "feat(auth): refresh token rotation",
+    "html_url": "https://github.com/acme/orchard-api/pull/134",
+    "user": {"login": "arivas", "id": 12}, "labels": [],
+    "created_at": "2026-11-10T09:00:00Z", "updated_at": "2026-11-19T10:00:00Z", "closed_at": "2026-11-19T10:00:00Z", "merged_at": "2026-11-19T10:00:00Z",
+    "requested_reviewers": [],
+    "head": {"ref": "feat/token-rotation", "sha": "2222222000000000000000000000000000000000"},
+    "base": {"ref": "main", "sha": "3333333000000000000000000000000000000000"},
+    "draft": false
+  },
+  {
+    "number": 130, "state": "closed", "title": "spike: try another queue",
+    "html_url": "https://github.com/acme/orchard-api/pull/130",
+    "user": {"login": "speon", "id": 14}, "labels": [],
+    "created_at": "2026-11-01T09:00:00Z", "updated_at": "2026-11-02T10:00:00Z", "closed_at": "2026-11-02T10:00:00Z", "merged_at": null,
+    "requested_reviewers": [],
+    "head": {"ref": "spike/queue", "sha": "4444444000000000000000000000000000000000"},
+    "base": {"ref": "main", "sha": "3333333000000000000000000000000000000000"},
+    "draft": false
+  }
+]

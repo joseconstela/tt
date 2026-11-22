@@ -1,19 +1,32 @@
-//! The Git view of the files panel: a source-control client in the idiom
-//! of VS Code's — the branch, a message box, a Commit button, and the
-//! changes in lists (merge conflicts, staged, not yet) with stage /
+//! The Git view of the files panel, drawn: a source-control client in the
+//! idiom of VS Code's — the branch, a message box, a Commit button, and
+//! the changes in lists (merge conflicts, staged, not yet) with stage /
 //! unstage / discard buttons on each row and each list. A row opens its
-//! change as a side-by-side comparison (`tabs/diff_tab.zig`): what is
+//! change as a side-by-side comparison (the `diff` feature): what is
 //! staged against the last commit, what is not against the index.
-//! Discards ask first: the panel hands the app a question, the app
-//! shows the box and calls `discardConfirmed` when it is accepted.
+//!
+//! This file only draws and keeps what the view itself remembers (the
+//! message being typed, the scroll, which lists are open). It is shown a
+//! reading of the repository (`State`) and runs nothing: what the user
+//! asked for comes out as one `Intent` (`takeIntent`), which
+//! `entry/panel.zig` hands to the git client, and as a `Result` for what
+//! only the app can do (open a comparison, a menu, a confirmation box).
+//! Discards ask first: the app shows the box and `discardConfirmed` turns
+//! the answer into the intent.
+//!
+//! The arrow beside Commit opens the commit's options: Amend (the next
+//! commit replaces the last one, and with no message keeps its own;
+//! ⌘⇧↵ does the same, and commits once it is on), Signoff and Skip Hooks.
+//! The ones in force are ticked; Amend goes off again once it is done.
 const std = @import("std");
-const ui_mod = @import("ui.zig");
-const theme = @import("theme.zig");
-const field = @import("field.zig");
-const sidebar = @import("sidebar.zig");
-const git = @import("../git.zig");
-const sys = @import("../sys.zig");
-const EditCommand = @import("../events.zig").EditCommand;
+const ui_mod = @import("../../../ui/ui.zig");
+const theme = @import("../../../ui/theme.zig");
+const field = @import("../../../ui/field.zig");
+const sidebar = @import("../../../ui/sidebar.zig");
+const icons = @import("../../../gfx/icons.zig");
+const status = @import("../model/status.zig");
+const kit = @import("kit.zig");
+const EditCommand = @import("../../../events.zig").EditCommand;
 
 const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
@@ -37,6 +50,8 @@ pub const Confirm = struct { heading: []const u8, reason: []const u8 };
 pub const Menu = struct {
     items: []const []const u8,
     checked: ?usize,
+    /// Rows ticked besides `checked`, a bit each (the commit options in force).
+    checks: u64 = 0,
     sep_after: ?usize,
     x: f32,
     y: f32,
@@ -58,8 +73,44 @@ pub const Diff = struct { path: []const u8, staged: bool, orig: ?[]const u8 = nu
 
 const MenuKind = enum { fetch, local, remote };
 
+/// The commit options, in the menu's order (a shortcut after a tab).
+const commit_rows = [_][]const u8{ "Amend\t⌘⇧↵", "Signoff", "Skip Hooks" };
+
+/// The repository as the view is shown it this frame.
+pub const State = struct {
+    snapshot: *const status.Snapshot,
+    /// A reading is on its way.
+    busy: bool = false,
+    /// A pull, push, fetch or switch is running, and what to call it.
+    cmd_running: bool = false,
+    cmd_label: []const u8 = "",
+    /// What the last failed command said.
+    last_error: []const u8 = "",
+};
+
+/// What the user asked git for. Paths are root-relative; every slice is
+/// valid until the view is next drawn or handed input.
+pub const Intent = union(enum) {
+    refresh,
+    fetch_all,
+    push,
+    pull,
+    switch_branch: []const u8,
+    switch_remote: []const u8,
+    stage: []const u8,
+    stage_all,
+    unstage: []const u8,
+    unstage_all,
+    discard: struct { rel: []const u8, untracked: bool },
+    discard_all,
+    /// With `all`, everything is staged first. `committed` is the answer,
+    /// once the commit is made. An amend with no message keeps the last
+    /// commit's own.
+    commit: struct { message: []const u8, all: bool, amend: bool = false, signoff: bool = false, no_verify: bool = false },
+};
+
 /// The colour a path with `kind` gets, in the tree and here.
-pub fn kindColor(kind: git.Kind) Color {
+pub fn kindColor(kind: status.Kind) Color {
     return switch (kind) {
         .untracked, .added => theme.ansi[2],
         .modified => theme.ansi[3],
@@ -70,7 +121,7 @@ pub fn kindColor(kind: git.Kind) Color {
 }
 
 /// The badge letter of a path with `kind` (VS Code's).
-pub fn kindLetter(kind: git.Kind) []const u8 {
+pub fn kindLetter(kind: status.Kind) []const u8 {
     return switch (kind) {
         .untracked => "U",
         .added => "A",
@@ -95,9 +146,10 @@ fn dl_text(ui: *Ui, x: f32, cy: f32, s: []const u8, color: Color) f32 {
     return ui.dl.textCentered(font_badge, x, cy, s, color);
 }
 
-pub const Panel = struct {
+pub const View = struct {
     gpa: std.mem.Allocator,
-    repo: git.Repo,
+    /// What was asked for and not yet taken (`takeIntent`).
+    intent: ?Intent = null,
     /// The commit message as last typed.
     message: std.ArrayList(u8) = .empty,
     focus: field.Focus,
@@ -111,22 +163,29 @@ pub const Panel = struct {
     pending: std.ArrayList(u8) = .empty,
     pending_untracked: bool = false,
     pending_all: bool = false,
+    /// A question is out: `discardConfirmed` has something to answer.
+    pending_asked: bool = false,
     heading_buf: [160]u8 = undefined,
     reason_buf: [200]u8 = undefined,
     /// The absolute path of the row acted on this frame.
     out_path: std.ArrayList(u8) = .empty,
     /// Commit was pressed with no message: said until typing starts.
     need_message: bool = false,
+    /// The commit options in force.
+    amend: bool = false,
+    signoff: bool = false,
+    skip_hooks: bool = false,
+    /// Which menu the app has open for this view.
+    menu_for: enum { branch, commit } = .branch,
     /// The rows of the branch menu last opened, and what each one is.
     menu_items: std.ArrayList([]const u8) = .empty,
     menu_kinds: std.ArrayList(MenuKind) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator) Panel {
-        return .{ .gpa = gpa, .repo = git.Repo.init(gpa), .focus = field.Focus.init(gpa) };
+    pub fn init(gpa: std.mem.Allocator) View {
+        return .{ .gpa = gpa, .focus = field.Focus.init(gpa) };
     }
 
-    pub fn deinit(self: *Panel) void {
-        self.repo.deinit();
+    pub fn deinit(self: *View) void {
         self.focus.deinit();
         self.message.deinit(self.gpa);
         self.pending.deinit(self.gpa);
@@ -136,13 +195,13 @@ pub const Panel = struct {
         self.menu_kinds.deinit(self.gpa);
     }
 
-    fn clearMenu(self: *Panel) void {
+    fn clearMenu(self: *View) void {
         for (self.menu_items.items) |s| self.gpa.free(s);
         self.menu_items.clearRetainingCapacity();
         self.menu_kinds.clearRetainingCapacity();
     }
 
-    fn addMenuRow(self: *Panel, label: []const u8, kind: MenuKind) void {
+    fn addMenuRow(self: *View, label: []const u8, kind: MenuKind) void {
         const owned = self.gpa.dupe(u8, label) catch return;
         self.menu_items.append(self.gpa, owned) catch {
             self.gpa.free(owned);
@@ -156,8 +215,8 @@ pub const Panel = struct {
 
     /// Builds the branch menu: "Fetch All", the local branches (the
     /// current one ticked), then the remote branches with no local one.
-    fn openBranchMenu(self: *Panel, x: f32, y: f32) Menu {
-        const s = &self.repo.snapshot;
+    fn openBranchMenu(self: *View, s: *const status.Snapshot, x: f32, y: f32) Menu {
+        self.menu_for = .branch;
         self.clearMenu();
         self.addMenuRow("Fetch All", .fetch);
         var checked: ?usize = null;
@@ -173,135 +232,168 @@ pub const Panel = struct {
         return .{ .items = self.menu_items.items, .checked = checked, .sep_after = 0, .x = x, .y = y };
     }
 
-    /// Row `i` of the branch menu was picked.
-    pub fn menuPicked(self: *Panel, i: usize) void {
-        if (i >= self.menu_kinds.items.len) return;
-        switch (self.menu_kinds.items[i]) {
-            .fetch => self.repo.fetchAll(),
-            .local => self.repo.switchBranch(self.menu_items.items[i]),
-            .remote => self.repo.switchRemote(self.menu_items.items[i]),
+    /// The commit options as a menu, the ones in force ticked.
+    fn openCommitMenu(self: *View, x: f32, y: f32) Menu {
+        self.menu_for = .commit;
+        var checks: u64 = 0;
+        if (self.amend) checks |= 1;
+        if (self.signoff) checks |= 2;
+        if (self.skip_hooks) checks |= 4;
+        return .{ .items = &commit_rows, .checked = null, .checks = checks, .sep_after = null, .x = x, .y = y };
+    }
+
+    /// ⌘⇧↵: turns Amend on, and commits when it already is.
+    pub fn amendKey(self: *View, s: *const status.Snapshot) void {
+        if (!self.amend) {
+            self.amend = true;
+            self.need_message = false;
+            return;
         }
+        self.syncMessage();
+        self.commitNow(s);
     }
 
-    pub fn setDir(self: *Panel, dir: []const u8) void {
-        self.repo.setDir(dir);
+    /// Row `i` of the menu the app opened for this view was picked.
+    pub fn menuPicked(self: *View, i: usize) void {
+        if (self.menu_for == .commit) {
+            switch (i) {
+                0 => self.amend = !self.amend,
+                1 => self.signoff = !self.signoff,
+                2 => self.skip_hooks = !self.skip_hooks,
+                else => {},
+            }
+            if (self.amend) self.need_message = false;
+            return;
+        }
+        if (i >= self.menu_kinds.items.len) return;
+        self.intent = switch (self.menu_kinds.items[i]) {
+            .fetch => .fetch_all,
+            .local => .{ .switch_branch = self.menu_items.items[i] },
+            .remote => .{ .switch_remote = self.menu_items.items[i] },
+        };
     }
 
-    /// Whether `dir` is inside the repository last read.
-    pub fn isRepoFor(self: *const Panel, dir: []const u8) bool {
-        return self.repo.isRepoFor(dir);
+    /// What was asked for since the last call, once.
+    pub fn takeIntent(self: *View) ?Intent {
+        defer self.intent = null;
+        return self.intent;
     }
 
-    /// Everything the lists would show.
-    pub fn changeCount(self: *const Panel) u32 {
-        const s = &self.repo.snapshot;
-        return s.staged_count + s.unstaged_count + s.conflict_count;
-    }
-
-    /// Background readings and the caret blink; true when a redraw is needed.
-    pub fn tick(self: *Panel, now: f64) bool {
-        const fresh = self.repo.tick(now);
-        const blink = self.focus.tick(now);
-        return fresh or blink;
+    /// The caret blink; true when a redraw is needed.
+    pub fn tick(self: *View, now: f64) bool {
+        return self.focus.tick(now);
     }
 
     // ── keyboard, routed by the app while the message field is focused ──
-    pub fn hasFocus(self: *const Panel) bool {
+    pub fn hasFocus(self: *const View) bool {
         return self.focus.active();
     }
 
-    pub fn onText(self: *Panel, utf8: []const u8) void {
+    pub fn onText(self: *View, utf8: []const u8) void {
         self.focus.onText(utf8);
         self.need_message = false;
     }
 
-    pub fn onMarkedText(self: *Panel, utf8: []const u8) void {
+    pub fn onMarkedText(self: *View, utf8: []const u8) void {
         self.focus.onMarkedText(utf8);
     }
 
-    pub fn paste(self: *Panel, utf8: []const u8) void {
+    pub fn paste(self: *View, utf8: []const u8) void {
         self.focus.paste(utf8);
         self.need_message = false;
     }
 
     /// ↵ commits; the rest edits the message (Esc gives the focus up).
-    pub fn onEdit(self: *Panel, cmd: EditCommand) void {
+    pub fn onEdit(self: *View, cmd: EditCommand, s: *const status.Snapshot) void {
         switch (cmd) {
             .insert_newline, .insert_line_break => {
                 self.syncMessage();
-                self.commitNow();
+                self.commitNow(s);
             },
             else => _ = self.focus.onEdit(cmd),
         }
     }
 
-    pub fn onCtrl(self: *Panel, key: u8) void {
+    pub fn onCtrl(self: *View, key: u8) void {
         _ = self.focus.onCtrl(key);
     }
 
-    pub fn copy(self: *Panel, out: *std.ArrayList(u8), cut: bool) bool {
+    pub fn copy(self: *View, out: *std.ArrayList(u8), cut: bool) bool {
         return self.focus.copy(out, cut);
     }
 
-    pub fn hasMarkedText(self: *const Panel) bool {
+    pub fn hasMarkedText(self: *const View) bool {
         return self.focus.hasMarkedText();
     }
 
     /// Gives the keyboard up (the message typed so far is kept).
-    pub fn dropFocus(self: *Panel) void {
+    pub fn dropFocus(self: *View) void {
         self.syncMessage();
         self.focus.drop();
     }
 
-    pub fn caretRect(self: *const Panel) Rect {
+    pub fn caretRect(self: *const View) Rect {
         return if (self.focus.active()) self.focus.caret else .{};
     }
 
-    fn syncMessage(self: *Panel) void {
+    fn syncMessage(self: *View) void {
         if (!self.focus.active() or !self.focus.changed()) return;
         self.message.clearRetainingCapacity();
         self.message.appendSlice(self.gpa, self.focus.editor.bytes()) catch {};
         self.focus.markSynced();
     }
 
-    fn takeFocus(self: *Panel, now: f64) void {
+    fn takeFocus(self: *View, now: f64) void {
         self.focus.take(field_id, self.message.items, now);
         // Typing carries on at the end rather than replacing the message.
         self.focus.editor.setCursor(self.message.items.len, false);
     }
 
     // ── commands ────────────────────────────────────────────────────────
-    fn commitNow(self: *Panel) void {
-        const s = &self.repo.snapshot;
+    fn commitNow(self: *View, s: *const status.Snapshot) void {
         const msg = std.mem.trim(u8, self.message.items, " \t\r\n");
-        if (s.staged_count + s.unstaged_count == 0) return;
-        if (msg.len == 0) {
+        // An amend needs neither a change nor a message: it can be for the message alone.
+        if (!self.amend and s.staged_count + s.unstaged_count == 0) return;
+        if (msg.len == 0 and !self.amend) {
             self.need_message = true;
             return;
         }
-        if (self.repo.commit(msg, s.staged_count == 0)) {
-            self.message.clearRetainingCapacity();
-            if (self.focus.active()) self.focus.take(field_id, "", self.focus.blink_t0);
-        }
+        self.intent = .{ .commit = .{
+            .message = msg,
+            .all = !self.amend and s.staged_count == 0,
+            .amend = self.amend,
+            .signoff = self.signoff,
+            .no_verify = self.skip_hooks,
+        } };
     }
 
-    /// The box was accepted: runs the discard that waited for it.
-    pub fn discardConfirmed(self: *Panel) void {
+    /// The commit asked for was made: the message has done its job, and
+    /// so has Amend.
+    pub fn committed(self: *View) void {
+        self.amend = false;
+        self.message.clearRetainingCapacity();
+        if (self.focus.active()) self.focus.take(field_id, "", self.focus.blink_t0);
+    }
+
+    /// The box was accepted: asks for the discard that waited for it.
+    pub fn discardConfirmed(self: *View) void {
+        if (!self.pending_asked) return;
+        self.pending_asked = false;
         if (self.pending_all) {
-            _ = self.repo.discardAll();
+            self.intent = .discard_all;
         } else if (self.pending.items.len > 0) {
-            _ = self.repo.discard(self.pending.items, self.pending_untracked);
+            self.intent = .{ .discard = .{ .rel = self.pending.items, .untracked = self.pending_untracked } };
         }
-        self.pending.clearRetainingCapacity();
         self.pending_all = false;
     }
 
-    fn askDiscard(self: *Panel, e: git.Entry) Confirm {
+    fn askDiscard(self: *View, e: status.Entry) Confirm {
         self.pending.clearRetainingCapacity();
         self.pending.appendSlice(self.gpa, e.path) catch {};
         self.pending_untracked = e.untracked();
         self.pending_all = false;
-        const name = sys.basename(e.path);
+        self.pending_asked = true;
+        const name = status.baseName(e.path);
         const heading = std.fmt.bufPrint(&self.heading_buf, "Discard changes in “{s}”?", .{name}) catch "Discard changes?";
         const reason = if (e.untracked())
             "The file is not in git yet: it is deleted. This cannot be undone."
@@ -312,10 +404,10 @@ pub const Panel = struct {
         return .{ .heading = heading, .reason = reason };
     }
 
-    fn askDiscardAll(self: *Panel) Confirm {
-        const s = &self.repo.snapshot;
+    fn askDiscardAll(self: *View, s: *const status.Snapshot) Confirm {
         self.pending.clearRetainingCapacity();
         self.pending_all = true;
+        self.pending_asked = true;
         var untracked: u32 = 0;
         for (s.entries.items) |e| {
             if (e.untracked()) untracked += 1;
@@ -330,10 +422,10 @@ pub const Panel = struct {
 
     // ── drawing ─────────────────────────────────────────────────────────
     /// Draws the view in `rect` (under the panel's Files / Git strip).
-    pub fn draw(self: *Panel, ui: *Ui, rect: Rect) Result {
+    pub fn draw(self: *View, ui: *Ui, rect: Rect, state: State) Result {
         var res: Result = .{};
         const dl = ui.dl;
-        const s = &self.repo.snapshot;
+        const s = state.snapshot;
         self.syncMessage();
 
         var y = rect.y;
@@ -348,13 +440,13 @@ pub const Panel = struct {
             const rr: Rect = .{ .x = right - small, .y = row.centerY() - small / 2, .w = small, .h = small };
             const st = ui.button(Ui.id("git.refresh", 0), rr);
             ui.feedback(rr, 6, st);
-            dl.icon(.reload, rr.x + 4, rr.y + 4, 14, if (self.repo.busy()) theme.text_3.alpha(0.5) else if (st.hover) theme.text else theme.text_3);
-            if (st.clicked) self.repo.refreshSoon();
+            dl.icon(.reload, rr.x + 4, rr.y + 4, 14, if (state.busy) theme.text_3.alpha(0.5) else if (st.hover) theme.text else theme.text_3);
+            if (st.clicked) self.intent = .refresh;
             right = rr.x - 6;
-            const can_push = s.isRepo() and !s.unborn and !s.detached and !self.repo.cmdRunning();
-            if (self.countButton(ui, Ui.id("git.push", 0), &right, row, .push, s.ahead, can_push)) self.repo.push();
-            const can_pull = s.isRepo() and s.upstream.len > 0 and !self.repo.cmdRunning();
-            if (self.countButton(ui, Ui.id("git.pull", 0), &right, row, .pull, s.behind, can_pull)) self.repo.pull();
+            const can_push = s.isRepo() and !s.unborn and !s.detached and !state.cmd_running;
+            if (self.countButton(ui, Ui.id("git.push", 0), &right, row, .push, s.ahead, can_push)) self.intent = .push;
+            const can_pull = s.isRepo() and s.upstream.len > 0 and !state.cmd_running;
+            if (self.countButton(ui, Ui.id("git.pull", 0), &right, row, .pull, s.behind, can_pull)) self.intent = .pull;
             right -= 4;
 
             // The branch is a button: its menu fetches and switches.
@@ -369,7 +461,7 @@ pub const Panel = struct {
             lx += name_w + 4;
             dl.icon(.chevron_down, lx, row.centerY() - 7, 14, if (bst.hover) theme.text else theme.text_3);
             lx += 14 + 10;
-            if (bst.clicked and s.isRepo()) res.menu = self.openBranchMenu(br.x, br.bottom() + 4);
+            if (bst.clicked and s.isRepo()) res.menu = self.openBranchMenu(s, br.x, br.bottom() + 4);
             var hint_buf: [48]u8 = undefined;
             const hint: []const u8 = if (s.unborn)
                 "no commits yet"
@@ -388,7 +480,7 @@ pub const Panel = struct {
         // The message.
         {
             const fr: Rect = .{ .x = x, .y = y, .w = w, .h = field.height };
-            const fres = field.draw(ui, &self.focus, field_id, fr, self.message.items, .{ .placeholder = "Message (↵ to commit)", .font = theme.font_side });
+            const fres = field.draw(ui, &self.focus, field_id, fr, self.message.items, .{ .placeholder = if (self.amend) "Empty keeps the last message" else "Message (↵ to commit)", .font = theme.font_side });
             if (fres.clicked) self.takeFocus(ui.now);
             // A press anywhere else gives the focus up.
             if (ui.pressed and self.focus.active() and !ui.mouseIn(fr)) {
@@ -401,19 +493,13 @@ pub const Panel = struct {
 
         // Commit.
         {
-            const can = s.staged_count + s.unstaged_count > 0;
-            const label: []const u8 = if (s.staged_count == 0 and s.unstaged_count > 0) "Commit All" else "Commit";
-            const br: Rect = .{ .x = x, .y = y, .w = w, .h = button_h };
-            const st = ui.button(Ui.id("git.commit", 0), br);
-            const fill = if (!can) theme.accent.alpha(0.35) else if (st.held) Color.mix(theme.accent, theme.on_accent, 0.15) else if (st.hover) Color.mix(theme.accent, theme.text, 0.12) else theme.accent;
-            dl.rrect(br, 8, fill);
-            const lw = ui.text.measure(theme.font_ui_medium, label);
-            const cx = br.x + (br.w - lw - 20) / 2;
-            const ink = if (can) theme.on_accent else theme.on_accent.alpha(0.7);
-            dl.icon(.check, cx, br.centerY() - 8, 16, ink);
-            _ = dl.textCentered(theme.font_ui_medium, cx + 20, br.centerY(), label, ink);
-            if (st.clicked and can) {
-                self.commitNow();
+            const can = self.amend or s.staged_count + s.unstaged_count > 0;
+            const label: []const u8 = if (self.amend) "Amend" else if (s.staged_count == 0 and s.unstaged_count > 0) "Commit All" else "Commit";
+            // One button: the arrow inside its right end opens the commit's options.
+            const split = kit.splitButton(ui, Ui.id("git.commit", 0), Ui.id("git.commit_options", 0), .{ .x = x, .y = y, .w = w, .h = button_h }, label, .check, theme.font_ui_medium, can);
+            if (split.arrow) res.menu = self.openCommitMenu(split.arrow_rect.right() - 200, split.arrow_rect.bottom() + 4);
+            if (split.clicked) {
+                self.commitNow(s);
                 if (self.need_message and !self.focus.active()) self.takeFocus(ui.now);
             }
             y += button_h + 6;
@@ -421,11 +507,11 @@ pub const Panel = struct {
 
         // What is under way, or what went wrong.
         {
-            if (self.repo.cmd_label.len > 0) {
-                _ = dl.textEllipsis(theme.font_hint, x, y + 10, self.repo.cmd_label, w, theme.text_3);
+            if (state.cmd_label.len > 0) {
+                _ = dl.textEllipsis(theme.font_hint, x, y + 10, state.cmd_label, w, theme.text_3);
                 y += 20;
             } else {
-                const err: []const u8 = if (self.need_message) "A commit message is needed." else self.repo.last_error.items;
+                const err: []const u8 = if (self.need_message) "A commit message is needed." else state.last_error;
                 if (err.len > 0) {
                     _ = dl.textEllipsis(theme.font_hint, x, y + 10, err, w, theme.red);
                     y += 20;
@@ -442,22 +528,21 @@ pub const Panel = struct {
         defer dl.popClip();
         var cy = area.y - self.scroll;
         const top = cy;
-        if (self.changeCount() == 0) {
+        if (s.staged_count + s.unstaged_count + s.conflict_count == 0) {
             _ = dl.textEllipsis(theme.font_hint, x, cy + 14, if (s.isRepo()) "No changes" else "Not a git repository", w, theme.text_3);
             cy += 28;
         } else {
-            if (s.conflict_count > 0) self.drawSection(ui, rect, .merge, &cy, &res);
-            if (s.staged_count > 0) self.drawSection(ui, rect, .staged, &cy, &res);
-            if (s.unstaged_count > 0) self.drawSection(ui, rect, .changes, &cy, &res);
+            if (s.conflict_count > 0) self.drawSection(ui, rect, s, .merge, &cy, &res);
+            if (s.staged_count > 0) self.drawSection(ui, rect, s, .staged, &cy, &res);
+            if (s.unstaged_count > 0) self.drawSection(ui, rect, s, .changes, &cy, &res);
         }
         self.content_h = (cy - top) + 12;
         if (max_scroll > 0) sidebar.drawScrollbar(ui, area, self.scroll, self.content_h);
         return res;
     }
 
-    fn drawSection(self: *Panel, ui: *Ui, panel: Rect, section: Section, y: *f32, res: *Result) void {
+    fn drawSection(self: *View, ui: *Ui, panel: Rect, s: *const status.Snapshot, section: Section, y: *f32, res: *Result) void {
         const dl = ui.dl;
-        const s = &self.repo.snapshot;
         const open = switch (section) {
             .merge => &self.merge_open,
             .staged => &self.staged_open,
@@ -492,14 +577,14 @@ pub const Panel = struct {
         if (hovered) {
             switch (section) {
                 .staged => if (self.smallButton(ui, Ui.id("git.unstage_all", sid), &right, row, .minus)) {
-                    _ = self.repo.unstageAll();
+                    self.intent = .unstage_all;
                 },
                 .changes => {
-                    if (self.smallButton(ui, Ui.id("git.stage_all", sid), &right, row, .plus)) _ = self.repo.stageAll();
-                    if (self.smallButton(ui, Ui.id("git.discard_all", sid), &right, row, .undo)) res.confirm = self.askDiscardAll();
+                    if (self.smallButton(ui, Ui.id("git.stage_all", sid), &right, row, .plus)) self.intent = .stage_all;
+                    if (self.smallButton(ui, Ui.id("git.discard_all", sid), &right, row, .undo)) res.confirm = self.askDiscardAll(s);
                 },
                 .merge => if (self.smallButton(ui, Ui.id("git.stage_all", sid), &right, row, .plus)) {
-                    _ = self.repo.stageAll();
+                    self.intent = .stage_all;
                 },
             }
         }
@@ -517,11 +602,11 @@ pub const Panel = struct {
                 .changes => e.unstaged(),
             };
             if (!in_section) continue;
-            self.drawRow(ui, panel, section, e, i, y, res);
+            self.drawRow(ui, panel, s, section, e, i, y, res);
         }
     }
 
-    fn drawRow(self: *Panel, ui: *Ui, panel: Rect, section: Section, e: git.Entry, i: usize, y: *f32, res: *Result) void {
+    fn drawRow(self: *View, ui: *Ui, panel: Rect, s: *const status.Snapshot, section: Section, e: status.Entry, i: usize, y: *f32, res: *Result) void {
         const dl = ui.dl;
         const clip = dl.currentClip();
         const row: Rect = .{ .x = panel.x + 6, .y = y.*, .w = panel.w - 12, .h = row_h };
@@ -542,14 +627,14 @@ pub const Panel = struct {
         if (hovered) {
             switch (section) {
                 .staged => if (self.smallButton(ui, Ui.id("git.unstage", key), &right, row, .minus)) {
-                    _ = self.repo.unstage(e.path);
+                    self.intent = .{ .unstage = e.path };
                 },
                 .changes => {
-                    if (self.smallButton(ui, Ui.id("git.stage", key), &right, row, .plus)) _ = self.repo.stage(e.path);
+                    if (self.smallButton(ui, Ui.id("git.stage", key), &right, row, .plus)) self.intent = .{ .stage = e.path };
                     if (self.smallButton(ui, Ui.id("git.discard", key), &right, row, .undo)) res.confirm = self.askDiscard(e);
                 },
                 .merge => if (self.smallButton(ui, Ui.id("git.stage", key), &right, row, .plus)) {
-                    _ = self.repo.stage(e.path);
+                    self.intent = .{ .stage = e.path };
                 },
             }
         }
@@ -557,8 +642,8 @@ pub const Panel = struct {
         ui.feedback(row, 6, st);
 
         // The name, then where it is.
-        const name = sys.basename(e.path);
-        const dir = sys.dirname(e.path);
+        const name = status.baseName(e.path);
+        const dir = status.dirName(e.path);
         var lx = row.x + 28;
         const name_color = if (letter == 'D') theme.text_3 else theme.text;
         const nw = dl.textEllipsis(theme.font_side, lx, row.centerY(), name, @max(0, right - lx), name_color);
@@ -566,9 +651,9 @@ pub const Panel = struct {
         if (!std.mem.eql(u8, dir, ".") and lx < right) _ = dl.textEllipsis(theme.font_hint, lx, row.centerY(), dir, right - lx, theme.text_3);
 
         // A folder git lists as one row (all of it new) has no two sides.
-        if (st.clicked and !e.is_dir and self.repo.snapshot.isRepo()) {
+        if (st.clicked and !e.is_dir and s.isRepo()) {
             self.out_path.clearRetainingCapacity();
-            self.out_path.appendSlice(self.gpa, self.repo.snapshot.root) catch return;
+            self.out_path.appendSlice(self.gpa, s.root) catch return;
             self.out_path.append(self.gpa, '/') catch return;
             self.out_path.appendSlice(self.gpa, e.path) catch return;
             res.open_diff = .{ .path = self.out_path.items, .staged = section == .staged, .orig = if (section == .staged) e.orig else null };
@@ -577,7 +662,7 @@ pub const Panel = struct {
 
     /// An icon button with a count beside it (push: commits ahead, pull:
     /// behind); dim and inert when `enabled` is false. Moves `right` past it.
-    fn countButton(_: *Panel, ui: *Ui, wid: u64, right: *f32, row: Rect, icon: @import("../gfx/icons.zig").Icon, count: u32, enabled: bool) bool {
+    fn countButton(_: *View, ui: *Ui, wid: u64, right: *f32, row: Rect, icon: icons.Icon, count: u32, enabled: bool) bool {
         var buf: [16]u8 = undefined;
         const n: []const u8 = if (count > 0) std.fmt.bufPrint(&buf, "{d}", .{count}) catch "" else "";
         const nw: f32 = if (n.len > 0) ui.text.measure(font_badge, n) + 2 else 0;
@@ -597,7 +682,7 @@ pub const Panel = struct {
     }
 
     /// A 22pt icon button at the right end of a row; moves `right` past it.
-    fn smallButton(_: *Panel, ui: *Ui, wid: u64, right: *f32, row: Rect, icon: @import("../gfx/icons.zig").Icon) bool {
+    fn smallButton(_: *View, ui: *Ui, wid: u64, right: *f32, row: Rect, icon: icons.Icon) bool {
         const r: Rect = .{ .x = right.* - small, .y = row.centerY() - small / 2, .w = small, .h = small };
         const st = ui.button(wid, r);
         ui.feedback(r, 6, st);

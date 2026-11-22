@@ -1,0 +1,8 @@
+{
+  "state": "pending", "sha": "6f6fc36000000000000000000000000000000000", "total_count": 2,
+  "statuses": [
+    {"id": 1, "status": "success", "description": "Has passed", "url": "", "target_url": "https://ci.example.invalid/1", "context": "ci/build", "creator": null, "created_at": "2026-11-21T18:40:00Z", "updated_at": "2026-11-21T18:42:14Z"},
+    {"id": 2, "status": "pending", "description": "Is running", "url": "", "target_url": "https://ci.example.invalid/2", "context": "ci/e2e", "creator": null, "created_at": "2026-11-21T18:40:00Z", "updated_at": "2026-11-21T18:40:00Z"}
+  ],
+  "repository": {"id": 9, "name": "orchard-api", "full_name": "acme/orchard-api"}, "commit_url": "", "url": ""
+}

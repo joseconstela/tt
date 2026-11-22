@@ -49,6 +49,14 @@ pub const Icon = enum(u8) {
     collapse_all,
     expand_all,
     clear_all,
+    // Repository tab.
+    tag,
+    history,
+    pull_request,
+    merge,
+    stash,
+    comment,
+    user,
 };
 
 /// Transparent padding (device px) around every rasterised icon.
@@ -96,6 +104,13 @@ fn pathData(icon: Icon) []const u8 {
         .collapse_all => "M5 5h14v14H5z M9 12h6",
         .expand_all => "M5 5h14v14H5z M9 12h6 M12 9v6",
         .clear_all => "M4 6h11 M4 11h8 M4 16h6 M14 14l6 6 M20 14l-6 6",
+        .tag => "M3 12V4h8l10 10-8 8z M7.5 8.5a1 1 0 1 0 2 0a1 1 0 1 0-2 0",
+        .history => "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18 M12 7v5l3 2",
+        .pull_request => "M6 9a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M6 21a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M18 21a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M6 9v6 M18 15V9a3 3 0 0 0-3-3h-3 M14 3.5L11.5 6 14 8.5",
+        .merge => "M6 9a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M6 21a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M18 15a3 3 0 1 0 0-6a3 3 0 1 0 0 6 M6 9v6 M6 9a9 9 0 0 0 9 3",
+        .stash => "M12 3l9 4.5-9 4.5-9-4.5z M3 12l9 4.5 9-4.5 M3 16.5l9 4.5 9-4.5",
+        .comment => "M5 5h14a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-7l-5 4v-4H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z",
+        .user => "M12 12a4 4 0 1 0 0-8a4 4 0 1 0 0 8 M4.5 20.5a7.5 7.5 0 0 1 15 0",
     };
 }
 

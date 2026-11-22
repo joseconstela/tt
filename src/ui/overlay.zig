@@ -42,7 +42,7 @@ pub const EditMenuOpts = struct {
 
 /// What a confirm box leads to when it is accepted (`close_others` and
 /// `close_right` are the tab menu's "Close Others" / "Close to the Right").
-pub const ConfirmKind = enum { close_tab, close_others, close_right, git_discard, delete_file, search_replace, install_cli, notice };
+pub const ConfirmKind = enum { close_tab, close_others, close_right, git_discard, delete_file, search_replace, install_cli, tab_question, notice };
 
 /// What a files-panel menu is about: a file, a folder, or the folder on
 /// show itself (a click on the panel's blank space).
@@ -108,6 +108,8 @@ pub const Outcome = union(enum) {
     replace_confirmed: void,
     /// The "Install CLI Tools…" box accepted.
     install_cli_confirmed: void,
+    /// A box a tab asked for (`Env.askConfirm`) accepted: the app tells the tab.
+    question_confirmed: void,
     /// A notice was read: nothing follows.
     dismissed: void,
     /// Project menu → "Rename…": open the rename box for this project.
@@ -335,6 +337,8 @@ pub const Overlay = struct {
     // (ticked) and the row a divider follows.
     list_items: std.ArrayList([]u8) = .empty,
     list_checked: ?usize = null,
+    /// Rows ticked besides `list_checked`, a bit each (options that are on).
+    list_checks: u64 = 0,
     list_sep_after: ?usize = null,
     list_scroll: f32 = 0,
 
@@ -479,6 +483,7 @@ pub const Overlay = struct {
         }
         self.mode = .list;
         self.list_checked = checked;
+        self.list_checks = 0;
         self.list_sep_after = sep_after;
         self.list_scroll = 0;
         self.anchor_x = x;
@@ -486,6 +491,14 @@ pub const Overlay = struct {
         self.highlighted = null;
         self.last_mx = -1;
         self.last_my = -1;
+    }
+
+    /// A list menu of options: every row whose bit is set in `checks` is
+    /// ticked (row 0 is bit 0). A row written `Label<tab>Hint` shows the
+    /// hint (its shortcut) at its right.
+    pub fn openListChecks(self: *Overlay, rows: []const []const u8, checks: u64, sep_after: ?usize, x: f32, y: f32) void {
+        self.openList(rows, null, sep_after, x, y);
+        self.list_checks = checks;
     }
 
     /// Whether the pointer moved since the last frame (the first frame
@@ -507,7 +520,7 @@ pub const Overlay = struct {
         if (!self.isOpen() or self.subject != .tab or self.mode == .list) return null;
         if (self.mode == .confirm) switch (self.confirm_kind) {
             .close_tab, .close_others, .close_right => {},
-            .git_discard, .delete_file, .search_replace, .install_cli, .notice => return null,
+            .git_discard, .delete_file, .search_replace, .install_cli, .tab_question, .notice => return null,
         };
         return self.id;
     }
@@ -873,6 +886,7 @@ pub const Overlay = struct {
             .delete_file => .delete_confirmed,
             .search_replace => .replace_confirmed,
             .install_cli => .install_cli_confirmed,
+            .tab_question => .question_confirmed,
             .notice => .dismissed,
             .close_tab => .{ .close_confirmed = uid },
             .close_others => .{ .close_others_confirmed = uid },
@@ -1089,8 +1103,13 @@ pub const Overlay = struct {
         const dl = ui.dl;
         ui.interactive.append(ui.gpa, .{ .x = 0, .y = 0, .w = width, .h = height }) catch {};
         const items_list = self.list_items.items;
+        // A row is its label, and after a tab the hint shown at its right.
         var widest: f32 = 0;
-        for (items_list) |s| widest = @max(widest, ui.text.measure(theme.font_ui, s));
+        for (items_list) |s| {
+            const tab = std.mem.indexOfScalar(u8, s, '\t') orelse s.len;
+            const hint_w: f32 = if (tab < s.len) ui.text.measure(theme.font_hint, s[tab + 1 ..]) + 24 else 0;
+            widest = @max(widest, ui.text.measure(theme.font_ui, s[0..tab]) + hint_w);
+        }
         const w = std.math.clamp(widest + 2 * menu_pad + 30 + 14, menu_w, 340);
         const sep_h: f32 = if (self.list_sep_after != null) 9 else 0;
         const content_h = menu_row_h * @as(f32, @floatFromInt(items_list.len)) + sep_h;
@@ -1136,8 +1155,12 @@ pub const Overlay = struct {
             if (st.held) {
                 dl.rrect(r, 6, theme.pressed);
             } else if (self.highlighted == i) dl.rrect(r, 6, theme.highlight);
-            if (self.list_checked == i) dl.icon(.check, r.x + 8, r.centerY() - 7, 14, theme.accent);
-            _ = dl.textEllipsis(theme.font_ui, r.x + 30, r.centerY(), label, r.w - 36, theme.text);
+            const ticked = self.list_checked == i or (i < 64 and (self.list_checks >> @intCast(i)) & 1 == 1);
+            if (ticked) dl.icon(.check, r.x + 8, r.centerY() - 7, 14, theme.accent);
+            const tab = std.mem.indexOfScalar(u8, label, '\t') orelse label.len;
+            var text_w = r.w - 36;
+            if (tab < label.len) text_w -= dl.textRight(theme.font_hint, r.right() - 8, r.centerY(), label[tab + 1 ..], theme.text_3) + 16;
+            _ = dl.textEllipsis(theme.font_ui, r.x + 30, r.centerY(), label[0..tab], @max(0, text_w), theme.text);
             if (st.clicked) out = self.pickList(i);
             if (self.list_sep_after == i) {
                 dl.rect(.{ .x = r.x + 4, .y = y + 4, .w = r.w - 8, .h = 1 }, theme.line_strong);

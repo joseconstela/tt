@@ -1,0 +1,13 @@
+{
+  "number": 142, "state": "open", "title": "feat(webhooks): delivery with retries and HMAC signing",
+  "html_url": "https://github.com/acme/orchard-api/pull/142",
+  "user": {"login": "mlado", "id": 11},
+  "body": "Queue with exponential retries (1 s to 5 min), DLQ after 8 attempts and HMAC payload signing.\n\nCloses #128.",
+  "labels": [{"name": "backend", "color": "5bd0c0"}],
+  "created_at": "2026-11-19T18:42:00Z", "updated_at": "2026-11-21T18:42:00Z", "merged_at": null,
+  "requested_reviewers": [{"login": "speon"}],
+  "head": {"ref": "feat/webhooks", "sha": "6f6fc36000000000000000000000000000000000"},
+  "base": {"ref": "main", "sha": "661e9c8000000000000000000000000000000000"},
+  "draft": false, "merged": false, "mergeable": true, "rebaseable": true, "mergeable_state": "clean", "merged_by": null,
+  "comments": 5, "review_comments": 3, "maintainer_can_modify": false, "commits": 12, "additions": 640, "deletions": 210, "changed_files": 5
+}

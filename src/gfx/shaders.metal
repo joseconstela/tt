@@ -4,10 +4,12 @@ using namespace metal;
 // One instance = one quad. Must match `Instance` in draw.zig.
 struct Instance {
     float4 rect;         // x, y, w, h   (device pixels, origin top-left)
-    float4 uv;           // u0, v0, u1, v1: atlas texels for kind 1, normalised for kind 2
+    float4 uv;           // u0, v0, u1, v1: atlas texels for kind 1, normalised for kind 2;
+                         // for kind 3 the stroke's two ends (x0, y0, x1, y1 in device pixels)
     float4 color;        // straight-alpha fill / tint
     float4 border_color; // straight-alpha border colour
-    float4 params;       // radius, border width, kind (0 = shape, 1 = atlas mask, 2 = image), unused
+    float4 params;       // radius (kind 3: half the stroke's width), border width,
+                         // kind (0 = shape, 1 = atlas mask, 2 = image, 3 = stroke), unused
     float4 clip;         // x0, y0, x1, y1 clip rectangle (device pixels)
 };
 
@@ -61,6 +63,17 @@ fragment float4 tt_fs(VOut in [[stage_in]],
     if (frag.x < inst.clip.x || frag.y < inst.clip.y ||
         frag.x >= inst.clip.z || frag.y >= inst.clip.w) {
         discard_fragment();
+    }
+
+    if (inst.params.z > 2.5) {
+        // A stroke: how far the fragment is from the segment between its ends.
+        float2 a = inst.uv.xy;
+        float2 ab = inst.uv.zw - a;
+        float2 ap = frag - a;
+        float t = clamp(dot(ap, ab) / max(dot(ab, ab), 0.0001), 0.0, 1.0);
+        float d = length(ap - ab * t) - inst.params.x;
+        float sa = inst.color.a * clamp(0.5 - d, 0.0, 1.0);
+        return float4(inst.color.rgb * sa, sa);
     }
 
     if (inst.params.z > 1.5) {

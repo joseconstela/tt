@@ -32,9 +32,10 @@ test {
     _ = @import("tabs/web_menu.zig");
     _ = @import("platform/notify.zig");
     _ = @import("agent.zig");
-    _ = @import("git.zig");
-    _ = @import("diff.zig");
-    _ = @import("tabs/diff_tab.zig");
+    _ = @import("http.zig");
+    _ = @import("sys.zig");
+    _ = @import("features/repo/repo.zig");
+    _ = @import("features/diff/diff.zig");
     _ = @import("coding_agents.zig");
     _ = @import("agent_cli.zig");
     _ = @import("paths.zig");

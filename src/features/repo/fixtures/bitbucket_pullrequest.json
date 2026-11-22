@@ -1,0 +1,18 @@
+{
+  "comment_count": 8, "task_count": 0, "type": "pullrequest", "id": 142,
+  "title": "feat(webhooks): delivery with retries and HMAC signing", "description": "Queue with exponential retries.",
+  "rendered": {"title": {"type": "rendered", "raw": "t", "markup": "markdown", "html": "<p>t</p>"}},
+  "state": "OPEN", "draft": false, "closed_by": null,
+  "author": {"type": "user", "display_name": "María Lado", "nickname": "mlado"},
+  "created_on": "2026-11-19T18:42:00.000000+00:00", "updated_on": "2026-11-21T18:42:00.123456+00:00",
+  "destination": {"branch": {"name": "main"}, "commit": {"hash": "661e9c8", "type": "commit"}},
+  "source": {"branch": {"name": "feat/webhooks"}, "commit": {"hash": "6f6fc36", "type": "commit"}},
+  "reviewers": [{"display_name": "Anxo Rivas", "type": "user", "nickname": "arivas"}, {"display_name": "Sara Peón", "type": "user", "nickname": "speon"}, {"display_name": "Jose Constela", "type": "user", "nickname": "jconstela"}],
+  "participants": [
+    {"type": "participant", "user": {"display_name": "Anxo Rivas", "type": "user", "nickname": "arivas"}, "role": "REVIEWER", "approved": true, "state": "approved", "participated_on": "2026-11-20T10:00:00.000000+00:00"},
+    {"type": "participant", "user": {"display_name": "Sara Peón", "type": "user", "nickname": "speon"}, "role": "REVIEWER", "approved": false, "state": "changes_requested", "participated_on": "2026-11-20T12:00:00.000000+00:00"},
+    {"type": "participant", "user": {"display_name": "Jose Constela", "type": "user", "nickname": "jconstela"}, "role": "REVIEWER", "approved": false, "state": null, "participated_on": null},
+    {"type": "participant", "user": {"display_name": "María Lado", "type": "user", "nickname": "mlado"}, "role": "PARTICIPANT", "approved": false, "state": null, "participated_on": "2026-11-21T14:00:00.000000+00:00"}
+  ],
+  "summary": {"type": "rendered", "raw": "Queue with exponential retries.", "markup": "markdown", "html": ""}, "queued": false
+}

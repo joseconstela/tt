@@ -30,6 +30,9 @@ CoreText, WebKit, AVFoundation and others are driven straight from Zig through t
   only thing that ever goes out is what you choose to send to an AI agent you configured yourself,
   and with a local model (Ollama) not even that. Nothing is configured out of the box.
   [The full list is below.](#what-stays-local-and-what-does-not)
+- **A git client in a tab.** The commit graph, staging and commits, stashes, and a repository's
+  pull requests on GitHub, GitLab, Bitbucket or Gitea. Pull requests are the one part that talks
+  to a server: only after you add an account for that host, and only to that host.
 - **Block-based terminal,** yet compatible with AI agents. Built in support for "fix with agent", explain, etc.
 - **An input box, not a prompt.** You can enter both commands or plain text asking for a commant to run.
 - **Projects.** Add a folder to the sidebar and it becomes a project with tabs of its own. Arrange tabs, split and arrange them, pin files, and others.
@@ -120,12 +123,20 @@ tt keeps its state in three plain files in your home directory, and nowhere else
 
 | File | Holds |
 | --- | --- |
-| `~/.tt/config.yml` | Style, accent, a style per display, the model APIs you added (name, provider, model, key, base URL), which features use them, notebook options |
+| `~/.tt/config.yml` | Style, accent, a style per display, the model APIs you added (name, provider, model, key, base URL), which features use them, notebook options, and the git hosting accounts you added (host, kind, and a token or the tool that keeps it) |
 | `~/.tt_projects` | Your projects, their pinned files and shell groups |
 | `~/.tt_workspace` | Open tabs, pane layout, each shell's directory and its blocks, each notebook's outputs |
 
 The config file is readable YAML meant to be edited by hand. It also holds your API keys in the
-clear, so treat it like any other credentials file.
+clear, and a hosting token if you paste one there, so treat it like any other credentials file.
+A hosting account can instead take its token from `gh`, `glab` or git's credential helper when it
+is needed, which keeps it out of the file.
+
+What goes out, all of it at your asking: what you send to an AI agent you configured; the pages
+you open in website tabs; what git itself fetches and pushes; and, for a repository whose host you
+added an account for (Settings › Git › Hosting), the requests that list its pull requests and do
+what you ask with them, sent to that host and to nothing else. A repository's history, changes and
+diffs, a pull request's included, are read with git on this Mac.
 
 There is no crash reporter, no usage ping and no "check for updates".
 

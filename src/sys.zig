@@ -25,6 +25,13 @@ pub extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, size: usize) isize;
 pub extern "c" fn symlink(target: [*:0]const u8, link: [*:0]const u8) c_int;
 pub extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
 
+extern "c" fn time(out: ?*c_long) c_long;
+
+/// The time of day, in seconds since the epoch.
+pub fn wallClock() i64 {
+    return @intCast(time(null));
+}
+
 pub fn getenv(name: [*:0]const u8) ?[]const u8 {
     const v = c.getenv(name) orelse return null;
     return std.mem.span(v);
@@ -346,6 +353,21 @@ pub fn run(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, ex
 /// `run` for a command that may take long: with a `watch`, the command
 /// gets a process group of its own and `watch.stop()` ends it.
 pub fn runWatched(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, extra_env: []const []const u8, watch: ?*Watch) !RunResult {
+    return runCore(gpa, cwd, argv, extra_env, watch, null);
+}
+
+/// The most `runWithInput` hands a command: what a pipe takes in one go,
+/// so the write never waits for the command to read.
+pub const max_input = 4096;
+
+/// `run` for a command that reads its question from stdin (`git
+/// credential fill`): `input` is written to it and stdin then closed.
+pub fn runWithInput(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, extra_env: []const []const u8, input: []const u8) !RunResult {
+    if (input.len > max_input) return error.InputTooLong;
+    return runCore(gpa, cwd, argv, extra_env, null, input);
+}
+
+fn runCore(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const u8, extra_env: []const []const u8, watch: ?*Watch, input: ?[]const u8) !RunResult {
     if (argv.len == 0) return error.NoCommand;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -381,10 +403,20 @@ pub fn runWatched(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const
         return error.PipeFailed;
     }
 
+    var in_pipe: [2]c.fd_t = .{ -1, -1 };
+    if (input != null and c.pipe(&in_pipe) != 0) {
+        for ([_]c.fd_t{ out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1] }) |fd| _ = c.close(fd);
+        return error.PipeFailed;
+    }
+
     var actions: c.posix_spawn_file_actions_t = undefined;
     _ = c.posix_spawn_file_actions_init(&actions);
     defer _ = c.posix_spawn_file_actions_destroy(&actions);
-    _ = c.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", 0, 0);
+    if (input != null) {
+        _ = c.posix_spawn_file_actions_adddup2(&actions, in_pipe[0], 0);
+    } else {
+        _ = c.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", 0, 0);
+    }
     _ = c.posix_spawn_file_actions_adddup2(&actions, out_pipe[1], 1);
     _ = c.posix_spawn_file_actions_adddup2(&actions, err_pipe[1], 2);
     _ = c.posix_spawn_file_actions_addchdir_np(&actions, cwd_z.ptr);
@@ -405,7 +437,27 @@ pub fn runWatched(gpa: std.mem.Allocator, cwd: []const u8, argv: []const []const
     if (rc != 0) {
         _ = c.close(out_pipe[0]);
         _ = c.close(err_pipe[0]);
+        if (input != null) {
+            _ = c.close(in_pipe[0]);
+            _ = c.close(in_pipe[1]);
+        }
         return error.SpawnFailed;
+    }
+    if (input) |bytes| {
+        // Our read end stays open until the bytes are in, so a command
+        // that exited at once cannot turn the write into a SIGPIPE; they
+        // fit the pipe's buffer (`max_input`), so the write does not wait.
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            const n = c.write(in_pipe[1], bytes.ptr + sent, bytes.len - sent);
+            if (n <= 0) {
+                if (n < 0 and __error().* == EINTR) continue;
+                break;
+            }
+            sent += @intCast(n);
+        }
+        _ = c.close(in_pipe[1]);
+        _ = c.close(in_pipe[0]);
     }
     if (watch) |w| {
         w.pid.store(pid, .seq_cst);
@@ -468,4 +520,19 @@ fn overridden(entry: []const u8, extra: []const []const u8) bool {
         if (std.mem.startsWith(u8, e, entry[0 .. eq + 1])) return true;
     }
     return false;
+}
+
+test "a command fed its input" {
+    const gpa = std.testing.allocator;
+    var res = try runWithInput(gpa, "/", &.{"cat"}, &.{}, "protocol=https\nhost=example.invalid\n\n");
+    defer res.deinit();
+    try std.testing.expect(res.ok());
+    try std.testing.expectEqualStrings("protocol=https\nhost=example.invalid\n\n", res.stdout);
+    // A command that never reads does not hang the write or raise a signal.
+    var ignored = try runWithInput(gpa, "/", &.{"true"}, &.{}, "unread");
+    defer ignored.deinit();
+    try std.testing.expect(ignored.ok());
+    var plain = try run(gpa, "/", &.{ "sh", "-c", "cat; echo done" }, &.{});
+    defer plain.deinit();
+    try std.testing.expectEqualStrings("done\n", plain.stdout);
 }

@@ -10,7 +10,7 @@
 //! the view along. Only the visible lines are lexed and drawn, every frame,
 //! from the document's per-line syntax state.
 //!
-//! A comparison (`diff_tab.zig`) shows one side of itself in an editor: it
+//! A comparison (the `diff` feature) shows one side of itself in an editor: it
 //! hands over the number each row carries in the gutter (`numbers`) and
 //! how each row is marked (`marks`: a tint for a line that went or came,
 //! with the part that changed picked out).

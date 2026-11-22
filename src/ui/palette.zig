@@ -177,6 +177,8 @@ const commands = [_]Command{
     .{ .prefix = "Edit:", .label = "Undo", .kbd = "⌘Z", .action = .undo },
     .{ .prefix = "Edit:", .label = "Redo", .kbd = "⌘⇧Z", .action = .redo },
     .{ .prefix = "View:", .label = "Markdown: switch preview / source", .kbd = "⌘E", .action = .toggle_view },
+    .{ .prefix = "Git:", .label = "Open repository", .kbd = "", .action = .open_repository },
+    .{ .prefix = "Git:", .label = "Amend last commit", .kbd = "⌘⇧↵", .action = .commit_amend },
     .{ .prefix = "Settings:", .label = "Open settings", .kbd = "⌘,", .action = .open_settings },
     .{ .prefix = "tt:", .label = "Install CLI tools…", .kbd = "", .action = .install_cli },
     .{ .prefix = "Page:", .label = "Open location", .kbd = "⌘L", .action = .open_location },

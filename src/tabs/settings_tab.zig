@@ -12,6 +12,7 @@ const icons = @import("../gfx/icons.zig");
 const config = @import("../config.zig");
 const appearance = @import("../appearance.zig");
 const apis_mod = @import("settings_apis.zig");
+const repo = @import("../features/repo/repo.zig");
 const coding_mod = @import("settings_coding_agents.zig");
 const features_mod = @import("settings_features.zig");
 const browser_mod = @import("settings_browser.zig");
@@ -43,6 +44,8 @@ pub const Page = enum {
     media,
     /// … and desktop notifications.
     notifications,
+    /// Accounts on git hosts, for pull requests (the `repo` feature).
+    hosting,
 
     pub fn label(self: Page) []const u8 {
         return switch (self) {
@@ -56,6 +59,7 @@ pub const Page = enum {
             .privacy => "Privacy",
             .media => "Camera & microphone",
             .notifications => "Notifications",
+            .hosting => "Hosting",
         };
     }
 
@@ -71,6 +75,7 @@ pub const Page = enum {
             .privacy => .lock,
             .media => .camera,
             .notifications => .bell,
+            .hosting => .pull_request,
         };
     }
 
@@ -87,13 +92,14 @@ pub const Page = enum {
             .privacy => "What websites may keep, and what tt asks of them.",
             .media => "Which websites may use the camera and the microphone, for calls in a tab.",
             .notifications => "Desktop notifications from websites, with each site's icon.",
+            .hosting => "Your accounts on GitHub, GitLab, Bitbucket and Gitea, for pull requests.",
         };
     }
 
     /// False while the page only says "coming up soon".
     pub fn ready(self: Page) bool {
         return switch (self) {
-            .style, .mode, .apis, .agents, .features, .browser, .privacy, .media, .notifications => true,
+            .style, .mode, .apis, .agents, .features, .browser, .privacy, .media, .notifications, .hosting => true,
             .mcps => false,
         };
     }
@@ -118,6 +124,7 @@ pub const sections = [_]Section{
     .{ .title = "UI", .pages = &.{ .style, .mode } },
     .{ .title = "AI", .pages = &.{ .apis, .agents, .mcps, .features } },
     .{ .title = "Browser", .pages = &.{ .browser, .privacy, .media, .notifications } },
+    .{ .title = "Git", .pages = &.{.hosting} },
 };
 
 pub const SettingsTab = struct {
@@ -134,6 +141,7 @@ pub const SettingsTab = struct {
     browser: browser_mod.Page,
     media: perms_mod.MediaPage,
     notifications: perms_mod.NotificationsPage,
+    hosting: repo.SettingsPage,
     /// The page drawn last frame: a switch resets the scroll and the focus.
     shown: Page = .style,
     /// The Style page's dropdowns.
@@ -145,7 +153,7 @@ pub const SettingsTab = struct {
 
     pub fn create(env: *tab_mod.Env, _: tab_mod.OpenArgs) anyerror!tab_mod.Tab {
         const self = try env.gpa.create(SettingsTab);
-        self.* = .{ .gpa = env.gpa, .apis = apis_mod.Page.init(env.gpa), .agents = coding_mod.Page.init(env.gpa), .features = features_mod.Page.init(env.gpa), .browser = browser_mod.Page.init(env.gpa), .media = perms_mod.MediaPage.init(env.gpa), .notifications = perms_mod.NotificationsPage.init() };
+        self.* = .{ .gpa = env.gpa, .apis = apis_mod.Page.init(env.gpa), .agents = coding_mod.Page.init(env.gpa), .features = features_mod.Page.init(env.gpa), .browser = browser_mod.Page.init(env.gpa), .media = perms_mod.MediaPage.init(env.gpa), .notifications = perms_mod.NotificationsPage.init(), .hosting = repo.SettingsPage.init(env.gpa) };
         return tab_mod.Tab.from(SettingsTab, self);
     }
 
@@ -155,6 +163,7 @@ pub const SettingsTab = struct {
         self.features.deinit();
         self.browser.deinit();
         self.media.deinit();
+        self.hosting.deinit();
         self.gpa.destroy(self);
     }
 
@@ -177,6 +186,7 @@ pub const SettingsTab = struct {
             // Only while on show: these ask macOS about devices and access.
             .media => active and self.media.tick(now),
             .notifications => active and self.notifications.tick(now),
+            .hosting => self.hosting.tick(now),
             else => false,
         };
     }
@@ -187,6 +197,7 @@ pub const SettingsTab = struct {
             .apis => self.apis.onText(utf8),
             .features => self.features.onText(utf8),
             .browser => self.browser.onText(utf8),
+            .hosting => self.hosting.onText(utf8),
             else => {},
         }
     }
@@ -196,6 +207,7 @@ pub const SettingsTab = struct {
             .apis => self.apis.onMarkedText(utf8),
             .features => self.features.onMarkedText(utf8),
             .browser => self.browser.onMarkedText(utf8),
+            .hosting => self.hosting.onMarkedText(utf8),
             else => {},
         }
     }
@@ -206,6 +218,7 @@ pub const SettingsTab = struct {
             .apis => self.apis.onEdit(cmd),
             .features => self.features.onEdit(cmd),
             .browser => self.browser.onEdit(cmd),
+            .hosting => self.hosting.onEdit(cmd),
             else => false,
         };
         if (used) return;
@@ -225,6 +238,7 @@ pub const SettingsTab = struct {
         switch (self.page) {
             .apis => _ = self.apis.onCtrl(key),
             .browser => _ = self.browser.onCtrl(key),
+            .hosting => _ = self.hosting.onCtrl(key),
             else => {},
         }
     }
@@ -234,6 +248,7 @@ pub const SettingsTab = struct {
             .apis => self.apis.paste(utf8),
             .features => self.features.paste(utf8),
             .browser => self.browser.paste(utf8),
+            .hosting => self.hosting.paste(utf8),
             else => {},
         }
     }
@@ -243,6 +258,7 @@ pub const SettingsTab = struct {
             .apis => self.apis.copy(out, cut),
             .features => self.features.copy(out, cut),
             .browser => self.browser.copy(out, cut),
+            .hosting => self.hosting.copy(out, cut),
             else => false,
         };
     }
@@ -252,6 +268,7 @@ pub const SettingsTab = struct {
             .apis => self.apis.hasMarkedText(),
             .features => self.features.hasMarkedText(),
             .browser => self.browser.hasMarkedText(),
+            .hosting => self.hosting.hasMarkedText(),
             else => false,
         };
     }
@@ -261,6 +278,7 @@ pub const SettingsTab = struct {
             .apis => self.apis.caretRect(),
             .features => self.features.caretRect(),
             .browser => self.browser.caretRect(),
+            .hosting => self.hosting.caretRect(),
             else => .{},
         };
     }
@@ -280,6 +298,7 @@ pub const SettingsTab = struct {
             if (self.shown == .apis) self.apis.blur();
             if (self.shown == .features) self.features.blur();
             if (self.shown == .browser) self.browser.blur();
+            if (self.shown == .hosting) self.hosting.blur();
             self.shown = self.page;
             self.scroll = 0;
             self.dd.close();
@@ -319,6 +338,7 @@ pub const SettingsTab = struct {
             .privacy => browser_mod.drawPrivacyPage(ui, x, y, col_w),
             .media => self.media.draw(ui, x, y, col_w, ui.now),
             .notifications => self.notifications.draw(ui, x, y, col_w, ui.now),
+            .hosting => self.hosting.draw(ui, x, y, col_w, ui.now),
             else => drawSoon(ui, x, y, col_w),
         };
 

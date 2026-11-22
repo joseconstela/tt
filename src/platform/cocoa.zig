@@ -1037,6 +1037,10 @@ fn performKeyEquivalent(self: id, _: SEL, event: id) callconv(.c) bool {
             app.selectTab(chars[0] - '1');
             return true;
         }
+        // ⌘⇧↵ amends where a commit is being written; elsewhere the key is not ours.
+        if (mods.shift and chars.len == 1 and (chars[0] == '\r' or chars[0] == 3)) {
+            if (app.commitAmend()) return true;
+        }
         // Zoom: ⌘+ arrives as '=' unshifted or '+' shifted; ⌘− as '-'; ⌘0 resets.
         if (chars.len == 1) switch (chars[0]) {
             '=', '+' => {
