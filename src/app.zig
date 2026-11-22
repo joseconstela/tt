@@ -1,5 +1,17 @@
 //! Platform-neutral application core: owns the renderer, the UI state, the
 //! tabs and the projects; receives input events; builds and submits frames.
+//!
+//! There is the main window (sidebar, tab strips and panes, files panel)
+//! and any number of separate ones (`features/windows`), each showing the
+//! tabs taken out of the main window into it: a window group of the tab
+//! manager, drawn by the same pane view with its own draw list and input
+//! state. The tab manager knows which group has the keyboard, so actions
+//! and typing reach the right window without being told; the pointer
+//! methods take the window. Menus, boxes and the palette are drawn in the
+//! window that has the keyboard and close when it moves to another. A tab
+//! let go outside its window joins the window it is over, or gets a new
+//! one (`dropOutside`); the platform layer only makes real windows match
+//! `windows`.
 const std = @import("std");
 const objc = @import("objc.zig");
 const cli = @import("cli.zig");
@@ -31,6 +43,8 @@ const SettingsTab = @import("tabs/settings_tab.zig").SettingsTab;
 const WebTab = @import("tabs/web_tab.zig").WebTab;
 const History = @import("input/history.zig").History;
 const projects_mod = @import("projects.zig");
+const windows = @import("features/windows/windows.zig");
+const TabWindow = windows.TabWindow;
 const jump_mod = @import("jump.zig");
 const workspace_mod = @import("workspace.zig");
 const shell_integration = @import("term/shell_integration.zig");
@@ -81,6 +95,9 @@ pub const Action = enum {
     /// Focus the next / previous pane in reading order (⌘] / ⌘[).
     next_pane,
     prev_pane,
+    /// The tab in front leaves for a window of its own (what dragging it
+    /// out of the window does).
+    move_tab_to_window,
     toggle_sidebar,
     toggle_files,
     /// The files panel's Search view, its box focused (⌘⇧F).
@@ -123,6 +140,16 @@ pub const Action = enum {
     zoom_reset,
 };
 
+/// What the "Move to…" list offers: a tab and, row by row, the group that
+/// row would send it to.
+const MovePick = struct {
+    uid: u32,
+    dests: [max]u32 = undefined,
+    len: usize = 0,
+
+    const max = 64;
+};
+
 pub const App = struct {
     gpa: std.mem.Allocator,
     text: text_mod.TextEngine,
@@ -138,8 +165,23 @@ pub const App = struct {
     /// The tab whose question (`Env.askConfirm`, `Env.askMenu`) the overlay
     /// is showing, and the tag to answer it with.
     question: ?struct { uid: u32, tag: u32 } = null,
+    /// The tab menu's "Move to…" list is up: the tab, and the group each
+    /// of its rows stands for.
+    move_pick: ?MovePick = null,
     /// The split panes of the group on show and a tab being dragged.
     panes: panes_mod.PaneView = .{},
+    /// The separate windows (`features/windows`), each showing a window
+    /// group of `tabs`; the one that last had the keyboard first. Everything
+    /// above that says "the" window (`ui`, `dl`, `panes`, the size) is the
+    /// main window's; each of these has its own.
+    windows: std.ArrayList(*TabWindow) = .empty,
+    /// Where the main window is on screen, as the platform last said
+    /// (null: not known, as in a headless run that did not say).
+    main_frame: ?windows.Frame = null,
+    /// The window the platform last said has the keyboard (a window
+    /// group; null: the main one). When `tabs.keyed` is another, the app
+    /// moved the user and the platform brings that one forward (`takeRaise`).
+    platform_key: ?u32 = null,
     tabs: tab_mod.TabManager,
     env: tab_mod.Env,
     history: History,
@@ -274,7 +316,7 @@ pub const App = struct {
         self.tabs.register(.{ .name = "settings", .label = "Settings", .create = SettingsTab.create, .singleton = true, .renamable = false });
         self.tabs.register(.{ .name = "web", .label = "Website", .create = WebTab.create });
         // The tabs of the last run come back; a first run starts with one shell.
-        _ = self.workspace.restore(&self.tabs, &self.projects);
+        self.restoreWorkspace();
         self.keepShowingSomething();
         for (opts.open_paths) |path| self.openPath(path);
         if (sys.getenv("TT_SOCKET") != null or (opts.script_path == null and sys.getenv("TT_SELFTEST") == null)) {
@@ -289,7 +331,8 @@ pub const App = struct {
 
     pub fn destroy(self: *App) void {
         if (self.cli_server) |*s| s.deinit();
-        self.workspace.save(&self.tabs, &self.projects);
+        var wins_buf: [max_saved_windows]workspace_mod.Window = undefined;
+        self.workspace.save(&self.tabs, &self.projects, self.savedWindows(&wins_buf));
         self.workspace.deinit();
         self.tabs.deinit();
         for (self.env.requests.items) |r| r.free(self.gpa);
@@ -306,6 +349,8 @@ pub const App = struct {
         self.forgetFilesRoots();
         self.files_roots.deinit(self.gpa);
         self.file_drag.deinit(self.gpa);
+        for (self.windows.items) |w| w.destroy();
+        self.windows.deinit(self.gpa);
         self.ui.deinit();
         self.dl.deinit();
         self.gpa.destroy(self);
@@ -331,6 +376,7 @@ pub const App = struct {
         self.height = self.raw_height / self.zoom;
         self.scale = self.raw_scale * self.zoom;
         self.text.setScale(self.scale);
+        for (self.windows.items) |w| w.applyZoom(self.zoom);
         self.invalidate();
     }
 
@@ -355,7 +401,7 @@ pub const App = struct {
         // closes itself may take its pane with it, so the pane list is
         // fetched again after each close.
         for (self.tabs.groups.items) |*g| {
-            const shown = g.id == self.tabs.groupId();
+            const shown = self.tabs.onShow(g.id);
             var again = true;
             while (again) {
                 again = false;
@@ -379,6 +425,7 @@ pub const App = struct {
         self.serveCli();
         self.reportCliInstall();
         self.keepShowingSomething();
+        self.dropEmptyWindows();
         // A menu or box about a tab that has since closed itself has nothing left to act on.
         if (self.overlay.aboutTab()) |uid| if (self.tabs.byUid(uid) == null) self.overlay.close();
         if (self.overlay.tick(now)) self.invalidate();
@@ -398,7 +445,8 @@ pub const App = struct {
         }
         if (theme.compact != cfg.compact) self.applyCompact(cfg.compact);
         cfg.saveIfDue(now);
-        self.workspace.saveIfChanged(&self.tabs, &self.projects, now);
+        var wins_buf: [max_saved_windows]workspace_mod.Window = undefined;
+        self.workspace.saveIfChanged(&self.tabs, &self.projects, self.savedWindows(&wins_buf), now);
         return self.dirty > 0;
     }
 
@@ -425,15 +473,24 @@ pub const App = struct {
         if (self.ui.wants_frame) self.invalidate();
     }
 
+    /// The main window's frame was due but the window is out of sight: the
+    /// platform owes it (and asks again when the window is back), so the
+    /// other windows are not kept drawing for its sake.
+    pub fn frameSkipped(self: *App) void {
+        if (self.dirty > 0) self.dirty -= 1;
+    }
+
     fn buildFrameOnce(self: *App) void {
         const ui = &self.ui;
+        self.text.setScale(self.scale);
         self.dl.begin(self.width, self.height, self.scale);
         ui.beginFrame(self.now);
         defer ui.endFrame();
 
-        self.dl.rect(.{ .x = 0, .y = 0, .w = self.width, .h = self.height }, theme.bg);
+        const whole: draw.Rect = .{ .x = 0, .y = 0, .w = self.width, .h = self.height };
+        self.dl.rect(whole, theme.bg);
 
-        const cwd = self.currentCwd();
+        const cwd = self.shownCwd();
         self.files.setRoot(self.filesRoot(), self.now);
 
         // A secondary click while a tab menu is open dismisses it first, so
@@ -458,6 +515,9 @@ pub const App = struct {
         // mouse. A path dragged from the files panel is known to every part.
         const dragged = self.draggedFile();
         var ctx: sidebar_mod.Context = .{ .projects = &self.projects, .tabs = &self.tabs, .dragging_file = dragged != null };
+        if (self.panes.drag) |d| {
+            if (d.kind == .tab) ctx.dragging_tab = self.tabs.groupOf(d.uid);
+        }
         if (self.projects.containing(cwd)) |p| ctx.current_project = p.id;
         const hints_on = self.jump.hintsVisible(self.now);
         ctx.hints = .{
@@ -485,6 +545,7 @@ pub const App = struct {
         if (fr.replace) |c| self.overlay.openConfirmAction(.search_replace, 0, c.heading, c.reason, "Replace");
         if (fr.menu) |m| {
             self.question = null;
+            self.move_pick = null;
             self.overlay.openList(m.items, m.checked, m.sep_after, m.x, m.y);
             self.overlay.list_checks = m.checks;
         }
@@ -495,7 +556,50 @@ pub const App = struct {
         // The panes: each one's strip, its active tab, the dividers, and a
         // tab being dragged. Moves are applied to the tab manager inside.
         const tab_hints: ?tabbar_mod.TabHints = if (hints_on) .{ .next = self.jump.stage == .group } else null;
-        const pv = self.panes.draw(ui, &self.tabs, bar, content, side.band_inset, self.files.visible, self.chrome.window_focused, tab_hints);
+        const pv = self.panes.draw(ui, &self.tabs, self.tabs.shownGroup(), bar, content, .{
+            .band_inset = side.band_inset,
+            .files_visible = self.files.visible,
+            .window_focused = self.chrome.window_focused and self.tabs.keyed == null,
+            .hints = tab_hints,
+            .bounds = whole,
+        });
+        self.servePanes(null, pv, content);
+        if (pv.toggle_files) self.perform(.toggle_files);
+        if (self.jump.active() and self.tabs.shownGroup().count() == 0) self.drawJumpEmpty(content);
+        if (pv.file_drop) |target| self.openDroppedAt(target);
+        // The drag is over once the pane view has let go of it.
+        if (self.panes.drag == null) self.file_drag.clearRetainingCapacity();
+        self.drawDropHint(null, content);
+        if (self.chrome.fake_lights) drawFakeLights(&self.dl);
+
+        // The tab menu / boxes and the palette float over everything and are
+        // the only things that get the mouse: in this window while it is
+        // the one with the keyboard.
+        ui.mouse_inside = mouse_inside;
+        if (self.tabs.keyed == null) self.drawModals(ui, self.width, self.height);
+    }
+
+    /// Stand-in traffic lights (headless snapshots). Same geometry AppKit
+    /// reports for the real buttons (x=19/42/65, 14pt), centred on the
+    /// band like AppKit centres them in the titlebar.
+    fn drawFakeLights(dl: *draw.DrawList) void {
+        const colors = [_]draw.Color{ draw.Color.hex(0xFF5F57), draw.Color.hex(0xFEBC2E), draw.Color.hex(0x28C840) };
+        for (colors, 0..) |c, i| dl.circle(26 + @as(f32, @floatFromInt(i)) * 23, theme.header_h / 2, 7, c);
+    }
+
+    /// The open menu or box, else the palette, over a window `width` ×
+    /// `height`: the one that has the keyboard.
+    fn drawModals(self: *App, ui: *ui_mod.Ui, width: f32, height: f32) void {
+        if (!self.palette.open) {
+            if (self.overlay.draw(ui, width, height)) |out| self.applyOverlay(out);
+        }
+        if (self.palette.draw(ui, width, height)) |pick| self.executePick(pick);
+    }
+
+    /// What a window's pane view asked for this frame (`win` null: the
+    /// main window's).
+    fn servePanes(self: *App, win: ?*TabWindow, pv: panes_mod.Result, content: draw.Rect) void {
+        const ui = self.uiOf(win);
         if (pv.menu) |m| self.openTabMenu(m);
         if (pv.new_tab) |pane| {
             _ = self.tabs.focusPane(pane);
@@ -505,36 +609,390 @@ pub const App = struct {
             _ = self.tabs.focusPane(pane);
             self.perform(.new_web_tab);
         }
-        if (pv.toggle_files) self.perform(.toggle_files);
-        if (self.jump.active() and self.tabs.group().count() == 0) self.drawJumpEmpty(content);
-        if (pv.file_drop) |target| self.openDroppedAt(target);
+        if (pv.torn) |t| self.dropOutside(win, t);
         if (ui.edit_menu) |m| self.openEditMenu(m);
-        self.serveLink(content);
+        self.serveLink(ui, content);
         if (pv.changed) self.invalidate();
-        // The drag is over once the pane view has let go of it.
-        if (self.panes.drag == null) self.file_drag.clearRetainingCapacity();
+    }
 
-        if (self.chrome.fake_lights) {
-            const colors = [_]draw.Color{ draw.Color.hex(0xFF5F57), draw.Color.hex(0xFEBC2E), draw.Color.hex(0x28C840) };
-            // Same geometry AppKit reports for the real buttons (x=19/42/65, 14pt),
-            // centred on the band like AppKit centres them in the titlebar.
-            for (colors, 0..) |c, i| self.dl.circle(26 + @as(f32, @floatFromInt(i)) * 23, theme.header_h / 2, 7, c);
+    // ── separate windows ────────────────────────────────────────────────
+    /// More separate windows than this are not kept across a relaunch.
+    const max_saved_windows = 64;
+
+    /// The separate windows as the workspace file keeps them.
+    fn savedWindows(self: *App, buf: []workspace_mod.Window) []const workspace_mod.Window {
+        const n = @min(self.windows.items.len, buf.len);
+        // In the order they were made, so the file does not change with
+        // which window had the keyboard last.
+        for (self.windows.items[0..n], 0..) |w, i| buf[i] = .{ .group = w.group, .frame = w.frame };
+        std.mem.sort(workspace_mod.Window, buf[0..n], {}, struct {
+            fn lt(_: void, a: workspace_mod.Window, b: workspace_mod.Window) bool {
+                return a.group < b.group;
+            }
+        }.lt);
+        return buf[0..n];
+    }
+
+    /// The tabs of the last run come back, and so do its separate windows:
+    /// one for each that got a tab back, where it was (the platform keeps
+    /// it on a screen that is still there).
+    fn restoreWorkspace(self: *App) void {
+        var wins: std.ArrayList(workspace_mod.Window) = .empty;
+        defer wins.deinit(self.gpa);
+        _ = self.workspace.restore(&self.tabs, &self.projects, &wins);
+        for (wins.items) |saved| {
+            const live = if (self.tabs.findGroup(saved.group)) |g| g.count() > 0 else false;
+            if (!live) {
+                self.tabs.dropGroup(saved.group);
+                continue;
+            }
+            const width = if (saved.frame) |f| f.w else windows.frames.default_w;
+            const height = if (saved.frame) |f| f.h else windows.frames.default_h;
+            const w = TabWindow.create(self.gpa, &self.text, saved.group, width, height, self.raw_scale, self.zoom) catch null;
+            if (w) |win| {
+                win.chrome = .{ .inset_left = self.chrome.inset_left, .fake_lights = self.chrome.fake_lights };
+                win.frame = saved.frame;
+                win.place = saved.frame;
+                self.windows.append(self.gpa, win) catch {
+                    win.destroy();
+                    self.tabs.dissolve(saved.group);
+                };
+            } else self.tabs.dissolve(saved.group);
         }
+        // The main window starts with the keyboard.
+        self.tabs.keyed = null;
+    }
 
-        // The tab menu / boxes and the palette float over everything and are
-        // the only things that get the mouse.
+    /// One separate window's frame, into its own draw list: the strip(s)
+    /// of its group in the titlebar band and the panes under it. The
+    /// platform presents it (`presentWindow`); a script snapshots it.
+    pub fn buildWindowFrame(self: *App, w: *TabWindow) void {
+        var attempts: u32 = 0;
+        while (attempts < 2) : (attempts += 1) {
+            const generation = self.text.generation;
+            self.buildWindowOnce(w);
+            if (self.text.generation == generation) break;
+        }
+        if (w.ui.wants_frame) self.invalidate();
+    }
+
+    fn buildWindowOnce(self: *App, w: *TabWindow) void {
+        const ui = &w.ui;
+        self.text.setScale(w.scale);
+        w.dl.begin(w.width, w.height, w.scale);
+        ui.beginFrame(self.now);
+        defer ui.endFrame();
+
+        const whole: draw.Rect = .{ .x = 0, .y = 0, .w = w.width, .h = w.height };
+        w.dl.rect(whole, theme.bg);
+        const g = self.tabs.findGroup(w.group) orelse return;
+
+        const keyed = self.tabs.keyed == w.group;
+        if (self.overlay.mode == .menu and ui.right_pressed) self.overlay.close();
+        const mouse_inside = ui.mouse_inside;
+        if (self.palette.open or self.overlay.isOpen()) ui.mouse_inside = false;
+
+        const band: draw.Rect = .{ .x = 0, .y = 0, .w = w.width, .h = theme.header_h };
+        const content: draw.Rect = .{ .x = 0, .y = theme.header_h, .w = w.width, .h = w.height - theme.header_h };
+        // As in the main window: the real lights report window points.
+        var inset = w.chrome.inset_left;
+        if (!w.chrome.fake_lights) inset /= self.zoom;
+        const pv = w.panes.draw(ui, &self.tabs, g, band, content, .{
+            .band_inset = inset + TabWindow.strip_gap,
+            .window_focused = w.chrome.window_focused and keyed,
+            .bounds = whole,
+        });
+        self.servePanes(w, pv, content);
+        self.drawDropHint(w, content);
+        if (w.chrome.fake_lights) drawFakeLights(&w.dl);
+
         ui.mouse_inside = mouse_inside;
-        if (!palette_open) {
-            if (self.overlay.draw(ui, self.width, self.height)) |out| self.applyOverlay(out);
+        if (keyed) self.drawModals(ui, w.width, w.height);
+    }
+
+    /// Puts a separate window's last built frame on its Metal layer.
+    pub fn presentWindow(self: *App, w: *TabWindow, layer: objc.id) void {
+        self.renderer.presentTo(layer, &w.dl, &self.text, theme.bg);
+    }
+
+    pub fn snapshotWindow(self: *App, w: *TabWindow, path: []const u8) !void {
+        self.invalidate();
+        self.buildWindowFrame(w);
+        self.buildWindowFrame(w);
+        const px_w: u32 = @intFromFloat(@round(w.width * w.scale));
+        const px_h: u32 = @intFromFloat(@round(w.height * w.scale));
+        try self.renderer.snapshot(&w.dl, &self.text, theme.bg, px_w, px_h, path);
+    }
+
+    pub fn windowByGroup(self: *App, gid: u32) ?*TabWindow {
+        for (self.windows.items) |w| {
+            if (w.group == gid) return w;
         }
-        if (self.palette.draw(ui, self.width, self.height)) |pick| self.executePick(pick);
+        return null;
+    }
+
+    fn uiOf(self: *App, win: ?*TabWindow) *ui_mod.Ui {
+        return if (win) |w| &w.ui else &self.ui;
+    }
+
+    /// The platform says which window has the keyboard now (a separate
+    /// window's group; null: the main window).
+    pub fn onWindowKey(self: *App, group: ?u32) void {
+        self.platform_key = group;
+        self.setKey(group);
+    }
+
+    /// The keyboard goes to a window. A menu, a box or the palette does
+    /// not follow it there: they close, as a click elsewhere closes them.
+    fn setKey(self: *App, group: ?u32) void {
+        const gid: ?u32 = if (group) |id| (if (self.windowByGroup(id) != null) id else null) else null;
+        if (self.tabs.keyed == gid) return;
+        self.tabs.keyed = gid;
+        if (gid) |id| self.bringFirst(id);
+        self.palette.close();
+        self.overlay.close();
+        self.invalidate();
+    }
+
+    /// The windows are kept in the order they last had the keyboard.
+    fn bringFirst(self: *App, gid: u32) void {
+        for (self.windows.items, 0..) |w, i| {
+            if (w.group != gid) continue;
+            _ = self.windows.orderedRemove(i);
+            self.windows.insertAssumeCapacity(0, w);
+            return;
+        }
+    }
+
+    /// Which window the platform should bring forward, when the app put
+    /// the user in one that does not have the keyboard: a tab revealed in
+    /// another window, a sidebar row jumped to from a separate one. Asked
+    /// once per change.
+    pub const Raise = union(enum) { main, window: *TabWindow };
+
+    pub fn takeRaise(self: *App) ?Raise {
+        if (self.tabs.keyed == self.platform_key) return null;
+        self.platform_key = self.tabs.keyed;
+        const gid = self.tabs.keyed orelse return .main;
+        const w = self.windowByGroup(gid) orelse return null;
+        self.bringFirst(gid);
+        return .{ .window = w };
+    }
+
+    /// A tab leaves for a window of its own, at `place` on screen (null:
+    /// wherever the platform puts a new window). The only tab of a
+    /// separate window is in one already.
+    pub fn detachTab(self: *App, uid: u32, place: ?windows.Frame) void {
+        const from = self.tabs.groupOf(uid) orelse return;
+        if (tab_mod.TabManager.isWindowGroup(from)) {
+            const g = self.tabs.findGroup(from) orelse return;
+            if (g.count() == 1) return;
+        }
+        const gid = self.tabs.newWindowGroup() catch return;
+        const width = if (place) |f| f.w else @min(self.raw_width, windows.frames.default_w);
+        const height = if (place) |f| f.h else @min(self.raw_height, windows.frames.default_h);
+        const w = TabWindow.create(self.gpa, &self.text, gid, width, height, self.raw_scale, self.zoom) catch {
+            self.tabs.dropGroup(gid);
+            return;
+        };
+        self.windows.ensureUnusedCapacity(self.gpa, 1) catch {
+            w.destroy();
+            self.tabs.dropGroup(gid);
+            return;
+        };
+        if (!self.tabs.moveTabToGroup(uid, gid)) {
+            w.destroy();
+            self.tabs.dropGroup(gid);
+            return;
+        }
+        // Until the platform reports its own: the main window's lights.
+        w.chrome = .{ .inset_left = self.chrome.inset_left, .fake_lights = self.chrome.fake_lights };
+        w.frame = place;
+        w.place = place;
+        self.windows.insertAssumeCapacity(0, w);
+        // The new window is where the user is now.
+        self.palette.close();
+        self.overlay.close();
+        self.tabs.keyed = gid;
+        self.keepShowingSomething();
+        self.invalidate();
+    }
+
+    /// A tab was let go outside the window it was dragged in (`src`, null:
+    /// the main one). Over another of tt's windows it joins the tabs that
+    /// one shows; over anything else it gets a window of its own there,
+    /// with the tab under the pointer. The only tab of a separate window
+    /// takes its window along instead.
+    fn dropOutside(self: *App, src: ?*TabWindow, t: panes_mod.Torn) void {
+        const at = self.onScreen(src, t.x, t.y);
+        if (at) |p| if (self.windowAt(src, p)) |target| {
+            const gid = switch (target) {
+                .main => self.tabs.shown,
+                .window => |w| w.group,
+            };
+            if (self.tabs.moveTabToGroup(t.uid, gid)) _ = self.tabs.focus(t.uid);
+            self.keepShowingSomething();
+            self.invalidate();
+            return;
+        };
+        const from_w = if (src) |w| w.raw_width else self.raw_width;
+        const from_h = if (src) |w| w.raw_height else self.raw_height;
+        // Where the first tab of a separate window sits in its band.
+        const lights = if (self.chrome.fake_lights) self.chrome.inset_left * self.zoom else self.chrome.inset_left;
+        const tab_x = lights + (TabWindow.strip_gap + t.grab_dx) * self.zoom;
+        const tab_y = theme.header_h / 2 * self.zoom;
+        const place: ?windows.Frame = if (at) |p| windows.frames.spawnAt(p, tab_x, tab_y, from_w, from_h) else null;
+        if (src) |w| if (self.tabs.findGroup(w.group)) |g| if (g.count() == 1) {
+            if (place) |f| {
+                const moved: windows.Frame = .{ .x = f.x, .y = f.y, .w = w.raw_width, .h = w.raw_height };
+                w.frame = moved;
+                w.place = moved;
+            }
+            self.invalidate();
+            return;
+        };
+        self.detachTab(t.uid, place);
+    }
+
+    /// A point of a window (its own coordinates, as its `Ui` has them) on
+    /// screen; null while the window's frame is not known.
+    fn onScreen(self: *App, win: ?*TabWindow, x: f32, y: f32) ?windows.Point {
+        const frame = (if (win) |w| w.frame else self.main_frame) orelse return null;
+        return frame.toScreen(x * self.zoom, y * self.zoom);
+    }
+
+    const WindowTarget = union(enum) { main, window: *TabWindow };
+
+    /// The window of tt's under a point on screen, other than `src`: the
+    /// separate ones first (most recently used in front), then the main one.
+    fn windowAt(self: *App, src: ?*TabWindow, p: windows.Point) ?WindowTarget {
+        for (self.windows.items) |w| {
+            if (w == src) continue;
+            const f = w.frame orelse continue;
+            if (f.contains(p)) return .{ .window = w };
+        }
+        if (src != null) if (self.main_frame) |f| {
+            if (f.contains(p)) return .main;
+        };
+        return null;
+    }
+
+    const Outside = struct { src: ?*TabWindow, uid: u32, at: windows.Point };
+
+    /// A tab being dragged that has left its window: which, and where the
+    /// pointer is on screen.
+    fn dragOutside(self: *App) ?Outside {
+        if (self.outsideOf(null)) |o| return o;
+        for (self.windows.items) |w| {
+            if (self.outsideOf(w)) |o| return o;
+        }
+        return null;
+    }
+
+    fn outsideOf(self: *App, win: ?*TabWindow) ?Outside {
+        const ui = self.uiOf(win);
+        const d = (if (win) |w| w.panes.drag else self.panes.drag) orelse return null;
+        if (d.kind != .tab or !ui.down) return null;
+        const width = if (win) |w| w.width else self.width;
+        const height = if (win) |w| w.height else self.height;
+        if (!windows.frames.outside(width, height, ui.mx, ui.my)) return null;
+        const at = self.onScreen(win, ui.mx, ui.my) orelse return null;
+        return .{ .src = win, .uid = d.uid, .at = at };
+    }
+
+    /// The title of a tab being dragged outside its window, for the
+    /// platform to show under the pointer (the ghost the pane view draws
+    /// stops at the window's edge); null when there is none.
+    pub fn draggedOut(self: *App, buf: []u8) ?[]const u8 {
+        const o = self.dragOutside() orelse return null;
+        const t = self.tabs.byUid(o.uid) orelse return null;
+        var title_buf: [tab_mod.TabManager.max_title_len]u8 = undefined;
+        const title = t.title(&title_buf);
+        const n = @min(title.len, buf.len);
+        @memcpy(buf[0..n], title[0..n]);
+        return buf[0..n];
+    }
+
+    /// While a tab dragged out of another window is over this one, its
+    /// content says it would take it.
+    fn drawDropHint(self: *App, win: ?*TabWindow, content: draw.Rect) void {
+        const o = self.dragOutside() orelse return;
+        const target = self.windowAt(o.src, o.at) orelse return;
+        const here = switch (target) {
+            .main => win == null,
+            .window => |w| w == win,
+        };
+        if (!here) return;
+        const dl = self.uiOf(win).dl;
+        const r = content.inset(3, 3);
+        dl.rrect(r, 8, theme.accent.alpha(0.1));
+        dl.border(r, 8, 1, theme.accent.alpha(0.55));
+    }
+
+    /// A separate window's close button: its tabs close with it, after a
+    /// question when any of them has work that would be lost.
+    pub fn closeWindow(self: *App, w: *TabWindow) void {
+        const g = self.tabs.findGroup(w.group) orelse return;
+        var count: usize = 0;
+        var at_risk: usize = 0;
+        var why_buf: [160]u8 = undefined;
+        var why: []const u8 = "";
+        for (g.layout.owned.items) |p| {
+            for (p.tabs.items) |t| {
+                count += 1;
+                var buf: [160]u8 = undefined;
+                const reason = t.vtable.closeWarning(t.ptr, &buf) orelse continue;
+                at_risk += 1;
+                if (why.len == 0) {
+                    const n = @min(reason.len, why_buf.len);
+                    @memcpy(why_buf[0..n], reason[0..n]);
+                    why = why_buf[0..n];
+                }
+            }
+        }
+        if (at_risk == 0) return self.closeWindowNow(w.group);
+        var heading_buf: [96]u8 = undefined;
+        const heading = if (count == 1) "Close this window?" else std.fmt.bufPrint(&heading_buf, "Close this window and its {d} tabs?", .{count}) catch "Close this window?";
+        var reason_buf: [200]u8 = undefined;
+        const reason = if (at_risk == 1) why else std.fmt.bufPrint(&reason_buf, "{d} of them have work that would be lost.", .{at_risk}) catch why;
+        // The box is the window's own: it takes the keyboard to show it.
+        self.palette.close();
+        self.tabs.keyed = w.group;
+        self.overlay.openConfirmAction(.close_window, w.group, heading, reason, "Close");
+        self.invalidate();
+    }
+
+    /// Closes a separate window's tabs; the window itself goes on the
+    /// next tick (`dropEmptyWindows`), never in the middle of its frame.
+    fn closeWindowNow(self: *App, gid: u32) void {
+        if (!tab_mod.TabManager.isWindowGroup(gid)) return;
+        self.tabs.dropGroup(gid);
+        self.invalidate();
+    }
+
+    /// A separate window whose last tab is gone (closed, exited, moved to
+    /// a row or another window) goes too. The platform layer closes the
+    /// real window when it finds it is no longer listed.
+    fn dropEmptyWindows(self: *App) void {
+        var i: usize = 0;
+        while (i < self.windows.items.len) {
+            const w = self.windows.items[i];
+            const live = if (self.tabs.findGroup(w.group)) |g| g.count() > 0 else false;
+            if (live) {
+                i += 1;
+                continue;
+            }
+            _ = self.windows.orderedRemove(i);
+            self.tabs.dropGroup(w.group);
+            w.destroy();
+            self.invalidate();
+        }
     }
 
     /// A link under the pointer (`Ui.link`): the pointing hand while ⌘ or ⌃
     /// is held, where it goes in a bubble at the bottom of the view showing
     /// it (the way browsers show it), and a ⌘- or ⌃-click opens it.
-    fn serveLink(self: *App, content: draw.Rect) void {
-        const ui = &self.ui;
+    fn serveLink(self: *App, ui: *ui_mod.Ui, content: draw.Rect) void {
         const found = ui.hoveredLink();
         if (found.len == 0) return;
         var buf: [links.max_len + 16]u8 = undefined;
@@ -610,11 +1068,68 @@ pub const App = struct {
             if (m.target != .resource) self.overlay.setMenuKey(self.projects.keyOf(m.id));
         }
         if (side.drop_file) |drop| self.pinDropped(drop);
+        if (side.drop_tab) |gid| if (self.panes.drag) |d| {
+            // The row took it: the pane view has nothing left to drop.
+            self.panes.drag = null;
+            self.moveTabToRow(d.uid, gid);
+        };
         if (side.move_project) |m| {
             if (self.projects.moveProject(m.id, m.before)) self.projects.save();
         }
         if (side.move_resource) |m| self.moveResource(m);
         if (side.changed) self.projects.save();
+    }
+
+    /// A tab goes to another sidebar row's own tabs (dropped on the row,
+    /// or picked in the tab menu's "Move to…"), where it is the one in
+    /// front the next time the row is shown. The row on show stays on
+    /// show, unless this was its last tab: then the tab is followed.
+    fn moveTabToRow(self: *App, uid: u32, gid: u32) void {
+        const from = self.tabs.groupOf(uid) orelse return;
+        if (!self.tabs.moveTabToGroup(uid, gid)) return;
+        if (from == self.tabs.shown and self.tabs.shownGroup().count() == 0) {
+            _ = self.tabs.focus(uid);
+            if (self.projects.find(gid)) |p| {
+                self.selected_project = p.id;
+            } else if (self.projects.findResource(gid)) |f| {
+                self.selected_project = if (f.project) |p| p.id else null;
+            }
+        }
+        self.invalidate();
+    }
+
+    /// The tab menu's "Move to…": the sidebar's rows as a list where the
+    /// menu was, the row the tab is in ticked.
+    fn openMoveMenu(self: *App, uid: u32) void {
+        const from = self.tabs.groupOf(uid) orelse return;
+        var pick: MovePick = .{ .uid = uid };
+        var labels: [MovePick.max][]const u8 = undefined;
+        var bufs: [MovePick.max][160]u8 = undefined;
+        const Rows = struct {
+            pick: *MovePick,
+            labels: *[MovePick.max][]const u8,
+            bufs: *[MovePick.max][160]u8,
+
+            fn add(rows: @This(), gid: u32, name: []const u8, child: bool) void {
+                const i = rows.pick.len;
+                if (i >= MovePick.max) return;
+                // A resource sits under its project, set in like in the tree.
+                rows.labels[i] = std.fmt.bufPrint(&rows.bufs[i], "{s}{s}", .{ if (child) "      " else "", name[0..@min(name.len, 150)] }) catch return;
+                rows.pick.dests[i] = gid;
+                rows.pick.len += 1;
+            }
+        };
+        const rows: Rows = .{ .pick = &pick, .labels = &labels, .bufs = &bufs };
+        rows.add(tab_mod.TabManager.default_group, projects_mod.Projects.default_name, false);
+        for (self.projects.default_resources.items) |r| rows.add(r.id, r.name, true);
+        for (self.projects.items.items) |p| {
+            rows.add(p.id, p.name, false);
+            for (p.resources.items) |r| rows.add(r.id, r.name, true);
+        }
+        const checked = std.mem.indexOfScalar(u32, pick.dests[0..pick.len], from);
+        self.question = null;
+        self.move_pick = pick;
+        self.overlay.openList(labels[0..pick.len], checked, null, self.overlay.anchor_x, self.overlay.anchor_y);
     }
 
     /// A resource was dragged in the sidebar: reorder it, or move it into
@@ -739,7 +1254,11 @@ pub const App = struct {
         const opened = if (self.projects.find(gid)) |p| blk: {
             self.selected_project = p.id;
             break :blk self.tabs.openWith("terminal", .{ .cwd = p.root });
-        } else self.tabs.open("terminal");
+        } else if (tab_mod.TabManager.isWindowGroup(gid))
+            // A separate window belongs to no folder: where its tab in front is.
+            self.tabs.openWith("terminal", .{ .cwd = self.currentCwd() })
+        else
+            self.tabs.open("terminal");
         _ = opened catch |err| std.log.err("could not open terminal tab: {s}", .{@errorName(err)});
         self.invalidate();
     }
@@ -828,6 +1347,11 @@ pub const App = struct {
         return false;
     }
 
+    /// The same for any window (null: the main one).
+    pub fn isInteractiveAtIn(self: *const App, win: ?*const TabWindow, x: f32, y: f32) bool {
+        return if (win) |w| w.isInteractiveAt(x, y) else self.isInteractiveAt(x, y);
+    }
+
     // ── actions ─────────────────────────────────────────────────────────
     pub fn perform(self: *App, action: Action) void {
         // Any command closes the palette (⌘K / ⌘P toggle it) and whatever
@@ -849,6 +1373,7 @@ pub const App = struct {
             .split_down => self.splitFocused(.bottom),
             .next_pane => self.tabs.cyclePane(1),
             .prev_pane => self.tabs.cyclePane(-1),
+            .move_tab_to_window => if (self.tabs.current()) |t| self.detachTab(t.uid, null),
             .toggle_sidebar => self.sidebar.toggle(),
             .toggle_files => self.files.toggle(),
             .find_in_files => self.files.openSearch(self.now),
@@ -994,6 +1519,7 @@ pub const App = struct {
                 }),
                 .question => |q| if (self.tabs.uidOf(q.tab)) |uid| {
                     self.question = .{ .uid = uid, .tag = q.tag };
+                    self.move_pick = null;
                     switch (q.what) {
                         .confirm => |c| self.overlay.openConfirmAction(.tab_question, 0, c.heading, c.reason, c.ok),
                         .menu => |m| {
@@ -1073,6 +1599,12 @@ pub const App = struct {
             .document = if (self.tabs.byUid(m.uid)) |t| t.vtable.path(t.ptr).len > 0 else false,
             .others = n - 1,
             .to_right = n - 1 - i,
+            // The default project is always there: only a tab of its own,
+            // with nothing else in the sidebar, has nowhere to go.
+            .movable = self.projects.items.items.len + self.projects.default_resources.items.len > 0 or
+                self.tabs.groupOf(m.uid) != tab_mod.TabManager.default_group,
+            // The only tab of a separate window has its window already.
+            .detachable = if (self.tabs.groupOfPane(p.id)) |g| !(tab_mod.TabManager.isWindowGroup(g.id) and g.count() == 1) else true,
         });
     }
 
@@ -1148,8 +1680,8 @@ pub const App = struct {
     /// kept one), background shells and all. The kept tab stays, so its
     /// pane does too.
     fn closeManyNow(self: *App, uid: u32, scope: CloseScope) void {
-        const g = self.tabs.group();
         const p = self.tabs.paneOf(uid) orelse return;
+        const g = self.tabs.groupOfPane(p.id) orelse return;
         var i = p.tabs.items.len;
         while (i > 0) {
             i -= 1;
@@ -1247,6 +1779,9 @@ pub const App = struct {
             .reveal_tab => |uid| if (self.tabPath(uid)) |path| {
                 _ = desktop.revealInFinder(path);
             },
+            .move_tab => |uid| self.openMoveMenu(uid),
+            .move_tab_window => |uid| self.detachTab(uid, null),
+            .close_window_confirmed => |gid| self.closeWindowNow(gid),
             .renamed => |r| {
                 // The name lives in the overlay's editor: copy it before closing.
                 self.tabs.rename(r.uid, r.name);
@@ -1259,7 +1794,10 @@ pub const App = struct {
             .replace_confirmed => self.files.replaceConfirmed(),
             .install_cli_confirmed => self.startCliInstall(),
             .dismissed => {},
-            .list_picked => |i| if (self.question) |q| {
+            .list_picked => |i| if (self.move_pick) |mp| {
+                self.move_pick = null;
+                if (i < mp.len) self.moveTabToRow(mp.uid, mp.dests[i]);
+            } else if (self.question) |q| {
                 self.question = null;
                 if (self.tabs.byUid(q.uid)) |t| t.vtable.answered(t.ptr, q.tag, i);
             } else self.files.menuPicked(i),
@@ -1608,19 +2146,38 @@ pub const App = struct {
     /// Never leave the screen empty: a row whose last tab closed hands over
     /// to the default group, and an empty default group starts a shell.
     fn keepShowingSomething(self: *App) void {
-        if (self.tabs.items().len > 0) return;
+        // This is about the main window, whichever window has the keyboard
+        // (and that one keeps it).
+        if (self.tabs.shownGroup().pane().tabs.items.len > 0) return;
         // A ⌥ chord passing through a row with no tabs yet: it gets its
         // first one when the chord ends there (`endJump`), not before.
         if (self.jump.active()) return;
+        const keyed = self.tabs.keyed;
+        defer self.tabs.keyed = keyed;
+        self.tabs.keyed = null;
         const default_group = tab_mod.TabManager.default_group;
-        if (self.tabs.groupId() != default_group) self.tabs.show(default_group) catch {};
+        if (self.tabs.shown != default_group) self.tabs.show(default_group) catch {};
         if (self.tabs.items().len == 0) _ = self.tabs.open("terminal") catch {};
         self.invalidate();
     }
 
-    /// Directory of the active tab, or the last one seen.
+    /// Directory of the tab the user is in, or the last one seen: where a
+    /// new shell or a split starts.
     pub fn currentCwd(self: *App) []const u8 {
-        if (self.tabs.current()) |t| {
+        if (self.tabs.keyed != null) {
+            if (self.tabs.current()) |t| {
+                const dir = t.vtable.cwd(t.ptr);
+                if (dir.len > 0) return dir;
+            }
+        }
+        return self.shownCwd();
+    }
+
+    /// Directory of the tab in front of the main window, or the last one
+    /// seen there: what the sidebar and the files panel go by, whichever
+    /// window has the keyboard.
+    fn shownCwd(self: *App) []const u8 {
+        if (self.tabs.shownGroup().current()) |t| {
             const dir = t.vtable.cwd(t.ptr);
             if (dir.len > 0 and !std.mem.eql(u8, self.last_cwd.items, dir)) {
                 self.last_cwd.clearRetainingCapacity();
@@ -1637,10 +2194,10 @@ pub const App = struct {
     /// no shell has spoken for yet starts at its own folder: a resource's,
     /// a project's root, else the current directory.
     pub fn filesRoot(self: *App) []const u8 {
-        const cwd = self.currentCwd();
-        const gid = self.tabs.groupId();
+        const cwd = self.shownCwd();
+        const gid = self.tabs.shown;
         var dir: []const u8 = "";
-        if (self.tabs.current()) |t| {
+        if (self.tabs.shownGroup().current()) |t| {
             if (t.vtable.path(t.ptr).len == 0) dir = t.vtable.cwd(t.ptr);
         }
         const kept = self.files_roots.getPtr(gid);
@@ -1881,10 +2438,18 @@ pub const App = struct {
     }
 
     // ── input ───────────────────────────────────────────────────────────
+    // The pointer: the `on…` forms are the main window's, the `pointer…`
+    // ones take the window (null: the main one). Each window has its own
+    // `Ui`; a press in a window also gives it the keyboard.
     pub fn onMouseMove(self: *App, x: f32, y: f32) void {
-        self.ui.mx = x;
-        self.ui.my = y;
-        self.ui.mouse_inside = true;
+        self.pointerMove(null, x, y);
+    }
+
+    pub fn pointerMove(self: *App, win: ?*TabWindow, x: f32, y: f32) void {
+        const ui = self.uiOf(win);
+        ui.mx = x;
+        ui.my = y;
+        ui.mouse_inside = true;
         self.invalidate();
     }
 
@@ -1893,6 +2458,7 @@ pub const App = struct {
         const was = self.ui.linkModifier();
         const hints = self.jump.hintsVisible(self.now);
         self.ui.mods = mods;
+        for (self.windows.items) |w| w.ui.mods = mods;
         if (self.jump.flags(mods.alt, mods.cmd or mods.ctrl or mods.shift, self.now)) |gid| self.endJump(gid);
         if (was != self.ui.linkModifier() or hints != self.jump.hintsVisible(self.now)) self.invalidate();
     }
@@ -1918,47 +2484,73 @@ pub const App = struct {
     }
 
     pub fn onMouseLeave(self: *App) void {
-        self.ui.mouse_inside = false;
+        self.pointerLeave(null);
+    }
+
+    pub fn pointerLeave(self: *App, win: ?*TabWindow) void {
+        self.uiOf(win).mouse_inside = false;
         self.invalidate();
     }
 
     pub fn onMouseDown(self: *App, x: f32, y: f32, clicks: u32, mods: ui_mod.Mods) void {
+        self.pointerDown(null, x, y, clicks, mods);
+    }
+
+    pub fn pointerDown(self: *App, win: ?*TabWindow, x: f32, y: f32, clicks: u32, mods: ui_mod.Mods) void {
         // ⌃-click is a secondary click, as everywhere on macOS — except
         // over a link, which it opens (`Ui.link`).
         if (mods.ctrl and !mods.cmd) {
-            self.onRightMouseDown(x, y, mods);
-            self.ui.ctrl_click = true;
+            self.pointerRightDown(win, x, y, mods);
+            self.uiOf(win).ctrl_click = true;
             return;
         }
-        self.onMouseMove(x, y);
+        self.setKey(if (win) |w| w.group else null);
+        self.pointerMove(win, x, y);
         // An ⌥-click is not a jump: no key hints for this press of ⌥.
         if (mods.alt) self.jump.alt_used = true;
-        self.ui.down = true;
-        self.ui.pressed = true;
-        self.ui.click_count = clicks;
-        self.ui.press_x = x;
-        self.ui.press_y = y;
-        self.ui.mods = mods;
+        const ui = self.uiOf(win);
+        ui.down = true;
+        ui.pressed = true;
+        ui.click_count = clicks;
+        ui.press_x = x;
+        ui.press_y = y;
+        ui.mods = mods;
     }
 
     pub fn onMouseUp(self: *App, x: f32, y: f32) void {
-        self.onMouseMove(x, y);
-        self.ui.down = false;
-        self.ui.released = true;
+        self.pointerUp(null, x, y);
+    }
+
+    pub fn pointerUp(self: *App, win: ?*TabWindow, x: f32, y: f32) void {
+        self.pointerMove(win, x, y);
+        const ui = self.uiOf(win);
+        ui.down = false;
+        ui.released = true;
     }
 
     /// Secondary click (right button, ⌃-click, two-finger tap): opens
     /// context menus. Nothing is pressed or dragged.
     pub fn onRightMouseDown(self: *App, x: f32, y: f32, mods: ui_mod.Mods) void {
-        self.onMouseMove(x, y);
-        self.ui.right_pressed = true;
-        self.ui.mods = mods;
+        self.pointerRightDown(null, x, y, mods);
+    }
+
+    pub fn pointerRightDown(self: *App, win: ?*TabWindow, x: f32, y: f32, mods: ui_mod.Mods) void {
+        self.setKey(if (win) |w| w.group else null);
+        self.pointerMove(win, x, y);
+        const ui = self.uiOf(win);
+        ui.right_pressed = true;
+        ui.mods = mods;
     }
 
     pub fn onScroll(self: *App, x: f32, y: f32, dx: f32, dy: f32) void {
-        self.onMouseMove(x, y);
-        self.ui.scroll_x += dx;
-        self.ui.scroll_y += dy;
+        self.pointerScroll(null, x, y, dx, dy);
+    }
+
+    pub fn pointerScroll(self: *App, win: ?*TabWindow, x: f32, y: f32, dx: f32, dy: f32) void {
+        self.pointerMove(win, x, y);
+        const ui = self.uiOf(win);
+        ui.scroll_x += dx;
+        ui.scroll_y += dy;
     }
 
     // Keyboard input goes to the palette while it is open, else to the tab

@@ -6,7 +6,9 @@
 //! routes it, see `App`). The edit menu (Cut / Copy / Paste) is what a
 //! text surface shows on a right-click. Two menus have a submenu: the
 //! files menu's "Open with", whose rows the app hands over when it opens
-//! the menu, and the tab menu's "Split & Move" (the four sides).
+//! the menu, and the tab menu's "Split & Move" (the four sides). The tab
+//! menu's "Move to…" leads to a list menu instead: the sidebar's rows, which
+//! the app builds (`Outcome.move_tab`).
 const std = @import("std");
 const draw = @import("../gfx/draw.zig");
 const gfx_text = @import("../gfx/text.zig");
@@ -41,8 +43,9 @@ pub const EditMenuOpts = struct {
 };
 
 /// What a confirm box leads to when it is accepted (`close_others` and
-/// `close_right` are the tab menu's "Close Others" / "Close to the Right").
-pub const ConfirmKind = enum { close_tab, close_others, close_right, git_discard, delete_file, search_replace, install_cli, tab_question, notice };
+/// `close_right` are the tab menu's "Close Others" / "Close to the Right",
+/// `close_window` a separate window's close button; its id is the window's group).
+pub const ConfirmKind = enum { close_tab, close_others, close_right, close_window, git_discard, delete_file, search_replace, install_cli, tab_question, notice };
 
 /// What a files-panel menu is about: a file, a folder, or the folder on
 /// show itself (a click on the panel's blank space).
@@ -70,6 +73,10 @@ pub const TabMenuOpts = struct {
     /// none, "Close Others" / "Close to the Right" are greyed out.
     others: usize = 0,
     to_right: usize = 0,
+    /// There is another sidebar row the tab could go to: "Move to…".
+    movable: bool = true,
+    /// "Move to New Window" (not for the only tab of a separate window).
+    detachable: bool = true,
 };
 
 /// What the user decided; the app carries it out.
@@ -95,6 +102,13 @@ pub const Outcome = union(enum) {
     copy_tab_path: struct { uid: u32, relative: bool },
     /// Tab menu → "Reveal in Finder".
     reveal_tab: u32,
+    /// Tab menu → "Move to…": the app lists the sidebar's rows for this
+    /// tab to go to.
+    move_tab: u32,
+    /// Tab menu → "Move to New Window": the tab gets a window of its own.
+    move_tab_window: u32,
+    /// A separate window's close box accepted (the window's group).
+    close_window_confirmed: u32,
     /// Rename box confirmed for a tab. `name` points into the overlay's
     /// editor and is valid until the overlay is next opened.
     renamed: struct { uid: u32, name: []const u8 },
@@ -161,7 +175,7 @@ pub const Outcome = union(enum) {
     edit: EditAction,
 };
 
-const MenuItem = enum { rename, split_beside, split_move, close, close_others, close_right, tab_copy_path, tab_copy_rel, new_shells, set_icon, shortcut, remove, new_file, new_folder, open_external, open_with, reveal, copy_path, copy_abs_path, delete, cut, copy, paste };
+const MenuItem = enum { rename, split_beside, split_move, move_to, move_window, close, close_others, close_right, tab_copy_path, tab_copy_rel, new_shells, set_icon, shortcut, remove, new_file, new_folder, open_external, open_with, reveal, copy_path, copy_abs_path, delete, cut, copy, paste };
 const MenuEntry = struct {
     item: MenuItem,
     label: []const u8,
@@ -186,6 +200,8 @@ const tab_menu_all = [_]MenuEntry{
     .{ .item = .reveal, .label = "Reveal in Finder", .sep_before = true },
     .{ .item = .split_beside, .label = "Split Right", .kbd = "⌘D" },
     .{ .item = .split_move, .label = "Split & Move", .submenu = true },
+    .{ .item = .move_to, .label = "Move to…", .sep_before = true },
+    .{ .item = .move_window, .label = "Move to New Window" },
 };
 /// The "Split & Move" submenu: one row per side, in this order.
 const split_sides = [_]Side{ .left, .right, .top, .bottom };
@@ -400,6 +416,8 @@ pub const Overlay = struct {
             row.disabled = switch (m.item) {
                 .close_others => opts.others == 0,
                 .close_right => opts.to_right == 0,
+                .move_to => !opts.movable,
+                .move_window => !opts.detachable,
                 else => false,
             };
             pending_sep = false;
@@ -520,7 +538,7 @@ pub const Overlay = struct {
         if (!self.isOpen() or self.subject != .tab or self.mode == .list) return null;
         if (self.mode == .confirm) switch (self.confirm_kind) {
             .close_tab, .close_others, .close_right => {},
-            .git_discard, .delete_file, .search_replace, .install_cli, .tab_question, .notice => return null,
+            .close_window, .git_discard, .delete_file, .search_replace, .install_cli, .tab_question, .notice => return null,
         };
         return self.id;
     }
@@ -837,6 +855,8 @@ pub const Overlay = struct {
             .split_beside => .{ .split_beside = .{ .uid = id, .side = .right } },
             // The row unfolds the submenu; it is never picked itself.
             .split_move => .{ .split_beside = .{ .uid = id, .side = .right } },
+            .move_to => .{ .move_tab = id },
+            .move_window => .{ .move_tab_window = id },
             .close => .{ .close_tab = id },
             .close_others => .{ .close_others = id },
             .close_right => .{ .close_right = id },
@@ -891,6 +911,7 @@ pub const Overlay = struct {
             .close_tab => .{ .close_confirmed = uid },
             .close_others => .{ .close_others_confirmed = uid },
             .close_right => .{ .close_right_confirmed = uid },
+            .close_window => .{ .close_window_confirmed = uid },
         };
     }
 
@@ -1379,21 +1400,23 @@ test "overlay: a tab's menu has the rows that apply to it" {
     // A file tab, last of three: everything, with "Close to the Right" greyed out.
     o.openTabMenu(7, 0, 0, .{ .has_path = true, .document = true, .others = 2, .to_right = 0 });
     const rows = o.items();
-    try std.testing.expectEqual(@as(usize, 9), rows.len);
+    try std.testing.expectEqual(@as(usize, 11), rows.len);
     try std.testing.expectEqualStrings("Close", rows[0].label);
     try std.testing.expect(!rows[1].disabled);
     try std.testing.expect(rows[2].disabled);
     try std.testing.expect(rows[3].sep_before and rows[4].sep_before and rows[6].sep_before);
     try std.testing.expect(!rows[5].sep_before and !rows[7].sep_before and !rows[8].sep_before);
     try std.testing.expect(rows[8].submenu);
+    try std.testing.expect(rows[9].sep_before and !rows[9].submenu and !rows[9].disabled);
+    try std.testing.expectEqualStrings("Move to New Window", rows[10].label);
     try std.testing.expectEqual(@as(usize, 4), o.sub_labels.items.len);
 
     // Settings, alone: no "Rename Tab…", no path rows; the divider moves
     // down to "Split Right", the close-others rows are greyed out.
-    o.openTabMenu(8, 0, 0, .{ .renamable = false });
+    o.openTabMenu(8, 0, 0, .{ .renamable = false, .movable = false, .detachable = false });
     const alone = o.items();
-    try std.testing.expectEqual(@as(usize, 5), alone.len);
-    try std.testing.expect(alone[1].disabled and alone[2].disabled);
+    try std.testing.expectEqual(@as(usize, 7), alone.len);
+    try std.testing.expect(alone[1].disabled and alone[2].disabled and alone[5].disabled and alone[6].disabled);
     try std.testing.expectEqualStrings("Split Right", alone[3].label);
     try std.testing.expect(alone[3].sep_before and !alone[4].sep_before);
     // The keyboard steps over the greyed-out rows.
@@ -1417,6 +1440,15 @@ test "overlay: a tab's menu has the rows that apply to it" {
     o.openTabMenu(7, 0, 0, .{});
     try std.testing.expectEqual(Side.top, o.pickSub(2).split_tab.side);
     try std.testing.expect(!o.isOpen());
+    // "Move to…" only says which tab: the app lists where it can go.
+    o.openTabMenu(7, 0, 0, .{});
+    try std.testing.expectEqual(@as(u32, 7), o.pickMenu(6).move_tab);
+    o.openTabMenu(7, 0, 0, .{});
+    try std.testing.expectEqual(@as(u32, 7), o.pickMenu(7).move_tab_window);
+    // A separate window's close box answers with the window's group.
+    o.openConfirmAction(.close_window, 9, "Close this window?", "", "Close");
+    try std.testing.expect(o.aboutTab() == null);
+    try std.testing.expectEqual(@as(u32, 9), o.onEdit(.insert_newline).?.close_window_confirmed);
 
     // The edit menu: the rows that do not apply are greyed out and skipped.
     o.openEditMenu(40, 60, .{ .copy = true });

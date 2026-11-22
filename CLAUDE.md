@@ -38,7 +38,8 @@ The script language (`type`, `key`, `click`, `drag`, `open`, `action <App.Action
 - Scripts and the selftest do not read or write `~/.tt_workspace` unless `TT_WORKSPACE=<file>` names one.
 - Headless there is no window, so nothing hosted in a native view exists (website tabs show only their chrome, notebook HTML outputs have no web view). The clipboard and "open in browser" are printed as `clipboard → …` / `browser → …`.
 - Scripts and the selftest do not listen for `tt <path>` either unless `TT_SOCKET=<file>` names a socket of their own; the script command `cli /path` does what the argument does.
-- `TT_SELFTEST=1` on the windowed binary posts real NSEvents through the window to exercise the AppKit side (hit testing, first responder, key routing); extra legs are selected with `TT_SELFTEST_*` variables, each described in a comment in `src/platform/cocoa.zig`. `TT_SELFTEST_SNAP` / `TT_SELFTEST_WINDOW_PNG` name the output images.
+- `TT_SELFTEST=1` on the windowed binary posts real NSEvents through the window to exercise the AppKit side (hit testing, first responder, key routing); extra legs are selected with `TT_SELFTEST_*` variables, each described in a comment in `src/platform/cocoa.zig`. `TT_SELFTEST_SNAP` / `TT_SELFTEST_WINDOW_PNG` name the output images. `TT_SELFTEST_NOFOCUS=1` shows the windows without taking the keyboard (for legs that only post mouse events, like `TT_SELFTEST_WINDOWS`), so a run does not swallow what the user is typing elsewhere.
+- Headless there are no real windows either, but separate tab windows exist in the app all the same: `window N` addresses one (pointer, keyboard, `snap`), `frame` says where a window is on screen, `tabs` prints where every tab is.
 - `TT_DEBUG_EVENTS=1` prints input events, web-bridge messages and what a notebook kernel sends.
 
 ## Architecture
@@ -46,8 +47,8 @@ The script language (`type`, `key`, `click`, `drag`, `open`, `action <App.Action
 ### Layers
 
 - `src/main.zig` parses flags and picks one of three drivers: `probe` (session only), `script.runHeadless`, or `platform/cocoa.zig` `run`. Paths on the command line (`tt .`, `tt notes.md`) go through `src/cli.zig`: handed to the running tt over the socket `~/.tt/tt.sock` (`$TT_SOCKET` overrides it) and opened by `App.openPath` in the default project, else the app starts detached with them (`--foreground` keeps it attached and hands nothing over). The app menu's "Install CLI Tools…" (`App.Action.install_cli` → `cli.install`) links `/usr/local/bin/tt` to the running binary; `$TT_CLI_LINK` moves the link for tests.
-- `src/platform/cocoa.zig` is the macOS shell: NSApplication, NSWindow and one CAMetalLayer-backed NSView whose class is registered at runtime. It translates AppKit events into the `on*` methods of `App` and nothing else; app behaviour does not belong here.
-- `src/app.zig` is the platform-neutral core. `App` owns the renderer, UI state, tab manager, projects, workspace, palette and overlay. The loop is `update(now)` (tick every tab, serve tab requests, save the workspace) → `buildFrame()` (immediate-mode UI into the draw list) → `present()` or `snapshot(path)`. Everything a menu item, shortcut, palette row or script can trigger is an `App.Action` handled in `perform`.
+- `src/platform/cocoa.zig` is the macOS shell: NSApplication, and for every window of ours (the main one, plus one per tab the user took out of it) an NSWindow with one CAMetalLayer-backed NSView whose class is registered at runtime, kept in a `Win` record. It translates AppKit events into the `on*` / `pointer*` methods of `App` (saying which window they are for), makes the real windows match the app's list each tick, and nothing else; app behaviour does not belong here.
+- `src/app.zig` is the platform-neutral core. `App` owns the renderer, UI state, tab manager, projects, workspace, palette and overlay. The loop is `update(now)` (tick every tab, serve tab requests, save the workspace) → `buildFrame()` (immediate-mode UI into the draw list) → `present()` or `snapshot(path)`, then the same for each separate window (`buildWindowFrame` → `presentWindow`), one after the other since they share the glyph atlas. Everything a menu item, shortcut, palette row or script can trigger is an `App.Action` handled in `perform`.
 
 Because `script.zig` and `cocoa.zig` both drive the same `App`, a feature built in `App` and below is testable headless; anything that only exists in `cocoa.zig` is not.
 
@@ -74,6 +75,8 @@ Features so far:
 
 - `repo`: git for a repository. The files panel's Git view and the tree's colours (`entry/panel.zig`); the repository tab (`entry/tab.zig`, kind `repo`, `App.Action.open_repository`): History with its graph, Changes, Stashes, and Pull Requests; Settings › Git › Hosting (`entry/settings.zig`). Pull requests are the same model whichever host they come from (`model/pull_request.zig`): each of `client/github.zig`, `gitlab.zig`, `bitbucket.zig` and `gitea.zig` only builds requests and decodes answers, `client/forge.zig` sends them through `hosts.Http`, and a pull request's files and diffs come from local git (`client/pull_files.zig`), not from the host. A control a host has no answer for is hidden through `Capabilities`. Each backend is tested against JSON in `fixtures/`, written to the shapes the real APIs return.
 - `diff`: the side-by-side comparison tab, of the index and the working tree or of two revisions.
+- `windows`: a tab in a window of its own. `entry/window.zig` is `TabWindow`, what one separate window draws with (its own draw list, `Ui`, pane view, size and scale); `model/frames.zig` is where windows are on screen as plain numbers (which window a point is over, where a new one opens, the workspace record). `App` owns the windows (`detachTab`, `dropOutside`, `closeWindow`) and `platform/cocoa.zig` gives each an NSWindow. A separate window is tabs only: the strip in its titlebar band and the panes, no sidebar or files panel. The theme is one for all windows (it follows the display the main window is on).
+- `explorer`: the files tree of the files panel (`entry/tree.zig`, mounted by `ui/files.zig` beside the Search and Git views; `ui/files.zig` itself is only the panel's shell: the splitter and the Files / Search / Git strip). Rows carry an icon (`view/icon.zig`: a folder open or closed, a file by what it holds) and no disclosure arrow; an unfolded folder draws one vertical line per level. A click on a folder comes out of the view as an intent and the entry lists it through `hosts.Dirs`, so no frame reads the disk.
 
 `.ai/features/repos/view.md` names the parts of the repository view (and of the Git view's commit button) and says what each host can do; use those names.
 
@@ -91,7 +94,9 @@ Features so far:
 
 Tabs do not reach into `App`. They get an `Env` (allocator, history, clipboard, textures, native-view host) and ask for app-level effects by queueing a `Request` on it (`openUrl`, `sendToShell`, `runInShell`, `closeTab`, `openDiff`, and `askConfirm` / `askMenu` for a box or a menu, whose answer comes back through the tab's `answered` hook …), which `App.update` serves on the next tick. `Env.textures` and `Env.host` are null in tests and headless runs, and tab code must cope with that.
 
-Tabs live in *groups*, one per sidebar row (see below). Each group has a pane tree (`tabs/layout.zig`: splits by weight, panes holding an ordered list of tabs); `layout.zig` only computes geometry, `ui/panes.zig` and `ui/tabbar.zig` draw.
+Tabs live in *groups*, one per sidebar row (see below), plus one per separate window (a *window group*, ids from `TabManager.window_group_base`). Each group has a pane tree (`tabs/layout.zig`: splits by weight, panes holding an ordered list of tabs); `layout.zig` only computes geometry, `ui/panes.zig` and `ui/tabbar.zig` draw.
+
+`TabManager.shown` is the row in the main window's strip; `keyed` is the window group that has the keyboard instead, when a separate window is key. `group()`, `pane()`, `current()`, `open*`, `close` and the like mean "where the user is" (`keyed orelse shown`), so actions and typing go to the key window without knowing about windows; code that is about the main window (the sidebar, the files panel, `keepShowingSomething`) says `shown` / `shownGroup()`. Pane ids are unique across groups, so `moveTab` takes a tab to any pane of any group, and `moveTabToGroup` to a row's or a window's tabs: the tab is the same object afterwards. A tab dragged by its title lands in a strip or a pane of its window, on a sidebar row (that row's own tabs), on another window (what it shows), or, let go outside every window, in a new window of its own; the tab menu's "Move to…" and "Move to New Window" do the same without a drag.
 
 ### Projects, groups and persistence
 
@@ -103,7 +108,7 @@ State is three plain files, each with its format documented at the top of its mo
 | --- | --- | --- |
 | `~/.tt/config.yml` | `src/config.zig` | Hand-editable YAML subset; unknown keys ignored; older key names still read |
 | `~/.tt_projects` | `src/projects.zig` | Tab-separated lines |
-| `~/.tt_workspace` | `src/workspace.zig` | Records per `src/records.zig`; a kind takes part by implementing `save` and reading `OpenArgs.saved` |
+| `~/.tt_workspace` | `src/workspace.zig` | Records per `src/records.zig`; a kind takes part by implementing `save` and reading `OpenArgs.saved`; separate windows come back too (`window` records: frame and tabs) |
 
 Changes to these formats must keep older files readable (see the version and legacy-key handling already there).
 

@@ -32,6 +32,7 @@ The default project has resources too, exactly like a folder project.
 | Toggle | The collapse button. When the sidebar is collapsed nothing of it stays on screen except this toggle, which moves into the titlebar band next to the traffic lights. |
 | Edge | The right border, dragged to resize the sidebar. |
 | Drop indicator | The line shown while a row is dragged to reorder projects or to move a resource within or between projects. |
+| Drop target | A row lit while a tab dragged from a strip (or a file dragged from the files panel) is over it. A tab let go there joins that row's own tabs (`Result.drop_tab`): a project row its own, a resource row the resource's. The row the tab is already in is not a target. The tab menu's "Move to…" lists the same rows. |
 | Hints | The ⌥ jump-key letters and digits drawn on rows (`Hints`). |
 
 ## Model notes

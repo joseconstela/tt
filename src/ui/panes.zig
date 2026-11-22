@@ -1,11 +1,15 @@
-//! The content area as split panes, VS Code style. Draws the group on show:
+//! The content area as split panes, VS Code style. Draws one group, the
+//! one a window shows (the main window: the sidebar row on show; a separate
+//! window: its own):
 //! every pane's tab strip (in the titlebar band for the panes along the top,
 //! at the pane's own top otherwise), the active tab of each pane, the
 //! dividers between them (drag to resize) and, while a tab is being dragged
 //! by its title, the drop hint and the ghost. A press inside a pane focuses
 //! it. The tree itself lives in `tabs/layout.zig`; the moves it takes are
 //! applied straight to the tab manager, the app only learns that
-//! something changed.
+//! something changed. A tab let go where nothing of this window is, beyond
+//! its edges, is the app's to place (`Result.torn`): on another window, or
+//! in a new one.
 const std = @import("std");
 const ui_mod = @import("ui.zig");
 const theme = @import("theme.zig");
@@ -31,22 +35,45 @@ pub const Result = struct {
     /// A file dragged from the files panel was let go over a strip or a
     /// pane: where. The app opens it there.
     file_drop: ?tabbar.DropTarget = null,
+    /// A tab was let go outside the window.
+    torn: ?Torn = null,
+};
+
+/// A tab dragged out of its window: where the pointer was when it was let
+/// go (this view's coordinates, so beyond `Options.bounds`), and where in
+/// the tab it had been grabbed.
+pub const Torn = struct { uid: u32, x: f32, y: f32, grab_dx: f32 };
+
+/// What `PaneView.draw` is told about the window around it.
+pub const Options = struct {
+    /// Where the first strip may start (past the traffic lights and the
+    /// sidebar's toggle while the sidebar is collapsed).
+    band_inset: f32 = 0,
+    /// The files toggle in the band: whether the panel is on show. Null:
+    /// this window has no files panel.
+    files_visible: ?bool = null,
+    window_focused: bool = true,
+    /// ⌥ is held, the tabs show their jump digits (null: not).
+    hints: ?tabbar.TabHints = null,
+    /// The whole window, in the view's coordinates.
+    bounds: Rect,
 };
 
 pub const PaneView = struct {
     /// The tab being dragged by its title, if any.
     drag: ?tabbar.Drag = null,
 
-    /// `band_inset`: where the first strip may start (past the traffic
-    /// lights and the sidebar's toggle while the sidebar is collapsed).
-    /// `hints`: ⌥ is held, the tabs show their jump digits (null: not).
-    pub fn draw(self: *PaneView, ui: *Ui, tabs: *tab_mod.TabManager, band: Rect, content: Rect, band_inset: f32, files_visible: bool, window_focused: bool, hints: ?tabbar.TabHints) Result {
+    /// Draws group `g`: its strips in `band` (and at the top of the panes
+    /// that are not along the top), its panes in `content`.
+    pub fn draw(self: *PaneView, ui: *Ui, tabs: *tab_mod.TabManager, g: *tab_mod.Group, band: Rect, content: Rect, opts: Options) Result {
         const dl = ui.dl;
         var res: Result = .{};
-        const cluster = tabbar.drawCluster(ui, band, files_visible);
+        const cluster = tabbar.drawCluster(ui, band, opts.files_visible);
         res.toggle_files = cluster.toggle_files;
+        const band_inset = opts.band_inset;
+        const window_focused = opts.window_focused;
+        const hints = opts.hints;
 
-        const g = tabs.group();
         const l = &g.layout;
         if (self.drag) |*d| d.target = null;
 
@@ -150,7 +177,11 @@ pub const PaneView = struct {
 
         if (self.drag) |*d| {
             if (ui.released) {
-                if (d.kind == .file) res.file_drop = d.target else applyDrop(tabs, d);
+                if (d.kind == .file) {
+                    res.file_drop = d.target;
+                } else if (d.target == null and !opts.bounds.contains(ui.mx, ui.my)) {
+                    res.torn = .{ .uid = d.uid, .x = ui.mx, .y = ui.my, .grab_dx = d.grab_dx };
+                } else applyDrop(tabs, d);
                 self.drag = null;
                 res.changed = true;
             } else if (!ui.down) {

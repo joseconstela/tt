@@ -84,18 +84,7 @@ pub const Renderer = struct {
         const atlas_tex = msg(id, device, "newTextureWithDescriptor:", .{tex_desc});
         if (atlas_tex == null) return error.AtlasTextureFailed;
 
-        if (layer != null) {
-            msg(void, layer, "setDevice:", .{device});
-            msg(void, layer, "setPixelFormat:", .{MTLPixelFormatBGRA8Unorm});
-            msg(void, layer, "setFramebufferOnly:", .{true});
-            msg(void, layer, "setOpaque:", .{true});
-            // Interpret our colours as sRGB so hex values match the design.
-            const cs = apple.CGColorSpaceCreateWithName(apple.kCGColorSpaceSRGB);
-            msg(void, layer, "setColorspace:", .{cs});
-            apple.CGColorSpaceRelease(cs);
-        }
-
-        return .{
+        const self: Renderer = .{
             .device = device,
             .queue = queue,
             .pipeline = pipeline,
@@ -103,6 +92,22 @@ pub const Renderer = struct {
             .layer = layer,
             .textures = .{ .device = device, .queue = queue },
         };
+        if (layer != null) self.attach(layer);
+        return self;
+    }
+
+    /// Makes a layer one this renderer can present to: the main window's
+    /// (`init` does it) and that of every separate window. They share the
+    /// device, the pipeline, the glyph atlas and the image textures.
+    pub fn attach(self: *const Renderer, layer: id) void {
+        msg(void, layer, "setDevice:", .{self.device});
+        msg(void, layer, "setPixelFormat:", .{MTLPixelFormatBGRA8Unorm});
+        msg(void, layer, "setFramebufferOnly:", .{true});
+        msg(void, layer, "setOpaque:", .{true});
+        // Interpret our colours as sRGB so hex values match the design.
+        const cs = apple.CGColorSpaceCreateWithName(apple.kCGColorSpaceSRGB);
+        msg(void, layer, "setColorspace:", .{cs});
+        apple.CGColorSpaceRelease(cs);
     }
 
     fn describe(err: id) []const u8 {
@@ -111,8 +116,13 @@ pub const Renderer = struct {
     }
 
     pub fn setDrawableSize(self: *Renderer, w_px: f64, h_px: f64, scale: f64) void {
-        msg(void, self.layer, "setContentsScale:", .{scale});
-        msg(void, self.layer, "setDrawableSize:", .{objc.CGSize{ .width = w_px, .height = h_px }});
+        setLayerSize(self.layer, w_px, h_px, scale);
+    }
+
+    /// The same for any attached layer.
+    pub fn setLayerSize(layer: id, w_px: f64, h_px: f64, scale: f64) void {
+        msg(void, layer, "setContentsScale:", .{scale});
+        msg(void, layer, "setDrawableSize:", .{objc.CGSize{ .width = w_px, .height = h_px }});
     }
 
     fn uploadAtlas(self: *Renderer, text: *text_mod.TextEngine) void {
@@ -183,12 +193,17 @@ pub const Renderer = struct {
         msg(void, enc, "endEncoding", .{});
     }
 
-    /// Renders the draw list to the layer's next drawable.
+    /// Renders the draw list to the main layer's next drawable.
     pub fn present(self: *Renderer, dl: *draw.DrawList, text: *text_mod.TextEngine, clear: draw.Color) void {
+        self.presentTo(self.layer, dl, text, clear);
+    }
+
+    /// Renders a draw list to the next drawable of an attached layer.
+    pub fn presentTo(self: *Renderer, layer: id, dl: *draw.DrawList, text: *text_mod.TextEngine, clear: draw.Color) void {
         const pool = objc.AutoreleasePool.push();
         defer pool.pop();
 
-        const drawable = msg(id, self.layer, "nextDrawable", .{});
+        const drawable = msg(id, layer, "nextDrawable", .{});
         if (drawable == null) return;
         const target = msg(id, drawable, "texture", .{});
         const w: f32 = @floatFromInt(msg(NSUInteger, target, "width", .{}));

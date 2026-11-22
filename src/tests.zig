@@ -36,6 +36,8 @@ test {
     _ = @import("sys.zig");
     _ = @import("features/repo/repo.zig");
     _ = @import("features/diff/diff.zig");
+    _ = @import("features/explorer/explorer.zig");
+    _ = @import("features/windows/windows.zig");
     _ = @import("coding_agents.zig");
     _ = @import("agent_cli.zig");
     _ = @import("paths.zig");

@@ -1,6 +1,18 @@
 //! macOS shell of the app, written against the Objective-C runtime directly:
 //! NSApplication + NSWindow + one CAMetalLayer-backed NSView. The view class
 //! is registered at runtime and forwards input to the platform-neutral `App`.
+//!
+//! There is one main window, and one more for every tab the user took out
+//! of it (`features/windows`: the app keeps a `TabWindow` for each, this
+//! file gives it an NSWindow). Every window of ours has a `Win` record and
+//! a view of the same class; a handler finds its record from the view it
+//! is called on, or from the window a notification is about, and tells the
+//! app which window the event is for. `tick` makes the real windows match
+//! the app's list (opening, closing, moving, bringing forward), then builds
+//! and presents a frame for each window that is on screen. A native view a
+//! tab hosts (a web page) lives under the content view of the window whose
+//! frame last placed it. The theme is one for all windows: it follows the
+//! display the main window is on (Settings › Style › Per screen).
 const std = @import("std");
 const objc = @import("../objc.zig");
 const apple = @import("../apple.zig");
@@ -16,6 +28,11 @@ const TerminalTab = @import("../tabs/terminal_tab.zig").TerminalTab;
 const NotebookTab = @import("../tabs/notebook_tab.zig").NotebookTab;
 const notify = @import("notify.zig");
 const cfg_mod = @import("../config.zig");
+const windows_feature = @import("../features/windows/windows.zig");
+const Renderer = @import("../gfx/renderer.zig").Renderer;
+
+const TabWindow = windows_feature.TabWindow;
+const Frame = windows_feature.Frame;
 
 const id = objc.id;
 const SEL = objc.SEL;
@@ -36,19 +53,48 @@ const mod_alt: NSUInteger = 1 << 19;
 const mod_cmd: NSUInteger = 1 << 20;
 const style_fullscreen: NSUInteger = 1 << 14;
 
+/// One window of ours and what goes with it.
+const Win = struct {
+    window: id = null,
+    view: id = null,
+    /// The view's CAMetalLayer.
+    layer: id = null,
+    toolbar: id = null,
+    /// The app's record when this is a separate window; null: the main one.
+    tab: ?*TabWindow = null,
+    cursor: ui_mod.Cursor = .arrow,
+    /// Ticks left on which the traffic-light inset is re-read: AppKit moves
+    /// the buttons a little after the toolbar is put back.
+    chrome_recheck: u8 = 0,
+    /// A frame was due while the window was not on screen: it is drawn
+    /// when it is again.
+    stale: bool = false,
+    /// What the window's title was last made from (a separate window is
+    /// named after the tab in front, for the Window menu).
+    title_hash: u64 = 0,
+};
+
 const Globals = struct {
     gpa: std.mem.Allocator = undefined,
     opts: app_mod.LaunchOptions = .{},
     app: ?*app_mod.App = null,
     nsapp: id = null,
+    /// The main window and its view (`main` holds the same two).
     window: id = null,
     view: id = null,
-    toolbar: id = null,
+    main: Win = .{},
+    /// The separate windows.
+    wins: std.ArrayList(*Win) = .empty,
+    /// The application delegate, every window's delegate too.
+    delegate: id = null,
+    /// The window whose frame is being built: where a native view placed
+    /// by that frame belongs.
+    building: ?*Win = null,
+    /// The little panel that follows the pointer while a tab is dragged
+    /// outside its window, and the label in it.
+    ghost: id = null,
+    ghost_label: id = null,
     view_class: objc.Class = null,
-    cursor: ui_mod.Cursor = .arrow,
-    /// Ticks left on which the traffic-light inset is re-read: AppKit moves
-    /// the buttons a little after the toolbar is put back.
-    chrome_recheck: u8 = 0,
     /// The scheme the window's own appearance (titlebar, native panels)
     /// was last matched to.
     applied_scheme: ?theme.Scheme = null,
@@ -57,6 +103,9 @@ const Globals = struct {
     /// Whether the titlebar was last sized for compact mode.
     applied_compact: bool = false,
     debug_events: bool = false,
+    /// TT_SELFTEST_NOFOCUS: the self test's windows come to the front
+    /// without taking the keyboard from whatever the user is typing in.
+    nofocus: bool = false,
     selftest: bool = false,
     selftest_step: u32 = 0,
     selftest_fs_phase: u32 = 0,
@@ -69,6 +118,7 @@ pub fn run(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
     g.opts = opts;
     g.debug_events = sys.getenv("TT_DEBUG_EVENTS") != null;
     g.selftest = sys.getenv("TT_SELFTEST") != null;
+    g.nofocus = g.selftest and sys.getenv("TT_SELFTEST_NOFOCUS") != null;
 
     const pool = objc.AutoreleasePool.push();
     defer pool.pop();
@@ -77,6 +127,7 @@ pub fn run(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
     msg(void, g.nsapp, "setActivationPolicy:", .{@as(NSInteger, 0)});
     g.view_class = registerViewClass();
     const delegate = msg(id, msg(id, registerDelegateClass(), "alloc", .{}), "init", .{});
+    g.delegate = delegate;
     msg(void, g.nsapp, "setDelegate:", .{delegate});
     msg(void, g.nsapp, "run", .{});
 }
@@ -95,6 +146,8 @@ fn registerDelegateClass() objc.Class {
     b.method("windowDidEnterFullScreen:", windowChromeChanged, "v@:@");
     b.method("windowDidExitFullScreen:", windowDidExitFullScreen, "v@:@");
     b.method("windowDidResize:", windowChromeChanged, "v@:@");
+    b.method("windowDidMove:", windowDidMove, "v@:@");
+    b.method("windowShouldClose:", windowShouldClose, "B@:@");
     // The window moved to another display, or displays were plugged in /
     // out: the theme may have to change with it (Settings › Mode › Per screen).
     b.method("windowDidChangeScreen:", screensChanged, "v@:@");
@@ -159,20 +212,367 @@ fn willTerminate(_: id, _: SEL, _: id) callconv(.c) void {
     }
 }
 
-fn windowFocusChanged(_: id, _: SEL, _: id) callconv(.c) void {
+// ── windows ──────────────────────────────────────────────────────────────
+/// A separate window's record in the app, while the app still has it (it
+/// forgets a window whose last tab closed before the real one is gone).
+fn liveTab(win: *const Win) ?*TabWindow {
+    const app = g.app orelse return null;
+    const tw = win.tab orelse return null;
+    for (app.windows.items) |w| {
+        if (w == tw) return tw;
+    }
+    return null;
+}
+
+/// A window of ours an event is for, and which of the app's it is.
+const Hit = struct {
+    win: *Win,
+    /// Null: the main window.
+    tab: ?*TabWindow,
+};
+
+fn hitOf(win: *Win) ?Hit {
+    if (win == &g.main) return .{ .win = win, .tab = null };
+    const tw = liveTab(win) orelse return null;
+    return .{ .win = win, .tab = tw };
+}
+
+/// The window a view of ours is the content of. Null for a view that is
+/// not set up yet, or whose window the app has let go of.
+fn hitOfView(view: id) ?Hit {
+    if (view == null) return null;
+    if (view == g.main.view) return hitOf(&g.main);
+    for (g.wins.items) |w| {
+        if (w.view == view) return hitOf(w);
+    }
+    return null;
+}
+
+fn winOfWindow(window: id) ?*Win {
+    if (window == null) return null;
+    if (window == g.main.window) return &g.main;
+    for (g.wins.items) |w| {
+        if (w.window == window) return w;
+    }
+    return null;
+}
+
+/// The window a delegate notification is about.
+fn winOfNotification(note: id) ?*Win {
+    if (note == null) return null;
+    return winOfWindow(msg(id, note, "object", .{}));
+}
+
+/// The window that has the keyboard as far as the app goes.
+fn keyWin() *Win {
+    const app = g.app orelse return &g.main;
+    const gid = app.tabs.keyed orelse return &g.main;
+    for (g.wins.items) |w| {
+        if (liveTab(w)) |tw| if (tw.group == gid) return w;
+    }
+    return &g.main;
+}
+
+fn windowFocusChanged(_: id, _: SEL, note: id) callconv(.c) void {
     const app = g.app orelse return;
-    app.chrome.window_focused = msg(bool, g.window, "isKeyWindow", .{});
-    // Keys let go of in another app never reach us: as far as tt knows
-    // they are all up (a ⌥ jump under way ends where it got to).
-    if (!app.chrome.window_focused) {
+    const win = winOfNotification(note) orelse return;
+    const hit = hitOf(win) orelse return;
+    const focused = msg(bool, win.window, "isKeyWindow", .{});
+    if (hit.tab) |tw| tw.chrome.window_focused = focused else app.chrome.window_focused = focused;
+    if (focused) {
+        app.onWindowKey(if (hit.tab) |tw| tw.group else null);
+    } else if (msg(id, g.nsapp, "keyWindow", .{}) == null) {
+        // Keys let go of in another app never reach us: as far as tt knows
+        // they are all up (a ⌥ jump under way ends where it got to).
         if (g.debug_events) std.debug.print("flags cleared (window resigned key)\n", .{});
         app.onFlags(.{});
     }
     app.invalidate();
 }
 
-fn windowChromeChanged(_: id, _: SEL, _: id) callconv(.c) void {
-    updateChrome();
+fn windowChromeChanged(_: id, _: SEL, note: id) callconv(.c) void {
+    const win = winOfNotification(note) orelse return;
+    updateChrome(win);
+    reportFrame(win);
+}
+
+fn windowDidMove(_: id, _: SEL, note: id) callconv(.c) void {
+    if (winOfNotification(note)) |win| reportFrame(win);
+}
+
+/// The close button. The main window is the app: closing it quits (after
+/// the question about unsaved work, which can cancel it). A separate
+/// window asks the app, which closes its tabs (after its own question);
+/// the real window goes when the app has let go of it (`reconcileWindows`).
+fn windowShouldClose(_: id, _: SEL, window: id) callconv(.c) bool {
+    const app = g.app orelse return true;
+    const win = winOfWindow(window) orelse return true;
+    if (win == &g.main) {
+        msg(void, g.nsapp, "terminate:", .{@as(id, null)});
+        return false;
+    }
+    if (liveTab(win)) |tw| app.closeWindow(tw);
+    return false;
+}
+
+/// The height of the main display: AppKit counts y up from its bottom
+/// edge, `Frame` down from its top.
+fn primaryHeight() f64 {
+    const list = msg(id, objc.class("NSScreen"), "screens", .{});
+    if (list == null or msg(NSUInteger, list, "count", .{}) == 0) return 0;
+    const screen = msg(id, list, "objectAtIndex:", .{@as(NSUInteger, 0)});
+    return msg(CGRect, screen, "frame", .{}).size.height;
+}
+
+fn frameOf(r: CGRect) Frame {
+    return .{
+        .x = @floatCast(r.origin.x),
+        .y = @floatCast(primaryHeight() - (r.origin.y + r.size.height)),
+        .w = @floatCast(r.size.width),
+        .h = @floatCast(r.size.height),
+    };
+}
+
+fn rectOf(f: Frame) CGRect {
+    return CGRect.make(f.x, primaryHeight() - (f.y + f.h), f.w, f.h);
+}
+
+/// Tells the app where a window is on screen: what a tab let go outside
+/// its window lands on goes by these.
+fn reportFrame(win: *Win) void {
+    const app = g.app orelse return;
+    const hit = hitOf(win) orelse return;
+    const f = frameOf(msg(CGRect, win.window, "frame", .{}));
+    if (hit.tab) |tw| {
+        tw.frame = f;
+    } else app.main_frame = f;
+}
+
+/// A window with the looks all of ours share: no title, a transparent
+/// titlebar the content runs under, and an empty unified toolbar that makes
+/// the titlebar 52pt tall (the height of the design's header row) and
+/// centres the traffic lights in it; in compact mode the unified-compact
+/// style makes it `theme.header_h` (38pt).
+fn makeWindow(win: *Win, frame: CGRect, min: CGSize) void {
+    const style: NSUInteger = 1 | 2 | 4 | 8 | (1 << 15); // titled, closable, miniaturizable, resizable, fullSizeContentView
+    const window = msg(id, objc.alloc("NSWindow"), "initWithContentRect:styleMask:backing:defer:", .{ frame, style, @as(NSUInteger, 2), false });
+    win.window = window;
+    msg(void, window, "setReleasedWhenClosed:", .{false});
+    msg(void, window, "setTitle:", .{objc.nsString("tt")});
+    msg(void, window, "setTitlebarAppearsTransparent:", .{true});
+    msg(void, window, "setTitleVisibility:", .{@as(NSInteger, 1)}); // hidden
+    msg(void, window, "setTabbingMode:", .{@as(NSInteger, 2)}); // we have our own tabs
+    msg(void, window, "setMinSize:", .{min});
+    msg(void, window, "setDelegate:", .{g.delegate});
+
+    const toolbar = msg(id, objc.alloc("NSToolbar"), "initWithIdentifier:", .{objc.nsString("tt.toolbar")});
+    msg(void, toolbar, "setShowsBaselineSeparator:", .{false});
+    msg(void, window, "setToolbar:", .{toolbar});
+    win.toolbar = toolbar;
+    styleToolbar(win);
+
+    const view = msg(id, msg(id, g.view_class, "alloc", .{}), "initWithFrame:", .{frame});
+    win.view = view;
+    msg(void, view, "setWantsLayer:", .{true});
+    win.layer = msg(id, view, "layer", .{});
+}
+
+/// The view under the pointer hears about it wherever the pointer goes in
+/// it, key window or not.
+fn trackPointer(win: *Win) void {
+    const tracking = msg(id, objc.alloc("NSTrackingArea"), "initWithRect:options:owner:userInfo:", .{
+        msg(CGRect, win.view, "bounds", .{}),
+        @as(NSUInteger, 0x01 | 0x02 | 0x80 | 0x200), // enter/exit, moved, always active, in visible rect
+        win.view,
+        @as(id, null),
+    });
+    msg(void, win.view, "addTrackingArea:", .{tracking});
+    objc.release(tracking); // the view keeps it
+}
+
+/// Puts a window in front; `key`: with the keyboard. (The no-focus self
+/// test never takes the keyboard, and shows its windows over whatever app
+/// is active so that they are drawn.)
+fn bringForward(win: *const Win, key: bool) void {
+    if (g.nofocus) {
+        msg(void, win.window, "orderFrontRegardless", .{});
+    } else if (key) {
+        msg(void, win.window, "makeKeyAndOrderFront:", .{@as(id, null)});
+    } else msg(void, win.window, "orderFront:", .{@as(id, null)});
+}
+
+/// The real window for one of the app's separate windows: where the app
+/// asked (the tab that was dragged out under the pointer; where it was in
+/// the last run), else a step down and right of the main window.
+fn openTabWindow(app: *app_mod.App, tw: *TabWindow) void {
+    const win = g.gpa.create(Win) catch return;
+    win.* = .{ .tab = tw };
+    const frame = CGRect.make(0, 0, tw.raw_width, tw.raw_height);
+    makeWindow(win, frame, .{ .width = windows_feature.frames.min_w, .height = windows_feature.frames.min_h });
+    app.renderer.attach(win.layer);
+    trackPointer(win);
+    msg(void, win.window, "setContentView:", .{win.view});
+    objc.release(win.view); // the window keeps it, for as long as `win` lives
+    _ = msg(bool, win.window, "makeFirstResponder:", .{win.view});
+    dressWindow(win);
+    if (tw.place) |f| {
+        placeWindow(win, f);
+    } else {
+        const from = msg(CGRect, g.main.window, "frame", .{});
+        const offset: f64 = 28 * @as(f64, @floatFromInt(1 + g.wins.items.len % 8));
+        msg(void, win.window, "setFrameTopLeftPoint:", .{CGPoint{ .x = from.origin.x + offset, .y = from.origin.y + from.size.height - offset }});
+    }
+    tw.place = null;
+    tw.native = win;
+    // Known from here on: the view's own callbacks find it.
+    g.wins.append(g.gpa, win) catch {};
+    updateGeometry(win);
+    reportFrame(win);
+    win.chrome_recheck = 60;
+    // With the keyboard when the app put the user in it (a tab just taken
+    // out); a window that is back from the last run only shows.
+    bringForward(win, app.tabs.keyed == tw.group);
+}
+
+/// Puts a window at `f`, kept on a screen that is there.
+fn placeWindow(win: *Win, f: Frame) void {
+    var screens: [8]Frame = undefined;
+    var n: usize = 0;
+    const list = msg(id, objc.class("NSScreen"), "screens", .{});
+    const count: usize = if (list == null) 0 else @intCast(msg(NSUInteger, list, "count", .{}));
+    while (n < count and n < screens.len) : (n += 1) {
+        const screen = msg(id, list, "objectAtIndex:", .{@as(NSUInteger, n)});
+        screens[n] = frameOf(msg(CGRect, screen, "visibleFrame", .{}));
+    }
+    const fitted = windows_feature.frames.clamp(f, screens[0..n]);
+    msg(void, win.window, "setFrame:display:", .{ rectOf(fitted), true });
+}
+
+/// Closes a separate window the app has let go of. A native view still
+/// under it (a page whose tab went to another window and has not drawn
+/// there yet) waits under the main window, hidden.
+fn closeTabWindow(win: *Win) void {
+    for (hosted.items) |*h| {
+        if (h.owner != win) continue;
+        msg(void, h.box, "removeFromSuperview", .{});
+        msg(void, h.box, "setHidden:", .{true});
+        msg(void, g.main.view, "addSubview:", .{h.box});
+        h.owner = &g.main;
+        h.shown = false;
+    }
+    for (hosted.items) |*h| {
+        if (h.placed_by == win) h.placed_by = null;
+    }
+    if (g.building == win) g.building = null;
+    msg(void, win.window, "setDelegate:", .{@as(id, null)});
+    msg(void, win.window, "orderOut:", .{@as(id, null)});
+    msg(void, win.window, "close", .{});
+    if (win.toolbar != null) objc.release(win.toolbar);
+    objc.release(win.window);
+    for (g.wins.items, 0..) |w, i| {
+        if (w != win) continue;
+        _ = g.wins.orderedRemove(i);
+        break;
+    }
+    g.gpa.destroy(win);
+}
+
+/// Makes the real windows match the app's: closes those it let go of,
+/// opens those it made, moves those it wants elsewhere, and brings forward
+/// the one it put the user in.
+fn reconcileWindows(app: *app_mod.App) void {
+    var i: usize = g.wins.items.len;
+    while (i > 0) {
+        i -= 1;
+        const win = g.wins.items[i];
+        if (liveTab(win) == null) closeTabWindow(win);
+    }
+    // By index: opening a window runs AppKit callbacks.
+    var k: usize = 0;
+    while (k < app.windows.items.len) : (k += 1) {
+        const tw = app.windows.items[k];
+        if (tw.native == null) {
+            openTabWindow(app, tw);
+        } else if (tw.place) |f| {
+            const win: *Win = @ptrCast(@alignCast(tw.native.?));
+            tw.place = null;
+            placeWindow(win, f);
+        }
+    }
+    if (app.takeRaise()) |r| {
+        const win: ?*Win = switch (r) {
+            .main => &g.main,
+            .window => |tw| if (tw.native) |n| @as(*Win, @ptrCast(@alignCast(n))) else null,
+        };
+        if (win) |w| {
+            if (msg(bool, w.window, "isMiniaturized", .{})) msg(void, w.window, "deminiaturize:", .{@as(id, null)});
+            bringForward(w, true);
+        }
+    }
+}
+
+/// A separate window is named after the tab in front (the Window menu,
+/// Mission Control); its titlebar shows no title.
+fn syncTitle(app: *app_mod.App, win: *Win, tw: *TabWindow) void {
+    const group = app.tabs.findGroup(tw.group) orelse return;
+    const t = group.current() orelse return;
+    var buf: [tab_mod.TabManager.max_title_len]u8 = undefined;
+    const title = t.title(&buf);
+    const hash = std.hash.Wyhash.hash(0, title);
+    if (hash == win.title_hash) return;
+    win.title_hash = hash;
+    msg(void, win.window, "setTitle:", .{objc.nsString(title)});
+}
+
+// ── the ghost of a tab dragged outside its window ────────────────────────
+/// While a tab is dragged beyond its window's edge the ghost the app draws
+/// is cut off there, so a small panel with the tab's title follows the
+/// pointer instead. It takes no clicks and never the keyboard.
+fn syncDragGhost(app: *app_mod.App) void {
+    var buf: [tab_mod.TabManager.max_title_len]u8 = undefined;
+    const title = app.draggedOut(&buf) orelse {
+        if (g.ghost != null) msg(void, g.ghost, "orderOut:", .{@as(id, null)});
+        return;
+    };
+    if (g.ghost == null) {
+        // Borderless and non-activating, above everything while it shows.
+        const panel = msg(id, objc.alloc("NSPanel"), "initWithContentRect:styleMask:backing:defer:", .{ CGRect.make(0, 0, 120, 28), @as(NSUInteger, 1 << 7), @as(NSUInteger, 2), false });
+        msg(void, panel, "setReleasedWhenClosed:", .{false});
+        msg(void, panel, "setLevel:", .{@as(NSInteger, 101)});
+        msg(void, panel, "setIgnoresMouseEvents:", .{true});
+        msg(void, panel, "setOpaque:", .{false});
+        msg(void, panel, "setHasShadow:", .{true});
+        msg(void, panel, "setBackgroundColor:", .{msg(id, objc.class("NSColor"), "clearColor", .{})});
+        const content = msg(id, panel, "contentView", .{});
+        msg(void, content, "setWantsLayer:", .{true});
+        const label = msg(id, objc.class("NSTextField"), "labelWithString:", .{objc.nsString("")});
+        msg(void, label, "setFont:", .{msg(id, objc.class("NSFont"), "systemFontOfSize:weight:", .{ @as(f64, 13), @as(f64, 0.23) })});
+        msg(void, content, "addSubview:", .{label});
+        g.ghost = panel;
+        g.ghost_label = label;
+    }
+    // In the theme's colours, which can change between two drags.
+    const content = msg(id, g.ghost, "contentView", .{});
+    if (msg(id, content, "layer", .{})) |layer| {
+        msg(void, layer, "setCornerRadius:", .{@as(f64, 8)});
+        msg(void, layer, "setBorderWidth:", .{@as(f64, 1)});
+        msg(void, layer, "setBackgroundColor:", .{msg(?*anyopaque, nsColor(theme.bg_panel), "CGColor", .{})});
+        msg(void, layer, "setBorderColor:", .{msg(?*anyopaque, nsColor(theme.line_strong), "CGColor", .{})});
+    }
+    msg(void, g.ghost_label, "setTextColor:", .{nsColor(theme.text)});
+    msg(void, g.ghost_label, "setStringValue:", .{objc.nsString(title)});
+    msg(void, g.ghost_label, "sizeToFit", .{});
+    const text = msg(CGRect, g.ghost_label, "frame", .{}).size;
+    const w = @min(text.width, 260) + 28;
+    const h: f64 = 28;
+    msg(void, g.ghost_label, "setFrame:", .{CGRect.make(14, (h - text.height) / 2, w - 28, text.height)});
+    const at = msg(CGPoint, objc.class("NSEvent"), "mouseLocation", .{});
+    msg(void, g.ghost, "setFrame:display:", .{ CGRect.make(at.x - 24, at.y - h / 2, w, h), true });
+    msg(void, g.ghost, "orderFront:", .{@as(id, null)});
+}
+
+fn nsColor(c: ui_mod.Color) id {
+    return msg(id, objc.class("NSColor"), "colorWithSRGBRed:green:blue:alpha:", .{ @as(f64, c.r), @as(f64, c.g), @as(f64, c.b), @as(f64, c.a) });
 }
 
 /// In full screen AppKit hosts the toolbar in a window of its own pinned
@@ -182,44 +582,28 @@ fn windowChromeChanged(_: id, _: SEL, _: id) callconv(.c) void {
 /// detached for the stay and put back once the window is normal again (a
 /// toolbar attached while still full screen is never laid out, leaving a
 /// standard-height titlebar).
-fn windowWillEnterFullScreen(_: id, _: SEL, _: id) callconv(.c) void {
-    msg(void, g.window, "setToolbar:", .{@as(id, null)});
+fn windowWillEnterFullScreen(_: id, _: SEL, note: id) callconv(.c) void {
+    const win = winOfNotification(note) orelse return;
+    msg(void, win.window, "setToolbar:", .{@as(id, null)});
 }
 
-fn windowDidExitFullScreen(_: id, _: SEL, _: id) callconv(.c) void {
-    if (g.toolbar != null) msg(void, g.window, "setToolbar:", .{g.toolbar});
-    updateChrome();
-    g.chrome_recheck = 60;
+fn windowDidExitFullScreen(_: id, _: SEL, note: id) callconv(.c) void {
+    const win = winOfNotification(note) orelse return;
+    if (win.toolbar != null) msg(void, win.window, "setToolbar:", .{win.toolbar});
+    updateChrome(win);
+    win.chrome_recheck = 60;
 }
 
-fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
+fn didFinishLaunching(_: id, _: SEL, _: id) callconv(.c) void {
     buildMenu();
 
     const frame = CGRect.make(0, 0, g.opts.width, g.opts.height);
-    const style: NSUInteger = 1 | 2 | 4 | 8 | (1 << 15); // titled, closable, miniaturizable, resizable, fullSizeContentView
-    const window = msg(id, objc.alloc("NSWindow"), "initWithContentRect:styleMask:backing:defer:", .{ frame, style, @as(NSUInteger, 2), false });
+    makeWindow(&g.main, frame, .{ .width = 760, .height = 480 });
+    const window = g.main.window;
+    const view = g.main.view;
     g.window = window;
-    msg(void, window, "setReleasedWhenClosed:", .{false});
-    msg(void, window, "setTitle:", .{objc.nsString("tt")});
-    msg(void, window, "setTitlebarAppearsTransparent:", .{true});
-    msg(void, window, "setTitleVisibility:", .{@as(NSInteger, 1)}); // hidden
-    msg(void, window, "setTabbingMode:", .{@as(NSInteger, 2)}); // we have our own tabs
-    msg(void, window, "setMinSize:", .{CGSize{ .width = 760, .height = 480 }});
-    msg(void, window, "setDelegate:", .{self});
-
-    // An empty unified toolbar makes the titlebar 52pt tall — the height of the
-    // design's header row — and centres the traffic lights in it; in compact
-    // mode the unified-compact style makes it `theme.header_h` (38pt).
-    const toolbar = msg(id, objc.alloc("NSToolbar"), "initWithIdentifier:", .{objc.nsString("tt.toolbar")});
-    msg(void, toolbar, "setShowsBaselineSeparator:", .{false});
-    msg(void, window, "setToolbar:", .{toolbar});
-    g.toolbar = toolbar;
-    syncToolbarStyle();
-
-    const view = msg(id, msg(id, g.view_class, "alloc", .{}), "initWithFrame:", .{frame});
     g.view = view;
-    msg(void, view, "setWantsLayer:", .{true});
-    const layer = msg(id, view, "layer", .{});
+    const layer = g.main.layer;
 
     g.app = app_mod.App.create(g.gpa, g.opts, layer, setClipboard) catch |err| {
         std.debug.print("tt: failed to start: {s}\n", .{@errorName(err)});
@@ -234,21 +618,16 @@ fn didFinishLaunching(self: id, _: SEL, _: id) callconv(.c) void {
     // The app has read the settings by now: dress the window to match.
     syncWindowAppearance();
 
-    const tracking = msg(id, objc.alloc("NSTrackingArea"), "initWithRect:options:owner:userInfo:", .{
-        frame,
-        @as(NSUInteger, 0x01 | 0x02 | 0x80 | 0x200), // enter/exit, moved, always active, in visible rect
-        view,
-        @as(id, null),
-    });
-    msg(void, view, "addTrackingArea:", .{tracking});
+    trackPointer(&g.main);
 
     msg(void, window, "setContentView:", .{view});
     _ = msg(bool, window, "makeFirstResponder:", .{view});
     msg(void, window, "center", .{});
     _ = msg(bool, window, "setFrameAutosaveName:", .{objc.nsString("tt.main")});
-    msg(void, window, "makeKeyAndOrderFront:", .{@as(id, null)});
-    msg(void, g.nsapp, "activateIgnoringOtherApps:", .{true});
-    updateGeometry();
+    bringForward(&g.main, true);
+    if (!g.nofocus) msg(void, g.nsapp, "activateIgnoringOtherApps:", .{true});
+    updateGeometry(&g.main);
+    reportFrame(&g.main);
     syncScreens();
 
     const timer = msg(id, objc.class("NSTimer"), "timerWithTimeInterval:target:selector:userInfo:repeats:", .{
@@ -367,6 +746,7 @@ fn buildMenu() void {
     addSeparator(window_menu);
     _ = addItem(window_menu, "Show Next Tab", "nextTab:", "}", null);
     _ = addItem(window_menu, "Show Previous Tab", "prevTab:", "{", null);
+    _ = addItem(window_menu, "Move Tab to New Window", "moveTabToWindow:", "", null);
 
     msg(void, g.nsapp, "setMainMenu:", .{bar});
     msg(void, g.nsapp, "setWindowsMenu:", .{window_menu});
@@ -428,6 +808,7 @@ fn registerViewClass() objc.Class {
     b.method("splitDown:", actionSplitDown, "v@:@");
     b.method("nextPane:", actionNextPane, "v@:@");
     b.method("prevPane:", actionPrevPane, "v@:@");
+    b.method("moveTabToWindow:", actionMoveTabToWindow, "v@:@");
     b.method("zoomIn:", actionZoomIn, "v@:@");
     b.method("zoomOut:", actionZoomOut, "v@:@");
     b.method("actualSize:", actionActualSize, "v@:@");
@@ -467,68 +848,80 @@ fn makeBackingLayer(_: id, _: SEL) callconv(.c) id {
 
 fn setFrameSize(self: id, _: SEL, size: CGSize) callconv(.c) void {
     objc.msgSuper(void, self, objc.class("NSView"), "setFrameSize:", .{size});
-    updateGeometry();
-    // Draw right away so live resizing never shows a stretched frame.
-    if (g.app) |app| {
-        _ = app.update(apple.CACurrentMediaTime());
-        app.buildFrame();
-        hostSync();
-        app.present();
-    }
+    const first = hitOfView(self) orelse return;
+    updateGeometry(first.win);
+    // Draw right away so live resizing never shows a stretched frame. The
+    // update may close the very window being resized (its last shell
+    // exited): it is looked up again after it.
+    const app = g.app orelse return;
+    _ = app.update(apple.CACurrentMediaTime());
+    const hit = hitOfView(self) orelse return;
+    drawWindow(app, hit, true);
 }
 
 fn viewDidChangeBackingProperties(self: id, _: SEL) callconv(.c) void {
     objc.msgSuper(void, self, objc.class("NSView"), "viewDidChangeBackingProperties", .{});
-    updateGeometry();
+    if (hitOfView(self)) |hit| updateGeometry(hit.win);
 }
 
-fn updateGeometry() void {
+fn updateGeometry(win: *Win) void {
     const app = g.app orelse return;
-    if (g.view == null or g.window == null) return;
-    const bounds = msg(CGRect, g.view, "bounds", .{});
-    var scale = msg(f64, g.window, "backingScaleFactor", .{});
+    const hit = hitOf(win) orelse return;
+    if (win.view == null or win.window == null) return;
+    const bounds = msg(CGRect, win.view, "bounds", .{});
+    var scale = msg(f64, win.window, "backingScaleFactor", .{});
     if (scale <= 0) scale = 2;
-    app.resize(@floatCast(bounds.size.width), @floatCast(bounds.size.height), @floatCast(scale));
-    app.renderer.setDrawableSize(@round(bounds.size.width * scale), @round(bounds.size.height * scale), scale);
-    updateChrome();
+    if (hit.tab) |tw| {
+        if (tw.resize(@floatCast(bounds.size.width), @floatCast(bounds.size.height), @floatCast(scale), app.zoom)) app.invalidate();
+    } else app.resize(@floatCast(bounds.size.width), @floatCast(bounds.size.height), @floatCast(scale));
+    Renderer.setLayerSize(win.layer, @round(bounds.size.width * scale), @round(bounds.size.height * scale), scale);
+    updateChrome(win);
 }
 
-fn isFullScreen() bool {
-    return msg(NSUInteger, g.window, "styleMask", .{}) & style_fullscreen != 0;
+fn isFullScreen(win: *const Win) bool {
+    return msg(NSUInteger, win.window, "styleMask", .{}) & style_fullscreen != 0;
 }
 
 /// Where the traffic lights end, so the header can flow around them.
-fn updateChrome() void {
+fn updateChrome(win: *Win) void {
     const app = g.app orelse return;
+    const hit = hitOf(win) orelse return;
     var inset: f32 = 0;
-    if (!isFullScreen()) {
-        const zoom = msg(id, g.window, "standardWindowButton:", .{@as(NSUInteger, 2)});
+    if (!isFullScreen(win)) {
+        const zoom = msg(id, win.window, "standardWindowButton:", .{@as(NSUInteger, 2)});
         if (zoom != null) {
             const b = msg(CGRect, zoom, "bounds", .{});
             const in_window = msg(CGRect, zoom, "convertRect:toView:", .{ b, @as(id, null) });
             inset = @floatCast(in_window.origin.x + in_window.size.width);
         }
     }
-    if (inset != app.chrome.inset_left) {
-        app.chrome.inset_left = inset;
+    const chrome = if (hit.tab) |tw| &tw.chrome else &app.chrome;
+    if (inset != chrome.inset_left) {
+        chrome.inset_left = inset;
         app.invalidate();
     }
 }
 
-/// The window's appearance (titlebar, traffic lights, native panels) and
+/// A window's appearance (titlebar, traffic lights, native panels) and
 /// background follow the theme's scheme (and its terminal theme's background).
-fn syncWindowAppearance() void {
-    if (g.window == null) return;
+fn dressWindow(win: *Win) void {
     const name = switch (theme.scheme) {
         .dark => "NSAppearanceNameDarkAqua",
         .light, .eink, .eink_color => "NSAppearanceNameAqua",
     };
     const ns_appearance = msg(id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)});
-    msg(void, g.window, "setAppearance:", .{ns_appearance});
+    msg(void, win.window, "setAppearance:", .{ns_appearance});
     const bg = msg(id, objc.class("NSColor"), "colorWithSRGBRed:green:blue:alpha:", .{
         @as(f64, theme.bg.r), @as(f64, theme.bg.g), @as(f64, theme.bg.b), @as(f64, 1),
     });
-    msg(void, g.window, "setBackgroundColor:", .{bg});
+    msg(void, win.window, "setBackgroundColor:", .{bg});
+}
+
+/// Every window of ours takes the theme on.
+fn syncWindowAppearance() void {
+    if (g.main.window == null) return;
+    dressWindow(&g.main);
+    for (g.wins.items) |w| dressWindow(w);
     g.applied_scheme = theme.scheme;
     g.applied_generation = theme.generation;
     if (g.app) |app| app.invalidate();
@@ -537,21 +930,31 @@ fn syncWindowAppearance() void {
 /// The titlebar's height follows compact mode: unified (52pt) or unified
 /// compact (38pt), the two heights `theme.header_h` takes. The traffic
 /// lights move with it, so their inset is read again.
-fn syncToolbarStyle() void {
-    if (g.window == null) return;
+fn styleToolbar(win: *Win) void {
     const style: NSInteger = if (theme.compact) 4 else 3; // unifiedCompact : unified
-    msg(void, g.window, "setToolbarStyle:", .{style});
+    msg(void, win.window, "setToolbarStyle:", .{style});
+    win.chrome_recheck = 60;
+}
+
+fn syncToolbarStyle() void {
+    if (g.main.window == null) return;
+    styleToolbar(&g.main);
+    for (g.wins.items) |w| styleToolbar(w);
     g.applied_compact = theme.compact;
-    g.chrome_recheck = 60;
     if (g.app) |app| app.invalidate();
 }
 
 fn tick(_: id, _: SEL, _: id) callconv(.c) void {
     const app = g.app orelse return;
     const now = apple.CACurrentMediaTime();
-    if (g.chrome_recheck > 0) {
-        g.chrome_recheck -= 1;
-        updateChrome();
+    if (g.main.chrome_recheck > 0) {
+        g.main.chrome_recheck -= 1;
+        updateChrome(&g.main);
+    }
+    for (g.wins.items) |w| {
+        if (w.chrome_recheck == 0) continue;
+        w.chrome_recheck -= 1;
+        updateChrome(w);
     }
     if (g.selftest) selftestStep(now);
     if (g.applied_scheme != theme.scheme or g.applied_generation != theme.generation) syncWindowAppearance();
@@ -561,7 +964,19 @@ fn tick(_: id, _: SEL, _: id) callconv(.c) void {
         app.folder_pick_requested = false;
         pickProjectFolder();
     }
+    // A window that missed a frame while it was out of sight draws now
+    // that it is back.
+    if (g.main.stale and windowOnScreen(&g.main)) {
+        g.main.stale = false;
+        app.invalidate();
+    }
+    for (g.wins.items) |w| {
+        if (!w.stale or !windowOnScreen(w)) continue;
+        w.stale = false;
+        app.invalidate();
+    }
     const dirty = app.update(now);
+    reconcileWindows(app);
     // A `tt <path>` typed in a shell (maybe another terminal's) reached us.
     if (app.front_requested) {
         app.front_requested = false;
@@ -570,24 +985,47 @@ fn tick(_: id, _: SEL, _: id) callconv(.c) void {
         msg(void, g.nsapp, "activateIgnoringOtherApps:", .{true});
     }
     if (!dirty) return;
-    // nextDrawable blocks when the window is not on screen; skip drawing
-    // then. The self test still lays the frame out so the hosted views get
-    // placed: its checks must not depend on what happens to cover the screen.
-    if (!windowOnScreen()) {
-        if (g.selftest) {
-            app.buildFrame();
-            hostSync();
-        }
-        return;
+    // The main window first (its frame is the one that counts the app's
+    // pending frames down), then each separate one; every frame is
+    // presented before the next is built, since they share the glyph atlas.
+    drawWindow(app, .{ .win = &g.main, .tab = null }, false);
+    // By index: a frame can open a window (a tab let go outside), which
+    // only shows up in `g.wins` on the next tick.
+    var i: usize = 0;
+    while (i < g.wins.items.len) : (i += 1) {
+        const hit = hitOf(g.wins.items[i]) orelse continue;
+        drawWindow(app, hit, false);
     }
-    app.buildFrame();
-    hostSync();
-    app.present();
-    syncCursor();
 }
 
-fn windowOnScreen() bool {
-    const occlusion = msg(NSUInteger, g.window, "occlusionState", .{});
+/// One window's frame: built, its native views put where the frame placed
+/// them, presented. nextDrawable blocks when the window is not on screen,
+/// so drawing is skipped then (the frame is owed: `Win.stale`); the self
+/// test still lays the frame out so the hosted views get placed, since its
+/// checks must not depend on what happens to cover the screen. `resizing`:
+/// the window's size just changed, draw whatever its state.
+fn drawWindow(app: *app_mod.App, hit: Hit, resizing: bool) void {
+    const win = hit.win;
+    const visible = resizing or windowOnScreen(win);
+    if (!visible and !g.selftest) {
+        win.stale = true;
+        if (hit.tab == null) app.frameSkipped();
+        return;
+    }
+    g.building = win;
+    if (hit.tab) |tw| app.buildWindowFrame(tw) else app.buildFrame();
+    g.building = null;
+    hostSync(win);
+    if (!visible) return;
+    if (hit.tab) |tw| {
+        app.presentWindow(tw, win.layer);
+        syncTitle(app, win, tw);
+    } else app.present();
+    syncCursor(win);
+}
+
+fn windowOnScreen(win: *const Win) bool {
+    const occlusion = msg(NSUInteger, win.window, "occlusionState", .{});
     return occlusion & (1 << 1) != 0;
 }
 
@@ -613,6 +1051,11 @@ const Hosted = struct {
     inner: ?CGRect = null,
     placed: bool = false,
     shown: bool = false,
+    /// The window whose content view the box is under.
+    owner: *Win,
+    /// The window whose frame placed it since that window last synced: the
+    /// box moves there if it is elsewhere (its tab went to another window).
+    placed_by: ?*Win = null,
 };
 var hosted: std.ArrayList(Hosted) = .empty;
 
@@ -631,8 +1074,10 @@ fn hostAttach(view: *anyopaque) void {
     msg(void, v, "setFrame:", .{msg(CGRect, box, "bounds", .{})});
     msg(void, v, "setAutoresizingMask:", .{follows_box});
     msg(void, box, "addSubview:", .{v});
-    msg(void, g.view, "addSubview:", .{box});
-    hosted.append(g.gpa, .{ .view = v, .box = box }) catch {};
+    // Under the main window until a frame places it: the frame's window
+    // takes it then (`hostSync`).
+    msg(void, g.main.view, "addSubview:", .{box});
+    hosted.append(g.gpa, .{ .view = v, .box = box, .owner = &g.main }) catch {};
 }
 
 /// The box around a hosted view (the view itself when it has none).
@@ -654,6 +1099,7 @@ fn hostPlace(view: *anyopaque, rect: ui_mod.Rect) void {
         h.frame = CGRect.make(rect.x * z, rect.y * z, rect.w * z, rect.h * z);
         h.inner = null;
         h.placed = true;
+        h.placed_by = g.building orelse h.owner;
     }
 }
 
@@ -672,6 +1118,7 @@ fn hostPlaceClipped(view: *anyopaque, content: ui_mod.Rect, clip: ui_mod.Rect) v
         const below = (clip.y + clip.h) - (content.y + content.h);
         h.inner = CGRect.make((content.x - clip.x) * z, below * z, content.w * z, content.h * z);
         h.placed = true;
+        h.placed_by = g.building orelse h.owner;
     }
 }
 
@@ -681,40 +1128,49 @@ fn hostDetach(view: *anyopaque) void {
     while (i < hosted.items.len) {
         if (hosted.items[i].view == v) {
             const box = hosted.items[i].box;
+            const owner = hosted.items[i].owner;
             msg(void, v, "removeFromSuperview", .{});
             msg(void, box, "removeFromSuperview", .{});
             objc.release(box);
             _ = hosted.orderedRemove(i);
+            if (owner.window != null) msg(void, owner.window, "invalidateCursorRectsForView:", .{owner.view});
         } else i += 1;
     }
-    if (g.window != null) msg(void, g.window, "invalidateCursorRectsForView:", .{g.view});
 }
 
 fn hostHasFocus(view: *anyopaque) bool {
     const v: id = view;
-    if (g.window == null) return false;
-    const fr = msg(id, g.window, "firstResponder", .{});
+    // In whichever window the view is.
+    const window = msg(id, v, "window", .{});
+    if (window == null) return false;
+    const fr = msg(id, window, "firstResponder", .{});
     if (fr == null) return false;
     if (!msg(bool, fr, "isKindOfClass:", .{objc.class("NSView")})) return false;
     // The box, so what is docked beside the view (the inspector) counts.
     return msg(bool, fr, "isDescendantOf:", .{hostBox(v)});
 }
 
-/// True while the keyboard is in one of the hosted views.
-fn hostedHasKeyboard() bool {
+/// True while the keyboard is in one of a window's hosted views.
+fn hostedHasKeyboard(win: *const Win) bool {
     for (hosted.items) |h| {
-        if (h.shown and hostHasFocus(h.view.?)) return true;
+        if (h.owner == win and h.shown and hostHasFocus(h.view.?)) return true;
     }
     return false;
 }
 
 fn hostFocusView(view: *anyopaque) void {
     const v: id = view;
-    if (g.window != null) _ = msg(bool, g.window, "makeFirstResponder:", .{v});
+    const window = msg(id, v, "window", .{});
+    if (window != null) _ = msg(bool, window, "makeFirstResponder:", .{v});
 }
 
+/// The keyboard back to the app's own view, in the window that has it.
 fn hostFocusApp() void {
-    if (g.window != null) _ = msg(bool, g.window, "makeFirstResponder:", .{g.view});
+    focusOwnView(keyWin());
+}
+
+fn focusOwnView(win: *const Win) void {
+    if (win.window != null) _ = msg(bool, win.window, "makeFirstResponder:", .{win.view});
 }
 
 /// A bare WKWebView (no navigation delegate, no bridges): a notebook cell's
@@ -767,16 +1223,29 @@ fn rectEql(a: CGRect, b: CGRect) bool {
     return a.origin.x == b.origin.x and a.origin.y == b.origin.y and a.size.width == b.size.width and a.size.height == b.size.height;
 }
 
-/// After a frame: the views it placed go where it put them, the others hide.
-fn hostSync() void {
+/// After a window's frame: the views it placed go where it put them, under
+/// this window (a view whose tab came from another window moves over), and
+/// the other views of this window hide.
+fn hostSync(win: *Win) void {
     const app = g.app orelse return;
     const covered = app.palette.open or app.overlay.isOpen();
     // What covers the window (the palette, a box) is typed into through the
     // app's own view: take the keyboard back from the page.
-    if (covered and hostedHasKeyboard()) hostFocusApp();
+    if (covered and hostedHasKeyboard(win)) focusOwnView(win);
     var changed = false;
     for (hosted.items) |*h| {
-        const show = h.placed and !covered;
+        const mine = h.placed_by == win;
+        if (!mine and h.owner != win) continue;
+        if (mine and h.owner != win) {
+            const old = h.owner;
+            msg(void, h.box, "removeFromSuperview", .{});
+            msg(void, h.box, "setHidden:", .{true});
+            msg(void, win.view, "addSubview:", .{h.box});
+            h.owner = win;
+            h.shown = false;
+            if (old.window != null) msg(void, old.window, "invalidateCursorRectsForView:", .{old.view});
+        }
+        const show = mine and h.placed and !covered;
         if (show) {
             if (!rectEql(msg(CGRect, h.box, "frame", .{}), h.frame)) {
                 msg(void, h.box, "setFrame:", .{h.frame});
@@ -798,16 +1267,17 @@ fn hostSync() void {
             // Hidden with the keyboard (its tab went out of view by a key,
             // ⌘1 or a ⌥ jump): the app's view takes it back, or typing
             // would reach nothing but the window.
-            if (!show and hostHasFocus(h.view.?)) hostFocusApp();
+            if (!show and hostHasFocus(h.view.?)) focusOwnView(win);
             msg(void, h.box, "setHidden:", .{!show});
             h.shown = show;
             changed = true;
         }
         h.placed = false;
+        h.placed_by = null;
         h.inner = null;
     }
     // The cursor rects leave the hosted views' frames out (they set their own).
-    if (changed and g.window != null) msg(void, g.window, "invalidateCursorRectsForView:", .{g.view});
+    if (changed and win.window != null) msg(void, win.window, "invalidateCursorRectsForView:", .{win.view});
 }
 
 /// `rects[0..n]` minus `cut`, as up to four pieces per rect; the new count.
@@ -854,29 +1324,36 @@ fn nsCursor(c: ui_mod.Cursor) id {
     };
 }
 
-fn syncCursor() void {
+fn syncCursor(win: *Win) void {
     const app = g.app orelse return;
-    if (app.ui.cursor == g.cursor) return;
-    g.cursor = app.ui.cursor;
-    msg(void, g.window, "invalidateCursorRectsForView:", .{g.view});
-    msg(void, nsCursor(g.cursor), "set", .{});
+    const hit = hitOf(win) orelse return;
+    const wanted = if (hit.tab) |tw| tw.ui.cursor else app.ui.cursor;
+    if (wanted == win.cursor) return;
+    win.cursor = wanted;
+    msg(void, win.window, "invalidateCursorRectsForView:", .{win.view});
+    // Only where the pointer is: another window's frame must not change
+    // the cursor under it.
+    const inside = if (hit.tab) |tw| tw.ui.mouse_inside else app.ui.mouse_inside;
+    if (inside) msg(void, nsCursor(win.cursor), "set", .{});
 }
 
 fn resetCursorRects(self: id, _: SEL) callconv(.c) void {
     const bounds = msg(CGRect, self, "bounds", .{});
+    const win: ?*Win = if (hitOfView(self)) |hit| hit.win else null;
     var rects: [32]CGRect = undefined;
     rects[0] = bounds;
     var n: usize = 1;
     for (hosted.items) |h| {
-        if (h.shown) n = subtractRect(&rects, n, h.frame);
+        if (h.shown and h.owner == win) n = subtractRect(&rects, n, h.frame);
     }
-    for (rects[0..n]) |r| msg(void, self, "addCursorRect:cursor:", .{ r, nsCursor(g.cursor) });
+    const cursor: ui_mod.Cursor = if (win) |w| w.cursor else .arrow;
+    for (rects[0..n]) |r| msg(void, self, "addCursorRect:cursor:", .{ r, nsCursor(cursor) });
 }
 
 // ── mouse ────────────────────────────────────────────────────────────────
-fn eventPoint(event: id) CGPoint {
+fn eventPoint(win: *const Win, event: id) CGPoint {
     const p = msg(CGPoint, event, "locationInWindow", .{});
-    const v = msg(CGPoint, g.view, "convertPoint:fromView:", .{ p, @as(id, null) });
+    const v = msg(CGPoint, win.view, "convertPoint:fromView:", .{ p, @as(id, null) });
     // The app draws in a logical space shrunk by its zoom, so map the pointer
     // into that same space; everything downstream compares against it.
     const z: f64 = if (g.app) |app| app.zoom else 1;
@@ -893,49 +1370,58 @@ fn eventMods(event: id) ui_mod.Mods {
     };
 }
 
-fn mouseDown(_: id, _: SEL, event: id) callconv(.c) void {
+fn mouseDown(self: id, _: SEL, event: id) callconv(.c) void {
     const app = g.app orelse return;
-    const p = eventPoint(event);
+    const hit = hitOfView(self) orelse return;
+    const p = eventPoint(hit.win, event);
     const x: f32 = @floatCast(p.x);
     const y: f32 = @floatCast(p.y);
     const clicks: u32 = @intCast(@max(1, msg(NSInteger, event, "clickCount", .{})));
-    const interactive = app.isInteractiveAt(x, y);
+    const interactive = app.isInteractiveAtIn(hit.tab, x, y);
     if (g.debug_events) std.debug.print("mouseDown {d:.0},{d:.0} clicks={d} interactive={}\n", .{ x, y, clicks, interactive });
 
     // Empty parts of the header behave like a titlebar (not in full screen:
     // nothing to drag or zoom there).
-    if (y < theme.header_h and !interactive and !isFullScreen()) {
+    if (y < theme.header_h and !interactive and !isFullScreen(hit.win)) {
         if (clicks == 2) {
-            msg(void, g.window, "performZoom:", .{@as(id, null)});
-        } else msg(void, g.window, "performWindowDragWithEvent:", .{event});
+            msg(void, hit.win.window, "performZoom:", .{@as(id, null)});
+        } else msg(void, hit.win.window, "performWindowDragWithEvent:", .{event});
         return;
     }
-    app.onMouseDown(x, y, clicks, eventMods(event));
+    app.pointerDown(hit.tab, x, y, clicks, eventMods(event));
 }
 
-fn mouseUp(_: id, _: SEL, event: id) callconv(.c) void {
+fn mouseUp(self: id, _: SEL, event: id) callconv(.c) void {
     const app = g.app orelse return;
-    const p = eventPoint(event);
+    const hit = hitOfView(self) orelse return;
+    const p = eventPoint(hit.win, event);
     if (g.debug_events) std.debug.print("mouseUp {d:.0},{d:.0}\n", .{ p.x, p.y });
-    app.onMouseUp(@floatCast(p.x), @floatCast(p.y));
+    app.pointerUp(hit.tab, @floatCast(p.x), @floatCast(p.y));
+    syncDragGhost(app);
 }
 
 /// Secondary click: context menus. Never a window drag, even in the titlebar band.
-fn rightMouseDown(_: id, _: SEL, event: id) callconv(.c) void {
+fn rightMouseDown(self: id, _: SEL, event: id) callconv(.c) void {
     const app = g.app orelse return;
-    const p = eventPoint(event);
+    const hit = hitOfView(self) orelse return;
+    const p = eventPoint(hit.win, event);
     if (g.debug_events) std.debug.print("rightMouseDown {d:.0},{d:.0}\n", .{ p.x, p.y });
-    app.onRightMouseDown(@floatCast(p.x), @floatCast(p.y), eventMods(event));
+    app.pointerRightDown(hit.tab, @floatCast(p.x), @floatCast(p.y), eventMods(event));
 }
 
-fn mouseMoved(_: id, _: SEL, event: id) callconv(.c) void {
+/// Moves and drags. A drag keeps coming to the view it started in, with
+/// points beyond its edges once the pointer leaves the window: that is how
+/// the app knows a tab is being taken out.
+fn mouseMoved(self: id, _: SEL, event: id) callconv(.c) void {
     const app = g.app orelse return;
+    const hit = hitOfView(self) orelse return;
     // The modifiers too: a key released while a web view had the keyboard
     // never reached `flagsChanged:`.
     if (g.debug_events and eventMods(event).alt != app.ui.mods.alt) std.debug.print("flags alt={} (mouse moved)\n", .{eventMods(event).alt});
     app.onFlags(eventMods(event));
-    const p = eventPoint(event);
-    app.onMouseMove(@floatCast(p.x), @floatCast(p.y));
+    const p = eventPoint(hit.win, event);
+    app.pointerMove(hit.tab, @floatCast(p.x), @floatCast(p.y));
+    syncDragGhost(app);
 }
 
 /// A modifier key went down or up (⌘ / ⌃ over a link shows it can be followed).
@@ -943,13 +1429,16 @@ fn flagsChanged(_: id, _: SEL, event: id) callconv(.c) void {
     if (g.app) |app| app.onFlags(eventMods(event));
 }
 
-fn mouseExited(_: id, _: SEL, _: id) callconv(.c) void {
-    if (g.app) |app| app.onMouseLeave();
+fn mouseExited(self: id, _: SEL, _: id) callconv(.c) void {
+    const app = g.app orelse return;
+    const hit = hitOfView(self) orelse return;
+    app.pointerLeave(hit.tab);
 }
 
-fn scrollWheel(_: id, _: SEL, event: id) callconv(.c) void {
+fn scrollWheel(self: id, _: SEL, event: id) callconv(.c) void {
     const app = g.app orelse return;
-    const p = eventPoint(event);
+    const hit = hitOfView(self) orelse return;
+    const p = eventPoint(hit.win, event);
     var dx = msg(f64, event, "scrollingDeltaX", .{});
     var dy = msg(f64, event, "scrollingDeltaY", .{});
     if (!msg(bool, event, "hasPreciseScrollingDeltas", .{})) {
@@ -959,7 +1448,7 @@ fn scrollWheel(_: id, _: SEL, event: id) callconv(.c) void {
     // Deltas are physical too; scale them into the zoomed logical space so the
     // scroll distance per gesture feels the same at any zoom.
     const z: f64 = app.zoom;
-    app.onScroll(@floatCast(p.x), @floatCast(p.y), @floatCast(dx / z), @floatCast(dy / z));
+    app.pointerScroll(hit.tab, @floatCast(p.x), @floatCast(p.y), @floatCast(dx / z), @floatCast(dy / z));
 }
 
 // ── keyboard ─────────────────────────────────────────────────────────────
@@ -981,8 +1470,8 @@ fn installKeyMonitor() void {
 /// Returns the event to go on with it, null to swallow it (a chord key).
 fn keyMonitor(event: id) id {
     const app = g.app orelse return event;
-    // Only the main window's: not the folder picker's or another panel's.
-    if (msg(id, event, "window", .{}) != g.window) return event;
+    // Only our windows': not the folder picker's or another panel's.
+    if (winOfWindow(msg(id, event, "window", .{})) == null) return event;
     const mods = eventMods(event);
     if (msg(NSUInteger, event, "type", .{}) == 12) {
         if (g.debug_events) std.debug.print("flags alt={} cmd={} (monitor)\n", .{ mods.alt, mods.cmd });
@@ -1124,15 +1613,18 @@ fn validAttributes(_: id, _: SEL) callconv(.c) id {
     return msg(id, objc.class("NSArray"), "array", .{});
 }
 
-fn firstRect(_: id, _: SEL, _: NSRange, _: ?*NSRange) callconv(.c) CGRect {
+fn firstRect(self: id, _: SEL, _: NSRange, _: ?*NSRange) callconv(.c) CGRect {
     const app = g.app orelse return .{};
     const c = app.caretRect();
     // The caret is in the app's zoomed logical space; the view wants window
-    // points, so scale up by the zoom before converting to screen.
+    // points, so scale up by the zoom before converting to screen. It is
+    // in the window being typed into: the view asked.
     const z: f64 = app.zoom;
     const in_view = CGRect.make(c.x * z, c.y * z, c.w * z, c.h * z);
-    const in_window = msg(CGRect, g.view, "convertRect:toView:", .{ in_view, @as(id, null) });
-    return msg(CGRect, g.window, "convertRectToScreen:", .{in_window});
+    const in_window = msg(CGRect, self, "convertRect:toView:", .{ in_view, @as(id, null) });
+    const window = msg(id, self, "window", .{});
+    if (window == null) return in_window;
+    return msg(CGRect, window, "convertRectToScreen:", .{in_window});
 }
 
 fn characterIndex(_: id, _: SEL, _: CGPoint) callconv(.c) NSUInteger {
@@ -1242,6 +1734,9 @@ fn actionNextPane(_: id, _: SEL, _: id) callconv(.c) void {
 fn actionPrevPane(_: id, _: SEL, _: id) callconv(.c) void {
     if (g.app) |app| app.perform(.prev_pane);
 }
+fn actionMoveTabToWindow(_: id, _: SEL, _: id) callconv(.c) void {
+    if (g.app) |app| app.perform(.move_tab_to_window);
+}
 fn actionZoomIn(_: id, _: SEL, _: id) callconv(.c) void {
     if (g.app) |app| app.perform(.zoom_in);
 }
@@ -1280,16 +1775,20 @@ fn actionPaste(_: id, _: SEL, _: id) callconv(.c) void {
 var selftest_t0: f64 = 0;
 
 fn postMouse(kind: NSUInteger, x: f64, y_from_top: f64) void {
-    const bounds = msg(CGRect, g.view, "bounds", .{});
+    postMouseIn(&g.main, kind, x, y_from_top);
+}
+
+/// A mouse event for one of our windows, at a point of its view (which may
+/// be beyond the view's edges: a drag that left the window).
+fn postMouseIn(win: *const Win, kind: NSUInteger, x: f64, y_from_top: f64) void {
     const in_view = CGPoint{ .x = x, .y = y_from_top };
-    const in_window = msg(CGPoint, g.view, "convertPoint:toView:", .{ in_view, @as(id, null) });
-    _ = bounds;
+    const in_window = msg(CGPoint, win.view, "convertPoint:toView:", .{ in_view, @as(id, null) });
     const ev = msg(id, objc.class("NSEvent"), "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:", .{
         kind,
         in_window,
         @as(NSUInteger, 0),
         apple.CACurrentMediaTime(),
-        msg(NSInteger, g.window, "windowNumber", .{}),
+        msg(NSInteger, win.window, "windowNumber", .{}),
         @as(id, null),
         @as(NSInteger, 0),
         @as(NSInteger, 1),
@@ -1364,6 +1863,8 @@ fn selftestStep(now: f64) void {
     // hold up the quit.
     if (sys.getenv("TT_SELFTEST_NOTEBOOK") != null) {
         selftestNotebook(t);
+    } else if (sys.getenv("TT_SELFTEST_WINDOWS") != null) {
+        selftestWindows(t);
     } else if (g.selftest_step < steps.len) {
         const s = steps[g.selftest_step];
         if (t >= s.at) {
@@ -1392,6 +1893,146 @@ fn selftestStep(now: f64) void {
         if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureOwnWindow(path, 1 << 3);
         selftestReportButtons();
         msg(void, g.nsapp, "terminate:", .{@as(id, null)});
+    }
+}
+
+/// TT_SELFTEST_WINDOWS=1 (instead of the regular steps): a tab is dragged
+/// out of the main window with real mouse events, down on its title, moves
+/// that end beyond the window's edge, up. It must get a window of its own
+/// there; the tab is then dragged from that window back over the main one,
+/// which takes it (and the emptied window goes); a tab is sent out again by
+/// the menu's action and that window closed by its close button. Each stage prints the real windows and where the
+/// tabs are; TT_SELFTEST_WINDOW_PNG gets the new window's capture, and
+/// "-main" appended the main one's. With TT_SELFTEST_NOFOCUS=1 none of
+/// the windows takes the keyboard.
+fn selftestWindows(t: f64) void {
+    const app = g.app orelse return;
+    const S = struct {
+        var step: usize = 0;
+        fn report(what: []const u8) void {
+            const a = g.app orelse return;
+            std.debug.print("selftest: {s}: real windows={d} app windows={d} keyed={?d}\n", .{ what, 1 + g.wins.items.len, a.windows.items.len, if (a.tabs.keyed) |k| k - tab_mod.TabManager.window_group_base + 1 else null });
+            for (a.tabs.groups.items) |*grp| {
+                if (grp.count() == 0) continue;
+                const is_window = tab_mod.TabManager.isWindowGroup(grp.id);
+                std.debug.print("selftest:   {s}={d} tabs={d}", .{ if (is_window) "window" else "group", if (is_window) grp.id - tab_mod.TabManager.window_group_base + 1 else grp.id, grp.count() });
+                if (a.windowByGroup(grp.id)) |tw| {
+                    if (tw.frame) |f| std.debug.print(" frame={d:.0},{d:.0} {d:.0}x{d:.0}", .{ f.x, f.y, f.w, f.h });
+                    std.debug.print(" size={d:.0}x{d:.0}@{d:.0} inset_left={d:.0} native={}", .{ tw.width, tw.height, tw.scale, tw.chrome.inset_left, tw.native != null });
+                }
+                std.debug.print("\n", .{});
+            }
+            if (a.main_frame) |f| std.debug.print("selftest:   main frame={d:.0},{d:.0} {d:.0}x{d:.0}\n", .{ f.x, f.y, f.w, f.h });
+        }
+        /// The separate window there is, and where its first tab's title is.
+        const from_x: f64 = 79 + 14 + 30;
+        fn first() ?*Win {
+            return if (g.wins.items.len > 0) g.wins.items[0] else null;
+        }
+        /// A point of the main window that the separate window does not
+        /// cover (they may overlap: the new one is kept on the screen), in
+        /// the separate window's coordinates: beyond its own edges.
+        fn overMain(win: *Win) ?CGPoint {
+            const a = g.app orelse return null;
+            const tw = liveTab(win) orelse return null;
+            const f = tw.frame orelse return null;
+            const mf = a.main_frame orelse return null;
+            const x: f32 = if (mf.x + 60 < f.x) mf.x + 60 else mf.x + mf.w - 60;
+            return .{ .x = x - f.x, .y = (mf.y + mf.h - 80) - f.y };
+        }
+    };
+    const bounds = msg(CGRect, g.view, "bounds", .{});
+    // The first tab of the main strip: past the sidebar (300pt wide).
+    const tab_x: f64 = 300 + 16 + 30;
+    const out_x = bounds.size.width + 160;
+    // A drag is spread over ticks, as a hand's is: the frame after the
+    // press has to see the pointer down on the tab before it moves away.
+    switch (S.step) {
+        0 => if (t >= 1.2) {
+            app.perform(.new_tab);
+            S.report("start, two tabs");
+            S.step += 1;
+        },
+        1 => if (t >= 1.8) {
+            std.debug.print("selftest: drag the first tab out of the window\n", .{});
+            postMouseIn(&g.main, 1, tab_x, 26);
+            S.step += 1;
+        },
+        2 => if (t >= 1.9) {
+            postMouseIn(&g.main, 6, tab_x + 12, 40);
+            S.step += 1;
+        },
+        3 => if (t >= 2.0) {
+            postMouseIn(&g.main, 6, bounds.size.width - 40, 160);
+            S.step += 1;
+        },
+        4 => if (t >= 2.1) {
+            postMouseIn(&g.main, 6, out_x, 220);
+            S.step += 1;
+        },
+        5 => if (t >= 2.4) {
+            var buf: [96]u8 = undefined;
+            std.debug.print("selftest: outside, ghost title={?s} panel_visible={}\n", .{ app.draggedOut(&buf), g.ghost != null and msg(bool, g.ghost, "isVisible", .{}) });
+            postMouseIn(&g.main, 2, out_x, 220);
+            S.step += 1;
+        },
+        6 => if (t >= 3.2) {
+            S.report("after the drag");
+            std.debug.print("selftest: ghost panel_visible={}\n", .{g.ghost != null and msg(bool, g.ghost, "isVisible", .{})});
+            if (g.wins.items.len > 0) {
+                const win = g.wins.items[0];
+                std.debug.print("selftest: new window visible={} on_screen={} layer={} view_in_window={}\n", .{
+                    msg(bool, win.window, "isVisible", .{}), windowOnScreen(win), win.layer != null, msg(id, win.view, "window", .{}) == win.window,
+                });
+                if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| captureWindow(win.window, path, 1 << 3);
+            }
+            S.step += 1;
+        },
+        7 => if (t >= 3.6) {
+            // Back again: its tab is dragged from the new window to a
+            // point over the main one, which takes it.
+            if (S.first()) |win| {
+                std.debug.print("selftest: drag the tab of the new window back over the main window\n", .{});
+                postMouseIn(win, 1, S.from_x, 26);
+            }
+            S.step += 1;
+        },
+        8 => if (t >= 3.7) {
+            if (S.first()) |win| postMouseIn(win, 6, S.from_x + 12, 40);
+            S.step += 1;
+        },
+        9 => if (t >= 3.8) {
+            if (S.first()) |win| if (S.overMain(win)) |to| postMouseIn(win, 6, to.x, to.y);
+            S.step += 1;
+        },
+        10 => if (t >= 4.0) {
+            if (S.first()) |win| if (S.overMain(win)) |to| postMouseIn(win, 2, to.x, to.y);
+            S.step += 1;
+        },
+        11 => if (t >= 4.8) {
+            S.report("after dragging it back");
+            // Out once more, by the menu's action this time, from the main
+            // window; then that window's close button.
+            app.onWindowKey(null);
+            app.perform(.move_tab_to_window);
+            S.step += 1;
+        },
+        12 => if (t >= 5.6) {
+            S.report("after Move Tab to New Window");
+            if (sys.getenv("TT_SELFTEST_WINDOW_PNG")) |path| {
+                var buf: [1024]u8 = undefined;
+                if (std.fmt.bufPrint(&buf, "{s}-main.png", .{path})) |p| captureOwnWindow(p, 1 << 3) else |_| {}
+            }
+            if (S.first()) |win| msg(void, win.window, "performClose:", .{@as(id, null)});
+            S.step += 1;
+        },
+        13 => if (t >= 6.4) {
+            S.report("after the close button");
+            selftestReportWindows();
+            msg(void, g.nsapp, "terminate:", .{@as(id, null)});
+            S.step += 1;
+        },
+        else => {},
     }
 }
 
@@ -1874,8 +2515,8 @@ fn selftestInspector(app: *app_mod.App, step: InspectorStep) void {
     const bounds = msg(CGRect, box, "bounds", .{});
     const box_frame = msg(CGRect, box, "frame", .{});
     std.debug.print("selftest: box frame=({d:.0},{d:.0} {d:.0}x{d:.0}) superview={s} window_on_screen={}\n", .{
-        box_frame.origin.x,                                                                            box_frame.origin.y, box_frame.size.width, box_frame.size.height,
-        objc.utf8(msg(id, msg(id, msg(id, box, "superview", .{}), "class", .{}), "description", .{})), windowOnScreen(),
+        box_frame.origin.x,                                                                            box_frame.origin.y,      box_frame.size.width, box_frame.size.height,
+        objc.utf8(msg(id, msg(id, msg(id, box, "superview", .{}), "class", .{}), "description", .{})), windowOnScreen(&g.main),
     });
     const subviews = msg(id, box, "subviews", .{});
     const n = msg(NSUInteger, subviews, "count", .{});
@@ -1946,7 +2587,7 @@ fn selftestReportWindows() void {
     const app = g.app orelse return;
     const bounds = msg(CGRect, g.view, "bounds", .{});
     std.debug.print("selftest: fullscreen={} toolbar_attached={} view={d:.0}x{d:.0} inset_left={d:.0} tabs={d}\n", .{
-        isFullScreen(), msg(id, g.window, "toolbar", .{}) != null, bounds.size.width, bounds.size.height, app.chrome.inset_left, app.tabs.count(),
+        isFullScreen(&g.main), msg(id, g.window, "toolbar", .{}) != null, bounds.size.width, bounds.size.height, app.chrome.inset_left, app.tabs.count(),
     });
     const windows = msg(id, g.nsapp, "windows", .{});
     const n = msg(NSUInteger, windows, "count", .{});
@@ -1979,6 +2620,10 @@ extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 /// `list_options` are CGWindowListOption bits (1 << 3 = just our window,
 /// | 1 << 1 also the windows on screen above it).
 fn captureOwnWindow(path: []const u8, list_options: u32) void {
+    captureWindow(g.window, path, list_options);
+}
+
+fn captureWindow(window: id, path: []const u8, list_options: u32) void {
     const rtld_default: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
     const sym = dlsym(rtld_default, "CGWindowListCreateImage") orelse {
         std.debug.print("selftest: CGWindowListCreateImage unavailable\n", .{});
@@ -1990,9 +2635,9 @@ fn captureOwnWindow(path: []const u8, list_options: u32) void {
     const screens = msg(id, objc.class("NSScreen"), "screens", .{});
     const primary = msg(id, screens, "objectAtIndex:", .{@as(NSUInteger, 0)});
     const sf = msg(CGRect, primary, "frame", .{});
-    const wf = msg(CGRect, g.window, "frame", .{});
+    const wf = msg(CGRect, window, "frame", .{});
     const bounds = CGRect.make(wf.origin.x, sf.size.height - (wf.origin.y + wf.size.height), wf.size.width, wf.size.height);
-    const wid: u32 = @intCast(msg(NSInteger, g.window, "windowNumber", .{}));
+    const wid: u32 = @intCast(msg(NSInteger, window, "windowNumber", .{}));
     const image = create(bounds, list_options, wid, 1 << 0);
     if (image == null) {
         std.debug.print("selftest: window capture returned null\n", .{});

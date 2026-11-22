@@ -57,6 +57,12 @@ pub const Icon = enum(u8) {
     stash,
     comment,
     user,
+    // Files tree.
+    folder_open,
+    /// Source code: `</>`.
+    code,
+    /// A Zig file: a Z with the stroke through it.
+    zig,
 };
 
 /// Transparent padding (device px) around every rasterised icon.
@@ -111,6 +117,9 @@ fn pathData(icon: Icon) []const u8 {
         .stash => "M12 3l9 4.5-9 4.5-9-4.5z M3 12l9 4.5 9-4.5 M3 16.5l9 4.5 9-4.5",
         .comment => "M5 5h14a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-7l-5 4v-4H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z",
         .user => "M12 12a4 4 0 1 0 0-8a4 4 0 1 0 0 8 M4.5 20.5a7.5 7.5 0 0 1 15 0",
+        .folder_open => "M3 16.6V7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v1.5 M5 19a2 2 0 0 1-1.9-2.6l1.7-4.5A2 2 0 0 1 6.7 10.5H20.5a1.5 1.5 0 0 1 1.4 2l-1.7 5.1A2 2 0 0 1 18.3 19z",
+        .code => "M8.5 7.5L4 12l4.5 4.5 M15.5 7.5L20 12l-4.5 4.5 M13.5 5.5l-3 13",
+        .zig => "M5 10V7h11 M19 14v3H8 M19.5 4.5L4.5 19.5",
     };
 }
 

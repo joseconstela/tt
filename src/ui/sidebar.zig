@@ -14,6 +14,9 @@
 //! renaming and the icon live in the context menu a right-click asks for
 //! (`Result.menu`; the app opens it, see `overlay.zig`). While the Settings
 //! tab is in front the same sidebar is that tab's navigation menu instead.
+//! A tab dragged from a strip can be let go on any row: it joins that row's
+//! own tabs (`Result.drop_tab`), and the tree is what shows while it is on
+//! the move, Settings in front or not.
 const std = @import("std");
 const DrawList = @import("../gfx/draw.zig").DrawList;
 const ui_mod = @import("ui.zig");
@@ -48,12 +51,17 @@ pub const Context = struct {
     /// A file from the files panel is being dragged: the rows take it
     /// (it is pinned to the project it lands on, see `Result.drop_file`).
     dragging_file: bool = false,
+    /// A tab is being dragged by its title: the group it is in. Every
+    /// other row takes it (`Result.drop_tab`).
+    dragging_tab: ?u32 = null,
     /// ⌥ is held: the rows show their jump keys (`jump.zig`).
     hints: Hints = .{},
 
-    /// The Settings tab, when it is the one in front.
+    /// The Settings tab, when it is the one in front of the main window
+    /// (and no tab is on the move: a dragged tab needs the rows).
     fn settings(self: Context) ?*settings_mod.SettingsTab {
-        const t = self.tabs.current() orelse return null;
+        if (self.dragging_tab != null) return null;
+        const t = self.tabs.shownGroup().current() orelse return null;
         return settings_mod.SettingsTab.fromTab(t);
     }
 };
@@ -106,6 +114,9 @@ pub const Result = struct {
     menu: ?MenuRequest = null,
     /// A file dragged from the files panel was let go here.
     drop_file: ?FileDrop = null,
+    /// A tab dragged from a strip was let go on a row: the group (the
+    /// row's own tabs) it moves to.
+    drop_tab: ?u32 = null,
     /// A project was dragged to a new position in the list.
     move_project: ?MoveProject = null,
     /// A resource was dragged within or between projects.
@@ -428,10 +439,11 @@ pub const Sidebar = struct {
         if (spec.target == .project) self.trackRowDrag(ui, .project, spec.id, st);
         const src = spec.target == .project and self.dragActive(.project, spec.id);
         if (ui.rightClicked(r)) res.menu = .{ .target = spec.target, .id = spec.id, .x = ui.mx, .y = ui.my };
-        const shown = ctx.tabs.groupId() == spec.gid;
+        const shown = ctx.tabs.shown == spec.gid;
         if (shown) dl.rrect(r, theme.row_radius, theme.accent.alpha(0.14)) else ui.feedback(r, theme.row_radius, st);
         if (src) dl.rrect(r, theme.row_radius, theme.accent.alpha(0.12));
         if (dropTarget(ui, ctx, r)) res.drop_file = .{ .gid = spec.gid };
+        if (tabTarget(ui, ctx, r, spec.gid)) res.drop_tab = spec.gid;
         if (spec.current) dl.rrect(.{ .x = r.x + 2, .y = r.centerY() - 8, .w = 3, .h = 16 }, 1.5, theme.accent);
         const unfolded = spec.open.* or ctx.hints.project == spec.gid;
         _ = dl.textCentered(theme.font_section, r.x + 10, r.centerY(), if (unfolded) "▾" else "▸", if (cs.hover) theme.text else theme.text_3);
@@ -461,6 +473,16 @@ pub const Sidebar = struct {
         return ui.released;
     }
 
+    /// The same for a tab being dragged, over the row of group `gid`: any
+    /// row but the one the tab is in already takes it among its own tabs.
+    fn tabTarget(ui: *Ui, ctx: Context, r: Rect, gid: u32) bool {
+        const from = ctx.dragging_tab orelse return false;
+        if (from == gid or !ui.mouseIn(r)) return false;
+        ui.dl.rrect(r, theme.row_radius, theme.accent.alpha(0.12));
+        ui.dl.border(r, theme.row_radius, 1, theme.accent.alpha(0.7));
+        return ui.released;
+    }
+
     /// A project's or resource's own icon at `x` (14pt, centred on `cy`),
     /// when it has one; returns where the label starts.
     fn drawRowIcon(dl: *DrawList, icon: ?[]const u8, x: f32, cy: f32, color: Color) f32 {
@@ -482,11 +504,13 @@ pub const Sidebar = struct {
         self.trackRowDrag(ui, .resource, r.id, st);
         const src = self.dragActive(.resource, r.id);
         if (ui.rightClicked(row)) res.menu = .{ .target = .resource, .id = r.id, .x = ui.mx, .y = ui.my };
-        const selected = ctx.tabs.groupId() == r.id;
+        const selected = ctx.tabs.shown == r.id;
         if (selected) dl.rrect(row, theme.row_radius, theme.accent.alpha(0.14)) else ui.feedback(row, theme.row_radius, st);
         if (src) dl.rrect(row, theme.row_radius, theme.accent.alpha(0.12));
-        // A file dropped on a resource joins the resource's project.
+        // A file dropped on a resource joins the resource's project; a tab
+        // joins the resource's own tabs.
         if (dropTarget(ui, ctx, row)) res.drop_file = .{ .gid = owner };
+        if (tabTarget(ui, ctx, row, r.id)) res.drop_tab = r.id;
 
         // The user's icon, else the kind's.
         const ix = row.x + 30;

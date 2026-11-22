@@ -13,12 +13,19 @@
 //!   layout <tab> tree <tab> focused <tab> group…   how a group's panes are split
 //!   tab <tab> 1|0 (in front of its pane) <tab> kind <tab> title <tab> cwd <tab> pane <tab> group…
 //!   <tab> line                                 the tab's own lines, from its `save`
+//!   window <tab> n [<tab> x <tab> y <tab> w <tab> h]   a separate window and where it
+//!                                              was on screen (`features/windows`)
 //! `group…` is `default <tab> <tab> <tab>` for the default project's own
 //! tabs, `project <tab> root <tab> <tab>` for a project's own tabs, or
 //! `file|shells <tab> root <tab> name <tab> path` for a sidebar resource's
 //! (root empty: a resource of the default project) — named rather than
 //! numbered, because ids are handed out afresh on every launch; a resource
-//! that is gone sends its tabs to its project's own. A group's tabs are
+//! that is gone sends its tabs to its project's own. The tabs of a separate
+//! window are in the group `window <tab> n <tab> <tab>`, n being the number
+//! its `window` record gives it in this file (the record comes first); the
+//! window comes back where it was, with its tabs and splits. A reader from
+//! before separate windows skips the `window` record and takes the group
+//! for the default project's, so those tabs come back in the main window. A group's tabs are
 //! written pane by pane in
 //! reading order; `pane` is the pane's place in that order and `layout`
 //! (only for a group with more than one pane; the text is `Layout.encode`'s,
@@ -31,10 +38,15 @@ const sys = @import("sys.zig");
 const tab_mod = @import("tabs/tab.zig");
 const layout_mod = @import("tabs/layout.zig");
 const projects_mod = @import("projects.zig");
+const windows = @import("features/windows/windows.zig");
 
 const TabManager = tab_mod.TabManager;
 const Projects = projects_mod.Projects;
 const Fields = std.mem.SplitIterator(u8, .scalar);
+
+/// A separate window as the workspace keeps it: the window group its tabs
+/// are in, and where it is on screen (null: not known).
+pub const Window = struct { group: u32, frame: ?windows.Frame = null };
 
 /// Seconds between looks for something new to save.
 const check_interval: f64 = 2;
@@ -61,30 +73,33 @@ pub const Workspace = struct {
         if (self.path) |p| self.gpa.free(p);
     }
 
-    /// Brings back the tabs of the last run; returns how many.
-    pub fn restore(self: *Workspace, tabs: *TabManager, projects: *Projects) usize {
+    /// Brings back the tabs of the last run; returns how many. The
+    /// separate windows it had are added to `wins`, each with the (new)
+    /// group its tabs came back in: the app opens a window for those that
+    /// got a tab back. The next save happens once the app has.
+    pub fn restore(self: *Workspace, tabs: *TabManager, projects: *Projects, wins: *std.ArrayList(Window)) usize {
         const path = self.path orelse return 0;
         const data = sys.readFileTail(self.gpa, path, max_file) catch return 0;
         defer self.gpa.free(data);
-        const n = parse(self.gpa, data, tabs, projects);
-        self.saved_version = version(tabs, projects);
+        const n = parse(self.gpa, data, tabs, projects, wins);
+        self.saved_version = version(tabs, projects, wins.items);
         return n;
     }
 
     /// Writes the file when something changed since the last write; looks
-    /// every couple of seconds.
-    pub fn saveIfChanged(self: *Workspace, tabs: *TabManager, projects: *Projects, now: f64) void {
+    /// every couple of seconds. `wins`: the separate windows there are.
+    pub fn saveIfChanged(self: *Workspace, tabs: *TabManager, projects: *Projects, wins: []const Window, now: f64) void {
         if (self.path == null or now - self.last_check < check_interval) return;
         self.last_check = now;
-        if (version(tabs, projects) != self.saved_version) self.save(tabs, projects);
+        if (version(tabs, projects, wins) != self.saved_version) self.save(tabs, projects, wins);
     }
 
-    pub fn save(self: *Workspace, tabs: *TabManager, projects: *Projects) void {
+    pub fn save(self: *Workspace, tabs: *TabManager, projects: *Projects, wins: []const Window) void {
         const path = self.path orelse return;
-        const v = version(tabs, projects);
+        const v = version(tabs, projects, wins);
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.gpa);
-        serialize(self.gpa, tabs, projects, &out) catch return;
+        serialize(self.gpa, tabs, projects, wins, &out) catch return;
         sys.writeFileAtomic(self.gpa, path, out.items) catch |err| {
             std.log.err("could not save the workspace: {s}", .{@errorName(err)});
             return;
@@ -94,9 +109,16 @@ pub const Workspace = struct {
 };
 
 /// Changes whenever `serialize` would write something different.
-pub fn version(tabs: *TabManager, projects: *Projects) u64 {
+pub fn version(tabs: *TabManager, projects: *Projects, wins: []const Window) u64 {
     var h = std.hash.Wyhash.init(0);
     h.update(std.mem.asBytes(&tabs.shown));
+    // A separate window moved or resized: its record changes (whole points,
+    // as they are written).
+    for (wins) |w| {
+        h.update(std.mem.asBytes(&w.group));
+        var buf: [64]u8 = undefined;
+        h.update(if (w.frame) |f| windows.frames.format(f, &buf) else "");
+    }
     for (tabs.groups.items) |*g| {
         h.update(std.mem.asBytes(&g.id));
         // A group is named on file by its resource (root, kind, name, path)
@@ -127,7 +149,7 @@ pub fn version(tabs: *TabManager, projects: *Projects) u64 {
     return h.final();
 }
 
-pub fn serialize(gpa: std.mem.Allocator, tabs: *TabManager, projects: *Projects, out: *std.ArrayList(u8)) !void {
+pub fn serialize(gpa: std.mem.Allocator, tabs: *TabManager, projects: *Projects, wins: []const Window, out: *std.ArrayList(u8)) !void {
     try out.appendSlice(gpa, "tt-workspace\t2\nshown\t");
     try writeGroup(gpa, projects, tabs.shown, out);
     try out.append(gpa, '\n');
@@ -135,6 +157,19 @@ pub fn serialize(gpa: std.mem.Allocator, tabs: *TabManager, projects: *Projects,
     defer body.deinit(gpa);
     for (tabs.groups.items) |*g| {
         const panes = g.layout.panes();
+        // A separate window's record goes ahead of its layout and tabs.
+        if (TabManager.isWindowGroup(g.id)) {
+            try out.print(gpa, "window\t{d}", .{windowNumber(g.id)});
+            for (wins) |w| {
+                if (w.group != g.id) continue;
+                const f = w.frame orelse break;
+                var buf: [64]u8 = undefined;
+                try out.append(gpa, '\t');
+                try out.appendSlice(gpa, windows.frames.format(f, &buf));
+                break;
+            }
+            try out.append(gpa, '\n');
+        }
         if (panes.len > 1) {
             try out.appendSlice(gpa, "layout\t");
             try g.layout.encode(gpa, out);
@@ -171,7 +206,16 @@ pub fn serialize(gpa: std.mem.Allocator, tabs: *TabManager, projects: *Projects,
     }
 }
 
+/// The number a separate window's group goes by in the file.
+fn windowNumber(id: u32) u32 {
+    return id - TabManager.window_group_base + 1;
+}
+
 fn writeGroup(gpa: std.mem.Allocator, projects: *Projects, id: u32, out: *std.ArrayList(u8)) !void {
+    if (TabManager.isWindowGroup(id)) {
+        try out.print(gpa, "window\t{d}\t\t", .{windowNumber(id)});
+        return;
+    }
     if (id != TabManager.default_group) {
         // A resource's tabs: its project's folder (none for the default
         // project's), kind, name and path.
@@ -218,8 +262,39 @@ const Active = struct { group: u32, uid: u32 };
 /// A `layout` record: which pane of the group had the focus.
 const Focus = struct { group: u32, pane: usize };
 
+/// The separate windows of the file being read: the number each has
+/// there, and the window group made for it in this run.
+const WindowMap = struct {
+    gpa: std.mem.Allocator,
+    tabs: *TabManager,
+    /// Where the app hears of them (null: nobody asked, as in most tests).
+    out: ?*std.ArrayList(Window),
+    numbers: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct { n: u32, group: u32 };
+
+    fn deinit(self: *WindowMap) void {
+        self.numbers.deinit(self.gpa);
+    }
+
+    /// The group of window `n`, made on first sight (with `frame` when
+    /// it is the `window` record that names it).
+    fn group(self: *WindowMap, n: u32, frame: ?windows.Frame) u32 {
+        for (self.numbers.items) |e| {
+            if (e.n == n) return e.group;
+        }
+        const gid = self.tabs.newWindowGroup() catch return TabManager.default_group;
+        self.numbers.append(self.gpa, .{ .n = n, .group = gid }) catch {};
+        if (self.out) |list| list.append(self.gpa, .{ .group = gid, .frame = frame }) catch {};
+        return gid;
+    }
+};
+
 /// Opens the tabs `serialize` wrote, each in its group; returns how many.
-pub fn parse(gpa: std.mem.Allocator, data: []const u8, tabs: *TabManager, projects: *Projects) usize {
+/// The separate windows named in it go to `wins` (see `Workspace.restore`).
+pub fn parse(gpa: std.mem.Allocator, data: []const u8, tabs: *TabManager, projects: *Projects, wins: ?*std.ArrayList(Window)) usize {
+    var wmap: WindowMap = .{ .gpa = gpa, .tabs = tabs, .out = wins };
+    defer wmap.deinit();
     var field: std.ArrayList(u8) = .empty;
     defer field.deinit(gpa);
     var actives: std.ArrayList(Active) = .empty;
@@ -243,14 +318,19 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8, tabs: *TabManager, projec
         var f = std.mem.splitScalar(u8, line, '\t');
         const tag = f.next() orelse continue;
         if (std.mem.eql(u8, tag, "shown")) {
-            shown = readGroup(gpa, &field, projects, &f);
+            shown = readGroup(gpa, &field, projects, &wmap, &f);
+            // The row on show is the main window's: never a separate one.
+            if (TabManager.isWindowGroup(shown)) shown = TabManager.default_group;
+        } else if (std.mem.eql(u8, tag, "window")) {
+            const n = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue;
+            _ = wmap.group(n, windows.frames.parse(f.rest()));
         } else if (std.mem.eql(u8, tag, "layout")) {
             // Before the group's tabs: the panes they go into. A group whose
             // resource is gone shares the default group, which may already be
             // split — then its tabs land there by clamped index.
             const tree = f.next() orelse continue;
             const focused = std.fmt.parseInt(usize, f.next() orelse continue, 10) catch 0;
-            const group = readGroup(gpa, &field, projects, &f);
+            const group = readGroup(gpa, &field, projects, &wmap, &f);
             tabs.show(group) catch continue;
             tabs.decodeLayout(group, tree) catch |err| {
                 std.log.debug("workspace: pane layout not restored: {s}", .{@errorName(err)});
@@ -277,7 +357,7 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8, tabs: *TabManager, projec
                 p.pane = pane;
                 group_kind = f.next() orelse continue;
             } else |_| {}
-            p.group = readGroupFrom(gpa, &field, projects, group_kind, &f);
+            p.group = readGroupFrom(gpa, &field, projects, &wmap, group_kind, &f);
             pending = p;
         }
     }
@@ -328,7 +408,8 @@ fn open(gpa: std.mem.Allocator, tabs: *TabManager, p: *Pending, shown: u32, acti
     // The tab the user sees first gets its shell right away; the others wait to be used.
     const index = tabs.openWith(p.kind.items, .{
         .cwd = dir,
-        .start_shell = p.active and p.group == shown,
+        // (So does the one in front of a separate window: it is on show too.)
+        .start_shell = p.active and (p.group == shown or TabManager.isWindowGroup(p.group)),
         .saved = p.body.items,
     }) catch |err| {
         std.log.err("could not restore a {s} tab: {s}", .{ p.kind.items, @errorName(err) });
@@ -342,13 +423,17 @@ fn open(gpa: std.mem.Allocator, tabs: *TabManager, p: *Pending, shown: u32, acti
 
 /// The group a record names: the resource's id today, or the default group
 /// when the resource is gone.
-fn readGroup(gpa: std.mem.Allocator, field: *std.ArrayList(u8), projects: *Projects, f: *Fields) u32 {
-    return readGroupFrom(gpa, field, projects, f.next() orelse return TabManager.default_group, f);
+fn readGroup(gpa: std.mem.Allocator, field: *std.ArrayList(u8), projects: *Projects, wmap: *WindowMap, f: *Fields) u32 {
+    return readGroupFrom(gpa, field, projects, wmap, f.next() orelse return TabManager.default_group, f);
 }
 
 /// `readGroup` with the kind field already taken from `f`.
-fn readGroupFrom(gpa: std.mem.Allocator, field: *std.ArrayList(u8), projects: *Projects, kind: []const u8, f: *Fields) u32 {
+fn readGroupFrom(gpa: std.mem.Allocator, field: *std.ArrayList(u8), projects: *Projects, wmap: *WindowMap, kind: []const u8, f: *Fields) u32 {
     const default = TabManager.default_group;
+    if (std.mem.eql(u8, kind, "window")) {
+        const n = std.fmt.parseInt(u32, f.next() orelse return default, 10) catch return default;
+        return wmap.group(n, null);
+    }
     if (std.mem.eql(u8, kind, "project")) {
         const root = f.next() orelse return default;
         const p = projects.byRoot(records.unescape(field, gpa, root) catch return default) orelse return default;
@@ -471,7 +556,7 @@ test "workspace: a resource that is gone sends its tabs to its project; the defa
         "tab\t0\tkept\t\t/tmp\t0\tfile\t/tmp/demo\tREADME.md\t/tmp/demo/README.md\n\tone\n";
     var tm = try testManager(&env);
     defer tm.deinit();
-    try std.testing.expectEqual(@as(usize, 2), parse(gpa, old, &tm, &projects));
+    try std.testing.expectEqual(@as(usize, 2), parse(gpa, old, &tm, &projects, null));
     try std.testing.expectEqual(project.id, tm.groupId());
     try std.testing.expectEqual(@as(usize, 2), tm.items().len);
 
@@ -481,13 +566,13 @@ test "workspace: a resource that is gone sends its tabs to its project; the defa
     _ = try tm.openWith("kept", .{ .cwd = "/tmp/notes" });
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    try serialize(gpa, &tm, &projects, &out);
+    try serialize(gpa, &tm, &projects, &.{}, &out);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "tt-workspace\t2\nshown\tshells\t\tnotes\t/tmp/notes\n"));
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\t0\tproject\t/tmp/demo\t\t\n") != null);
 
     var tm2 = try testManager(&env);
     defer tm2.deinit();
-    try std.testing.expectEqual(@as(usize, 3), parse(gpa, out.items, &tm2, &projects));
+    try std.testing.expectEqual(@as(usize, 3), parse(gpa, out.items, &tm2, &projects, null));
     try std.testing.expectEqual(notes.id, tm2.groupId());
     try std.testing.expectEqual(@as(usize, 1), tm2.items().len);
     try std.testing.expectEqual(@as(usize, 2), tm2.findGroup(project.id).?.count());
@@ -523,7 +608,7 @@ test "workspace: tabs come back in their groups with their names, directories an
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    try serialize(gpa, &tm, &projects, &out);
+    try serialize(gpa, &tm, &projects, &.{}, &out);
     try std.testing.expectEqualStrings(
         "tt-workspace\t2\n" ++
             "shown\tshells\t/tmp/demo\tShells\t/tmp/demo\n" ++
@@ -532,9 +617,9 @@ test "workspace: tabs come back in their groups with their names, directories an
             "tab\t0\tkept\t\t/tmp\t0\tshells\t/tmp/demo\tShells\t/tmp/demo\n\tone\n\ttwo\t2\n",
         out.items,
     );
-    const v = version(&tm, &projects);
+    const v = version(&tm, &projects, &.{});
     tm.rename(tm.items()[0].uid, "Other");
-    try std.testing.expect(version(&tm, &projects) != v);
+    try std.testing.expect(version(&tm, &projects, &.{}) != v);
 
     // The next launch: projects come back from their own file first, then the tabs.
     var projects2 = Projects.init(gpa);
@@ -545,7 +630,7 @@ test "workspace: tabs come back in their groups with their names, directories an
     projects2.parse(pout.items);
     var tm2 = try testManager(&env);
     defer tm2.deinit();
-    try std.testing.expectEqual(@as(usize, 3), parse(gpa, out.items, &tm2, &projects2));
+    try std.testing.expectEqual(@as(usize, 3), parse(gpa, out.items, &tm2, &projects2, null));
     const shells2 = projects2.items.items[0].resources.items[0].id;
     try std.testing.expectEqual(shells2, tm2.groupId());
     try std.testing.expectEqual(@as(usize, 1), tm2.items().len);
@@ -568,7 +653,7 @@ test "workspace: tabs come back in their groups with their names, directories an
     defer none.deinit();
     var tm3 = try testManager(&env);
     defer tm3.deinit();
-    try std.testing.expectEqual(@as(usize, 3), parse(gpa, out.items, &tm3, &none));
+    try std.testing.expectEqual(@as(usize, 3), parse(gpa, out.items, &tm3, &none, null));
     try std.testing.expectEqual(TabManager.default_group, tm3.groupId());
     try std.testing.expectEqual(@as(usize, 3), tm3.items().len);
     try std.testing.expectEqual(@as(usize, 1), tm3.activeIndex());
@@ -613,7 +698,7 @@ test "workspace: split panes come back as they were, version 1 files still read"
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    try serialize(gpa, &tm, &none, &out);
+    try serialize(gpa, &tm, &none, &.{}, &out);
     try std.testing.expectEqualStrings(
         "tt-workspace\t2\n" ++
             "shown\tdefault\t\t\t\n" ++
@@ -625,16 +710,16 @@ test "workspace: split panes come back as they were, version 1 files still read"
         out.items,
     );
     // Moving a divider or splitting is a change worth saving.
-    const v = version(&tm, &none);
+    const v = version(&tm, &none, &.{});
     geo = tm.group().layout.geometry(.{ .x = 0, .y = 0, .w = 1000, .h = 1000 }, 0);
     tab_mod.Layout.resize(geo.dividers[0].split, 0, 0.05, 0.05);
-    try std.testing.expect(version(&tm, &none) != v);
+    try std.testing.expect(version(&tm, &none, &.{}) != v);
 
     // Next launch: three panes in the same arrangement, tabs where they
     // were, the middle pane focused with its tab in front and started.
     var tm2 = try testManager(&env);
     defer tm2.deinit();
-    try std.testing.expectEqual(@as(usize, 4), parse(gpa, out.items, &tm2, &none));
+    try std.testing.expectEqual(@as(usize, 4), parse(gpa, out.items, &tm2, &none, null));
     const l = &tm2.group().layout;
     try std.testing.expectEqual(@as(usize, 3), l.count());
     var text: std.ArrayList(u8) = .empty;
@@ -663,7 +748,7 @@ test "workspace: split panes come back as they were, version 1 files still read"
         "tt-workspace\t1\n" ++
         "shown\tdefault\t\t\t\n" ++
         "tab\t1\tkept\tOld\t-\tdefault\t\t\t\n\tx\n";
-    try std.testing.expectEqual(@as(usize, 1), parse(gpa, old, &tm3, &none));
+    try std.testing.expectEqual(@as(usize, 1), parse(gpa, old, &tm3, &none, null));
     var buf: [96]u8 = undefined;
     try std.testing.expectEqualStrings("Old", tm3.current().?.title(&buf));
     try std.testing.expectEqual(@as(usize, 1), tm3.group().layout.count());
@@ -674,7 +759,93 @@ test "workspace: split panes come back as they were, version 1 files still read"
         "shown\tdefault\t\t\t\n" ++
         "layout\th(0.5000:_,0.5000:_)\t1\tdefault\t\t\t\n" ++
         "tab\t1\tkept\t\t-\t0\tdefault\t\t\t\n\tx\n";
-    try std.testing.expectEqual(@as(usize, 1), parse(gpa, sparse, &tm4, &none));
+    try std.testing.expectEqual(@as(usize, 1), parse(gpa, sparse, &tm4, &none, null));
     try std.testing.expectEqual(@as(usize, 1), tm4.group().layout.count());
     try std.testing.expectEqual(@as(usize, 1), tm4.items().len);
+}
+
+test "workspace: a separate window comes back with its tabs, its splits and its place" {
+    const gpa = std.testing.allocator;
+    var history = History.init(gpa);
+    defer history.deinit();
+    var env: tab_mod.Env = .{
+        .gpa = gpa,
+        .history = &history,
+        .integration_dir = "",
+        .user_zdotdir = "",
+        .launch_cwd = "/",
+        .setClipboard = struct {
+            fn f(_: []const u8) void {}
+        }.f,
+    };
+    var none = Projects.init(gpa);
+    defer none.deinit();
+    var tm = try testManager(&env);
+    defer tm.deinit();
+
+    // The main window: one tab. Two separate windows: the first with a
+    // split (a kept tab either side, the right one renamed), the second
+    // with a tab that keeps nothing.
+    _ = try tm.openWith("kept", .{ .cwd = "/tmp" });
+    const w1 = try tm.newWindowGroup();
+    try tm.show(w1);
+    _ = try tm.openWith("kept", .{ .cwd = "/tmp" });
+    _ = try tm.splitPane(.right);
+    const right = try tm.openWith("kept", .{ .cwd = "/" });
+    tm.rename(tm.items()[right].uid, "Logs");
+    const w2 = try tm.newWindowGroup();
+    try tm.show(w2);
+    _ = try tm.open("plain");
+    try tm.show(TabManager.default_group);
+
+    const wins = [_]Window{
+        .{ .group = w1, .frame = .{ .x = 1500, .y = -120, .w = 900, .h = 620 } },
+        .{ .group = w2 },
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try serialize(gpa, &tm, &none, &wins, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "window\t1\t1500\t-120\t900\t620\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "window\t2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\twindow\t1\t\t\n") != null);
+    // Moving a window is something to save; so is a tab changing windows.
+    const v = version(&tm, &none, &wins);
+    var moved = wins;
+    moved[0].frame.?.x = 1501;
+    try std.testing.expect(version(&tm, &none, &moved) != v);
+
+    // A new run: other group ids, the same windows.
+    var tm2 = try testManager(&env);
+    defer tm2.deinit();
+    _ = try tm2.newWindowGroup(); // ids do not line up with the file's numbers
+    var back: std.ArrayList(Window) = .empty;
+    defer back.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), parse(gpa, out.items, &tm2, &none, &back));
+    try std.testing.expectEqual(@as(usize, 2), back.items.len);
+    try std.testing.expect(tm2.keyed == null);
+    try std.testing.expectEqual(TabManager.default_group, tm2.shown);
+    try std.testing.expectEqual(@as(usize, 1), tm2.shownGroup().count());
+    const g1 = tm2.findGroup(back.items[0].group).?;
+    try std.testing.expect(TabManager.isWindowGroup(g1.id));
+    try std.testing.expectEqual(@as(f32, 1500), back.items[0].frame.?.x);
+    try std.testing.expectEqual(@as(f32, -120), back.items[0].frame.?.y);
+    try std.testing.expectEqual(@as(usize, 2), g1.layout.count());
+    try std.testing.expectEqual(@as(usize, 2), g1.count());
+    var tb: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Logs", g1.current().?.title(&tb));
+    // The tab in front of a separate window is on show: its shell starts.
+    const front: *KeptTab = @ptrCast(@alignCast(g1.current().?.ptr));
+    try std.testing.expect(front.started);
+    // The second window had nothing to keep: it is named, with no tabs
+    // (the app does not open a window for it).
+    try std.testing.expect(back.items[1].frame == null);
+    try std.testing.expectEqual(@as(usize, 0), tm2.findGroup(back.items[1].group).?.count());
+
+    // A reader that was not told about windows still gets the tabs (and
+    // one from before them takes the group for the default project's:
+    // `readGroupFrom` sends a kind it does not know there).
+    var tm3 = try testManager(&env);
+    defer tm3.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parse(gpa, out.items, &tm3, &none, null));
+    try std.testing.expectEqual(@as(usize, 3), tm3.count());
 }

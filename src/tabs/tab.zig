@@ -15,6 +15,12 @@
 //! The comparison tab ("diff") is the one kind opened on more than a path:
 //! the Git view hands it `OpenArgs.diff` (which two versions to compare).
 //!
+//! Tabs live in groups: one per sidebar row, one per separate window. The
+//! manager keeps which group the main window shows (`shown`) and which one
+//! has the keyboard when that is a separate window's (`keyed`); a tab can
+//! be moved to any pane of any group (`moveTab`, `moveTabToGroup`) and is
+//! the same object afterwards. See `Group`.
+//!
 //! A tab reaches beyond its rect only by queueing a `Request` on `Env`:
 //! another tab opened, text for a shell, and a question for the user (a
 //! confirmation box or a menu, which only the app can show): the answer
@@ -581,6 +587,12 @@ pub const Kind = struct {
 /// the background. Within a group the tabs are spread over *panes* — the
 /// split layout of the content area (see `layout.zig`); one pane is focused
 /// and gets the keyboard.
+///
+/// A tab dragged out of the window gets a window of its own, and that window
+/// a group of its own: a *window group*, with an id outside the sidebar's
+/// (`TabManager.window_group_base` and up). It is on show in its window the
+/// whole time, and while that window has the keyboard it is the group
+/// everything here that says "the group the user is in" means (`keyed`).
 pub const Group = struct {
     id: u32,
     layout: Layout,
@@ -606,13 +618,24 @@ pub const TabManager = struct {
     kinds: std.ArrayList(Kind) = .empty,
     /// The default group is created first and never removed.
     groups: std.ArrayList(Group) = .empty,
-    /// Id of the group the strip(s) show.
+    /// Id of the group the main window's strip(s) show: a sidebar row.
     shown: u32 = default_group,
+    /// The window group whose window has the keyboard, when one does: then
+    /// that is the group the user is in (`group`), not the one on show.
+    keyed: ?u32 = null,
+    next_window_group: u32 = window_group_base,
     next_uid: u32 = 1,
     /// Pane ids are unique across groups, so a pane names itself anywhere.
     next_pane_id: u32 = 1,
 
     pub const default_group: u32 = 0;
+    /// Window groups are numbered from here: no project or resource of the
+    /// sidebar gets this far (their ids start at 1 on every load).
+    pub const window_group_base: u32 = 1 << 31;
+
+    pub fn isWindowGroup(id: u32) bool {
+        return id >= window_group_base;
+    }
 
     pub fn init(gpa: std.mem.Allocator, env: *Env) !TabManager {
         var self: TabManager = .{ .gpa = gpa, .env = env };
@@ -660,16 +683,33 @@ pub const TabManager = struct {
         return null;
     }
 
-    // ── the group on show and its focused pane ──────────────────────────
+    // ── the group the user is in and its focused pane ───────────────────
+    /// The group that has the keyboard: a separate window's while that
+    /// window is key, else the one on show in the main window.
     pub fn group(self: *TabManager) *Group {
-        return self.findGroup(self.shown) orelse &self.groups.items[0];
+        if (self.keyed) |id| {
+            if (self.findGroup(id)) |g| return g;
+        }
+        return self.shownGroup();
     }
 
     pub fn groupId(self: *const TabManager) u32 {
-        return self.shown;
+        return self.keyed orelse self.shown;
     }
 
-    /// The focused pane of the group on show.
+    /// The sidebar row's group in the main window's strip(s), whichever
+    /// window has the keyboard.
+    pub fn shownGroup(self: *TabManager) *Group {
+        return self.findGroup(self.shown) orelse &self.groups.items[0];
+    }
+
+    /// Whether a group's tabs are on screen: the row on show, and every
+    /// window group (its window shows nothing else).
+    pub fn onShow(self: *const TabManager, id: u32) bool {
+        return id == self.shown or isWindowGroup(id);
+    }
+
+    /// The focused pane of the group the user is in.
     pub fn pane(self: *TabManager) *Pane {
         return self.group().pane();
     }
@@ -701,7 +741,7 @@ pub const TabManager = struct {
                 for (g.layout.owned.items) |p| {
                     for (p.tabs.items, 0..) |t, i| {
                         if (std.mem.eql(u8, t.kind, kind.name)) {
-                            self.shown = g.id;
+                            self.enter(g.id);
                             g.layout.focused = p.id;
                             p.active = i;
                             return i;
@@ -811,17 +851,33 @@ pub const TabManager = struct {
     }
 
     // ── panes ───────────────────────────────────────────────────────────
+    // A pane's id names it in whichever group it is, so these look in all
+    // of them: the main window and every separate one draw at once.
     pub fn paneById(self: *TabManager, id: u32) ?*Pane {
-        return self.group().layout.find(id);
+        const g = self.groupOfPane(id) orelse return null;
+        return g.layout.find(id);
     }
 
-    /// The pane (of the group on show) holding a tab.
+    /// The pane holding a tab.
     pub fn paneOf(self: *TabManager, uid: u32) ?*Pane {
-        return self.group().layout.paneOf(uid);
+        for (self.groups.items) |g| {
+            if (g.layout.paneOf(uid)) |p| return p;
+        }
+        return null;
     }
 
+    /// The group a pane belongs to.
+    pub fn groupOfPane(self: *TabManager, id: u32) ?*Group {
+        for (self.groups.items) |*g| {
+            if (g.layout.find(id) != null) return g;
+        }
+        return null;
+    }
+
+    /// Makes a pane the focused one of its group.
     pub fn focusPane(self: *TabManager, id: u32) bool {
-        return self.group().layout.focus(id);
+        const g = self.groupOfPane(id) orelse return false;
+        return g.layout.focus(id);
     }
 
     /// Focus moves `delta` panes along in reading order, wrapping.
@@ -847,17 +903,20 @@ pub const TabManager = struct {
 
     /// Removes a pane that ended up empty (e.g. its first tab failed to open).
     pub fn dropIfEmpty(self: *TabManager, id: u32) void {
-        const g = self.group();
+        const g = self.groupOfPane(id) orelse return;
         const p = g.layout.find(id) orelse return;
         if (p.tabs.items.len == 0) _ = g.layout.remove(id);
     }
 
-    /// Moves a tab of the group on show into pane `to` before position
-    /// `index` (clamped), focusing it there. Within its own pane this
-    /// reorders. A pane left empty is dropped.
+    /// Moves a tab into pane `to` before position `index` (clamped),
+    /// focusing it there. Within its own pane this reorders; the pane may
+    /// as well be another group's (a sidebar row, a separate window): the
+    /// tab is the same object afterwards, nothing in it restarts. A pane
+    /// left empty is dropped.
     pub fn moveTab(self: *TabManager, uid: u32, to_id: u32, index: usize) bool {
-        const g = self.group();
-        const from = g.layout.paneOf(uid) orelse return false;
+        const from_group = self.findGroup(self.groupOf(uid) orelse return false) orelse return false;
+        const g = self.groupOfPane(to_id) orelse return false;
+        const from = from_group.layout.paneOf(uid) orelse return false;
         const to = g.layout.find(to_id) orelse return false;
         const fi = from.indexOf(uid).?;
         if (from == to) {
@@ -879,15 +938,15 @@ pub const TabManager = struct {
         to.tabs.insertAssumeCapacity(at, t);
         to.active = at;
         g.layout.focused = to.id;
-        if (from.tabs.items.len == 0) _ = g.layout.remove(from.id);
+        if (from.tabs.items.len == 0) _ = from_group.layout.remove(from.id);
         return true;
     }
 
     /// Moves a tab into a new pane on `side` of pane `beside`. Nothing to do
     /// (false) when the tab is alone in that very pane.
     pub fn moveTabToNewPane(self: *TabManager, uid: u32, beside: u32, side: Side) bool {
-        const g = self.group();
-        const from = g.layout.paneOf(uid) orelse return false;
+        const g = self.groupOfPane(beside) orelse return false;
+        const from = self.paneOf(uid) orelse return false;
         if (from.id == beside and from.tabs.items.len == 1) return false;
         const p = g.layout.split(beside, side, self.newPaneId()) catch return false;
         if (self.moveTab(uid, p.id, 0)) return true;
@@ -903,12 +962,61 @@ pub const TabManager = struct {
         return null;
     }
 
-    /// Puts a group on show, creating it (empty, one pane) if needed.
+    /// Puts the user in a group, creating it (empty, one pane) if needed:
+    /// a sidebar row goes on show in the main window, which takes the
+    /// keyboard back from a separate window; a window group takes it.
     pub fn show(self: *TabManager, id: u32) !void {
-        if (self.findGroup(id) == null) {
-            try self.groups.append(self.gpa, .{ .id = id, .layout = try Layout.init(self.gpa, self.newPaneId()) });
+        _ = try self.ensureGroup(id);
+        self.enter(id);
+    }
+
+    fn enter(self: *TabManager, id: u32) void {
+        if (isWindowGroup(id)) {
+            self.keyed = id;
+        } else {
+            self.shown = id;
+            self.keyed = null;
         }
-        self.shown = id;
+    }
+
+    /// A group by id, made (empty, one pane) when there is none yet,
+    /// without putting it on show. Appending may move the groups: a
+    /// `*Group` from before is stale.
+    pub fn ensureGroup(self: *TabManager, id: u32) !*Group {
+        if (self.findGroup(id)) |g| return g;
+        try self.groups.append(self.gpa, .{ .id = id, .layout = try Layout.init(self.gpa, self.newPaneId()) });
+        return &self.groups.items[self.groups.items.len - 1];
+    }
+
+    /// A new, empty group for a separate window; the id is what is returned.
+    pub fn newWindowGroup(self: *TabManager) !u32 {
+        const id = self.next_window_group;
+        _ = try self.ensureGroup(id);
+        self.next_window_group += 1;
+        return id;
+    }
+
+    /// Moves a tab to the end of another group's focused pane (a sidebar
+    /// row's tabs, a separate window's). False when it is there already.
+    pub fn moveTabToGroup(self: *TabManager, uid: u32, id: u32) bool {
+        const from = self.groupOf(uid) orelse return false;
+        if (from == id) return false;
+        const g = self.ensureGroup(id) catch return false;
+        const p = g.pane();
+        return self.moveTab(uid, p.id, p.tabs.items.len);
+    }
+
+    /// Removes a group and closes whatever tabs are still in it (a separate
+    /// window being closed). The default group stays.
+    pub fn dropGroup(self: *TabManager, id: u32) void {
+        if (id == default_group) return;
+        var gi: usize = 0;
+        while (gi < self.groups.items.len and self.groups.items[gi].id != id) gi += 1;
+        if (gi == self.groups.items.len) return;
+        var g = self.groups.orderedRemove(gi);
+        self.freeGroup(&g);
+        if (self.shown == id) self.shown = default_group;
+        if (self.keyed == id) self.keyed = null;
     }
 
     /// The group a tab lives in.
@@ -956,12 +1064,12 @@ pub const TabManager = struct {
         return t.*;
     }
 
-    /// Shows the group and pane a tab lives in with that tab active.
+    /// Puts the user where a tab lives, group and pane, with that tab active.
     pub fn focus(self: *TabManager, uid: u32) bool {
         for (self.groups.items) |*g| {
             for (g.layout.owned.items) |p| {
                 const i = p.indexOf(uid) orelse continue;
-                self.shown = g.id;
+                self.enter(g.id);
                 g.layout.focused = p.id;
                 p.active = i;
                 return true;
@@ -981,6 +1089,7 @@ pub const TabManager = struct {
         var g = self.groups.orderedRemove(gi);
         const was_shown = self.shown == id;
         if (was_shown) self.shown = default_group;
+        if (self.keyed == id) self.keyed = null;
         const home = self.findGroup(default_group).?.pane();
         const first = home.tabs.items.len;
         const shown_active = if (g.layout.find(g.layout.focused)) |p| p.current() else null;
@@ -1228,4 +1337,94 @@ test "panes: splitting, moving tabs between panes, empty panes go away" {
     try std.testing.expectEqual(y, tm.current().?.uid);
     try std.testing.expectEqual(@as(usize, 6), tm.count());
     try std.testing.expect(tm.findGroup(9) == null);
+}
+
+/// Opens a test tab on `path` where the user is; its uid.
+fn openTest(tm: *TabManager, path: []const u8) !u32 {
+    const i = try tm.openWith("test", .{ .path = path });
+    return tm.items()[i].uid;
+}
+
+test "moving a tab to another group, and a window group that has the keyboard" {
+    var history = History.init(std.testing.allocator);
+    defer history.deinit();
+    var env = testEnv(&history);
+    var tm = try TabManager.init(std.testing.allocator, &env);
+    defer tm.deinit();
+    tm.register(.{ .name = "test", .label = "Test", .create = TestTab.create });
+    tm.register(.{ .name = "single", .label = "Single", .create = TestTab.create, .singleton = true });
+
+    const a = try openTest(&tm, "/a");
+    const b = try openTest(&tm, "/b");
+    const c = try openTest(&tm, "/c");
+    const b_ptr = tm.byUid(b).?.ptr;
+    tm.rename(b, "Build");
+
+    // To a row that has no tabs yet: the group is made, the tab is the same
+    // object there (the testing allocator would catch a second free), the
+    // row on show does not change and its strip closes ranks.
+    try std.testing.expect(tm.moveTabToGroup(b, 7));
+    try std.testing.expectEqual(TabManager.default_group, tm.groupId());
+    try std.testing.expectEqual(@as(?u32, 7), tm.groupOf(b));
+    try std.testing.expectEqual(b_ptr, tm.byUid(b).?.ptr);
+    var tb: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("Build", tm.byUid(b).?.title(&tb));
+    try std.testing.expectEqual(@as(usize, 2), tm.items().len);
+    try std.testing.expectEqual(c, tm.current().?.uid);
+    try std.testing.expect(!tm.moveTabToGroup(b, 7)); // already there
+    try std.testing.expect(!tm.moveTabToGroup(999, 7)); // no such tab
+
+    // Into a split of another group: the pane names the group. The pane the
+    // tab leaves empty goes away, in the group it was in.
+    try tm.show(7);
+    const first = tm.pane().id;
+    const side = (try tm.splitPane(.right)).id;
+    try std.testing.expect(tm.moveTab(b, side, 0));
+    try std.testing.expect(tm.paneById(first) == null);
+    try tm.show(0);
+    try std.testing.expect(tm.moveTab(a, side, 0));
+    try std.testing.expectEqual(@as(?u32, 7), tm.groupOf(a));
+    try std.testing.expectEqual(a, tm.findGroup(7).?.current().?.uid);
+    try std.testing.expectEqual(@as(usize, 1), tm.items().len);
+    // The last tab of the row on show can leave too; its one pane stays.
+    try std.testing.expect(tm.moveTabToGroup(c, 7));
+    try std.testing.expectEqual(@as(usize, 0), tm.items().len);
+    try std.testing.expectEqual(@as(usize, 1), tm.group().layout.count());
+    try std.testing.expectEqual(@as(usize, 3), tm.count());
+
+    // A separate window's group: on show wherever the main window is, and
+    // "the group the user is in" only while it has the keyboard.
+    const w = try tm.newWindowGroup();
+    try std.testing.expect(TabManager.isWindowGroup(w));
+    try std.testing.expect(tm.moveTabToGroup(a, w));
+    try std.testing.expect(tm.onShow(w) and tm.onShow(0) and !tm.onShow(7));
+    try std.testing.expectEqual(TabManager.default_group, tm.groupId());
+    tm.keyed = w;
+    try std.testing.expectEqual(w, tm.groupId());
+    try std.testing.expectEqual(a, tm.current().?.uid);
+    const d = try openTest(&tm, "/d");
+    try std.testing.expectEqual(@as(?u32, w), tm.groupOf(d));
+    try std.testing.expectEqual(@as(u32, 0), tm.shown);
+
+    // Going to a row gives the keyboard back to the main window; a tab of
+    // the window (or a singleton living there) takes it again.
+    try tm.show(7);
+    try std.testing.expect(tm.keyed == null);
+    try std.testing.expect(tm.focus(d));
+    try std.testing.expectEqual(@as(?u32, w), tm.keyed);
+    try std.testing.expectEqual(@as(u32, 7), tm.shown);
+    _ = try tm.open("single");
+    try tm.show(0);
+    _ = try tm.open("single");
+    try std.testing.expectEqual(@as(?u32, w), tm.keyed);
+
+    // Back to a row from the window, then the window goes with what is left.
+    try std.testing.expect(tm.moveTabToGroup(d, 0));
+    try std.testing.expectEqual(@as(?u32, 0), tm.groupOf(d));
+    tm.dropGroup(w);
+    try std.testing.expect(tm.keyed == null);
+    try std.testing.expect(tm.findGroup(w) == null);
+    try std.testing.expect(tm.byUid(a) == null);
+    try std.testing.expectEqual(@as(usize, 3), tm.count());
+    try std.testing.expect((try tm.newWindowGroup()) != w);
 }

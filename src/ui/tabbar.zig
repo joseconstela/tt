@@ -9,7 +9,9 @@
 //! others / to the right, rename, copy path, reveal, split; see overlay.zig).
 //! Pressing a tab and moving it starts a *drag*: the pane view draws
 //! the ghost, and the strip or pane under the mouse says where the tab would
-//! land (`Drag.target`). `left_inset` keeps the first tab clear of the
+//! land (`Drag.target`). With no target it can still land on a sidebar row
+//! (the row's own tabs) or, let go outside the window, in a window of its
+//! own (`panes.zig`'s `Result.torn`). `left_inset` keeps the first tab clear of the
 //! traffic lights and the sidebar's toggle (in the band while the sidebar
 //! is collapsed); empty space in the band drags the window (see the
 //! platform layer).
@@ -116,13 +118,15 @@ const min_title_w: f32 = 36;
 /// Moving this far (points) from the press turns a click into a drag.
 const drag_threshold: f32 = 5;
 
-/// The band's bottom line and its right cluster: the files toggle.
-pub fn drawCluster(ui: *Ui, band: Rect, files_visible: bool) Cluster {
+/// The band's bottom line and its right cluster: the files toggle, lit
+/// while the panel is on show (null: a window with no files panel, so
+/// no toggle).
+pub fn drawCluster(ui: *Ui, band: Rect, files: ?bool) Cluster {
     const dl = ui.dl;
     dl.rect(.{ .x = band.x, .y = band.bottom() - 1, .w = band.w, .h = 1 }, theme.line);
     var right = band.right() - 16;
     var res: Cluster = .{ .right = right };
-    {
+    if (files) |files_visible| {
         const b = theme.tab_pill_h;
         const r: Rect = .{ .x = right - b, .y = band.y + (band.h - b) / 2, .w = b, .h = b };
         const st = ui.button(Ui.id("tabbar.files", 0), r);

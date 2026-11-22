@@ -1,6 +1,9 @@
 //! Text engine: CoreText fonts → glyph lookup with fallback → alpha atlas.
 //! All public measurements are in points; rasterisation happens at the
 //! window's backing scale so glyphs are pixel-exact on Retina displays.
+//! Every cache is keyed by pixel size, so windows on displays of different
+//! scales (and the app's zoom levels) share the one atlas: `setScale` only
+//! says which scale the next measurements and glyphs are for.
 const std = @import("std");
 const apple = @import("../apple.zig");
 const icons = @import("icons.zig");
@@ -166,14 +169,13 @@ pub const TextEngine = struct {
         return apple.CTFontManagerCreateFontDescriptorFromData(data);
     }
 
+    /// The points→pixels factor of what is drawn next. Nothing is thrown
+    /// away: a font instance, its glyphs and an icon are each cached under
+    /// their size in pixels, so going back and forth between two scales
+    /// (a frame for each of two windows) costs nothing. What is no longer
+    /// used goes when the atlas fills up and is wiped (`pack`).
     pub fn setScale(self: *TextEngine, scale: f32) void {
-        if (scale == self.scale) return;
         self.scale = scale;
-        for (self.insts.items) |inst| apple.CFRelease(inst.ct);
-        self.insts.clearRetainingCapacity();
-        self.inst_map.clearRetainingCapacity();
-        self.glyph_map.clearRetainingCapacity();
-        self.resetAtlas();
     }
 
     fn resetAtlas(self: *TextEngine) void {

@@ -42,6 +42,24 @@
 //!   paste some text        (as ⌘V would; what the app copies is printed as
 //!                          `clipboard → …` and is what the edit menu's Paste gives)
 //!   files                  print the folder the files panel shows
+//!   tabs                   print every group that has tabs, one per line, its tabs
+//!                          pane by pane (`*` is the one in front of its pane):
+//!                          `tabs: group=3 shown: 'zsh' *'notes.md'`. A separate
+//!                          window's reads `tabs: window=1 key at 1500,200 900x620: …`
+//!                          (`key`: the window with the keyboard)
+//!   window 1               the pointer commands, `snap` and the keyboard go to
+//!                          separate window 1 from now on (0: the main window).
+//!                          Windows are numbered as they are made. A tab dragged
+//!                          to a point outside the window (`drag 355 26 1500 300`)
+//!                          gets one; `window → 1` is printed when it does, and
+//!                          `key → window 1` / `key → main` when the app moves
+//!                          the keyboard on its own
+//!   close_window           what the close button of the separate window chosen
+//!                          with `window N` does: its tabs close with it, after
+//!                          a question when one of them is busy
+//!   frame 0 100 50 1200 700   where a window is on screen (0: the main one):
+//!                          x y of its top-left corner, then its size. What a
+//!                          tab let go outside its window lands on goes by these
 //!   snap /path/out.png
 const std = @import("std");
 const app_mod = @import("app.zig");
@@ -76,9 +94,58 @@ fn scriptClipboard(gpa: std.mem.Allocator) ?[]u8 {
 fn pump(app: *app_mod.App, ms: f64) void {
     const t0 = apple.CACurrentMediaTime();
     while ((apple.CACurrentMediaTime() - t0) * 1000 < ms) {
-        if (app.update(apple.CACurrentMediaTime())) app.buildFrame();
+        if (app.update(apple.CACurrentMediaTime())) {
+            app.buildFrame();
+            // By index: a frame can open a window (a tab let go outside).
+            var i: usize = 0;
+            while (i < app.windows.items.len) : (i += 1) app.buildWindowFrame(app.windows.items[i]);
+        }
+        standInForPlatform(app);
         _ = sys.usleep(4000);
     }
+}
+
+/// The separate window the pointer commands and `snap` address (`window N`);
+/// 0 is the main window.
+var target_window: u32 = 0;
+/// Separate windows seen so far, to say when one opens.
+var windows_seen: u32 = 0;
+
+const TabManager = @TypeOf(@as(app_mod.App, undefined).tabs);
+
+/// A separate window's number: 1 for the first one made.
+fn windowNumber(group: u32) u32 {
+    return group - TabManager.window_group_base + 1;
+}
+
+/// The window `window N` chose, while it exists (null: the main one).
+fn targetWindow(app: *app_mod.App) ?*@TypeOf(app.windows.items[0].*) {
+    if (target_window == 0) return null;
+    return app.windowByGroup(TabManager.window_group_base + target_window - 1);
+}
+
+/// What the platform layer does for the app's windows, as far as a run
+/// with no real ones can: a new window is where the app asked, and a
+/// window the app wants in front gets the keyboard.
+fn standInForPlatform(app: *app_mod.App) void {
+    for (app.windows.items) |w| {
+        w.place = null;
+        const n = windowNumber(w.group);
+        if (n > windows_seen) {
+            windows_seen = n;
+            std.debug.print("window → {d}\n", .{n});
+        }
+    }
+    if (app.takeRaise()) |r| switch (r) {
+        .main => {
+            app.onWindowKey(null);
+            std.debug.print("key → main\n", .{});
+        },
+        .window => |w| {
+            app.onWindowKey(w.group);
+            std.debug.print("key → window {d}\n", .{windowNumber(w.group)});
+        },
+    };
 }
 
 fn settle(app: *app_mod.App, max_ms: f64) void {
@@ -105,6 +172,32 @@ fn modsOf(it: *std.mem.TokenIterator(u8, .scalar), count: *u32) ui_mod.Mods {
 
 fn num(it: *std.mem.TokenIterator(u8, .scalar)) f32 {
     return std.fmt.parseFloat(f32, it.next() orelse "0") catch 0;
+}
+
+/// `tabs`: where every tab is.
+fn printTabs(app: *app_mod.App) void {
+    for (app.tabs.groups.items) |*g| {
+        if (g.count() == 0) continue;
+        const key = if (app.tabs.groupId() == g.id) " key" else "";
+        if (TabManager.isWindowGroup(g.id)) {
+            std.debug.print("tabs: window={d}{s}", .{ windowNumber(g.id), key });
+            if (app.windowByGroup(g.id)) |w| if (w.frame) |f| {
+                std.debug.print(" at {d},{d} {d}x{d}", .{ f.x, f.y, f.w, f.h });
+            };
+            std.debug.print(":", .{});
+        } else {
+            std.debug.print("tabs: group={d}{s}{s}:", .{ g.id, if (g.id == app.tabs.shown) " shown" else "", key });
+        }
+        const panes = g.layout.panes();
+        for (panes.slice(), 0..) |p, pi| {
+            if (pi > 0) std.debug.print(" |", .{});
+            for (p.tabs.items, 0..) |t, i| {
+                var buf: [96]u8 = undefined;
+                std.debug.print(" {s}'{s}'", .{ if (i == p.active) "*" else "", t.title(&buf) });
+            }
+        }
+        std.debug.print("\n", .{});
+    }
 }
 
 pub fn runHeadless(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
@@ -159,25 +252,25 @@ pub fn runHeadless(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
         } else if (std.mem.eql(u8, cmd, "move")) {
             const x = num(&args);
             const y = num(&args);
-            app.onMouseMove(x, y);
+            app.pointerMove(targetWindow(app), x, y);
         } else if (std.mem.eql(u8, cmd, "down")) {
             const x = num(&args);
             const y = num(&args);
-            app.onMouseDown(x, y, 1, .{});
+            app.pointerDown(targetWindow(app), x, y, 1, .{});
         } else if (std.mem.eql(u8, cmd, "up")) {
             const x = num(&args);
             const y = num(&args);
-            app.onMouseUp(x, y);
+            app.pointerUp(targetWindow(app), x, y);
         } else if (std.mem.eql(u8, cmd, "click")) {
             const x = num(&args);
             const y = num(&args);
             var count: u32 = 1;
             const mods = modsOf(&args, &count);
-            app.onMouseMove(x, y);
+            app.pointerMove(targetWindow(app), x, y);
             pump(app, 30);
-            app.onMouseDown(x, y, count, mods);
+            app.pointerDown(targetWindow(app), x, y, count, mods);
             pump(app, 30);
-            app.onMouseUp(x, y);
+            app.pointerUp(targetWindow(app), x, y);
         } else if (std.mem.eql(u8, cmd, "mods")) {
             var count: u32 = 1;
             app.onFlags(modsOf(&args, &count));
@@ -197,30 +290,30 @@ pub fn runHeadless(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
         } else if (std.mem.eql(u8, cmd, "rclick")) {
             const x = num(&args);
             const y = num(&args);
-            app.onMouseMove(x, y);
+            app.pointerMove(targetWindow(app), x, y);
             pump(app, 30);
-            app.onRightMouseDown(x, y, .{});
+            app.pointerRightDown(targetWindow(app), x, y, .{});
         } else if (std.mem.eql(u8, cmd, "drag")) {
             const x0 = num(&args);
             const y0 = num(&args);
             const x1 = num(&args);
             const y1 = num(&args);
-            app.onMouseMove(x0, y0);
+            app.pointerMove(targetWindow(app), x0, y0);
             pump(app, 30);
-            app.onMouseDown(x0, y0, 1, .{});
+            app.pointerDown(targetWindow(app), x0, y0, 1, .{});
             pump(app, 30);
             var i: f32 = 1;
             while (i <= 8) : (i += 1) {
-                app.onMouseMove(x0 + (x1 - x0) * i / 8, y0 + (y1 - y0) * i / 8);
+                app.pointerMove(targetWindow(app), x0 + (x1 - x0) * i / 8, y0 + (y1 - y0) * i / 8);
                 pump(app, 20);
             }
-            app.onMouseUp(x1, y1);
+            app.pointerUp(targetWindow(app), x1, y1);
         } else if (std.mem.eql(u8, cmd, "scroll")) {
             const x = num(&args);
             const y = num(&args);
             const dy = num(&args);
             const dx = num(&args);
-            app.onScroll(x, y, dx, dy);
+            app.pointerScroll(targetWindow(app), x, y, dx, dy);
         } else if (std.mem.eql(u8, cmd, "copy")) {
             if (app.onCopy(false)) |copied| {
                 defer gpa.free(copied);
@@ -274,9 +367,32 @@ pub fn runHeadless(gpa: std.mem.Allocator, opts: app_mod.LaunchOptions) !void {
             app.invalidate();
         } else if (std.mem.eql(u8, cmd, "files")) {
             std.debug.print("files: root={s}\n", .{app.files.rootPath()});
+        } else if (std.mem.eql(u8, cmd, "tabs")) {
+            printTabs(app);
+        } else if (std.mem.eql(u8, cmd, "window")) {
+            target_window = @intFromFloat(num(&args));
+            if (targetWindow(app)) |w| {
+                app.onWindowKey(w.group);
+            } else {
+                if (target_window != 0) std.debug.print("script: no window {d}\n", .{target_window});
+                target_window = 0;
+                app.onWindowKey(null);
+            }
+        } else if (std.mem.eql(u8, cmd, "close_window")) {
+            if (targetWindow(app)) |w| app.closeWindow(w) else std.debug.print("script: the main window does not close\n", .{});
+        } else if (std.mem.eql(u8, cmd, "frame")) {
+            const n: u32 = @intFromFloat(num(&args));
+            const f: @TypeOf(app.main_frame.?) = .{ .x = num(&args), .y = num(&args), .w = num(&args), .h = num(&args) };
+            if (n == 0) {
+                app.main_frame = f;
+            } else if (app.windowByGroup(TabManager.window_group_base + n - 1)) |w| {
+                w.frame = f;
+                _ = w.resize(f.w, f.h, w.raw_scale, app.zoom);
+            } else std.debug.print("script: no window {d}\n", .{n});
+            app.invalidate();
         } else if (std.mem.eql(u8, cmd, "snap")) {
             pump(app, 40);
-            app.snapshot(rest) catch |err| std.debug.print("snap failed: {s}\n", .{@errorName(err)});
+            (if (targetWindow(app)) |w| app.snapshotWindow(w, rest) else app.snapshot(rest)) catch |err| std.debug.print("snap failed: {s}\n", .{@errorName(err)});
             std.debug.print("snapshot → {s}\n", .{rest});
         } else {
             std.debug.print("script: unknown command '{s}'\n", .{cmd});

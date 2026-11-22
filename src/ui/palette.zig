@@ -173,6 +173,7 @@ const commands = [_]Command{
     .{ .prefix = "View:", .label = "Split down", .kbd = "⌘⇧D", .action = .split_down },
     .{ .prefix = "View:", .label = "Focus next pane", .kbd = "⌘]", .action = .next_pane },
     .{ .prefix = "View:", .label = "Focus previous pane", .kbd = "⌘[", .action = .prev_pane },
+    .{ .prefix = "View:", .label = "Move tab to new window", .kbd = "", .action = .move_tab_to_window },
     .{ .prefix = "File:", .label = "Save", .kbd = "⌘S", .action = .save },
     .{ .prefix = "Edit:", .label = "Undo", .kbd = "⌘Z", .action = .undo },
     .{ .prefix = "Edit:", .label = "Redo", .kbd = "⌘⇧Z", .action = .redo },
