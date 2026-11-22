@@ -53,8 +53,12 @@ What this page says about committing applies to both.
 | Graph | A lane per line of history, one colour per lane. The line of first parents keeps to the left; a branch bends into and out of it. Laid out in `model/lanes.zig`. |
 | Ref chips | The names pointing at a commit, after its subject: the branch checked out (accent), other local branches, remote branches (grey), tags (amber). |
 | Author | Initials in a circle, with the name beside it when the list is wide enough. |
+| Density | The list follows Settings › UI › Mode. Regular: 44pt rows, lanes 16pt apart, a 2pt stroke. Compact (`theme.compact`): 26pt rows, a shorter header and filter bar, lanes 11pt apart, a 1.5pt stroke, smaller dots and author circles. All sizes come from `Metrics` in `view/history.zig`; fonts are the same in both. |
+| Row menu | A secondary click on a commit selects it and offers "Copy Commit Message" (the subject, a blank line, the rest) and "Copy SHA" (the full hash). |
 | Row | A click selects the commit; ↑ and ↓ move the selection; ⌘C copies the selected commit's hash. Scrolling near the end asks for the next page (300 commits a page). |
 | Detail pane | Hash, subject and body, author, date, parents, refs, and the files with their `+n −n`. A click on a file opens it against the commit's first parent in a diff tab. |
+| Selecting text | Everything written in the detail pane (hash, subject, message, author, date, parents, refs) can be selected and copied: drag across it, double-click a word, triple-click a line, then ⌘C or a secondary click → Copy. The helper is `view/select.zig`. With nothing selected, ⌘C copies the commit's hash. |
+| File menu | The files are buttons, so they are not selectable: a secondary click on one offers "Copy Path" and "Copy Absolute Path". |
 | Checkout / Revert / Cherry-pick | The three buttons under the detail. Each asks first. Checkout leaves HEAD detached at the commit. |
 
 ## Changes

@@ -5,7 +5,14 @@
 //! scrolling near the end asks for the next page. Typing in the box above
 //! the list keeps the commits whose subject, author, hash or ref names
 //! contain the text; the graph is not drawn then, since the rows left are
-//! no longer neighbours.
+//! no longer neighbours. A secondary click on a commit asks for its menu
+//! (Copy Commit Message, Copy SHA).
+//!
+//! The list has two densities, following Settings › UI › Mode: the
+//! regular one, and compact mode's (`theme.compact`), where rows, the
+//! header and the filter bar are shorter, the graph's lanes sit closer
+//! with a thinner stroke and smaller dots, and authors' circles are
+//! smaller. Every size comes from `Metrics`, so the two cannot drift.
 const std = @import("std");
 const ui_mod = @import("../../../ui/ui.zig");
 const theme = @import("../../../ui/theme.zig");
@@ -20,15 +27,34 @@ const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
 const Color = ui_mod.Color;
 
-const row_h: f32 = 44;
-const head_h: f32 = 28;
-const bar_h: f32 = 48;
-const pad: f32 = 16;
-const lane_w: f32 = 16;
-const lane_x0: f32 = 12;
+/// The sizes of the list, for the density in use.
+const Metrics = struct {
+    row_h: f32,
+    head_h: f32,
+    bar_h: f32,
+    pad: f32,
+    /// The distance between two lanes of the graph, and from the graph's
+    /// edge to its first lane.
+    lane_w: f32,
+    lane_x0: f32,
+    /// The narrowest the graph's column gets.
+    graph_min: f32,
+    stroke: f32,
+    /// The radius of a commit's dot.
+    node: f32,
+    /// The diameter of an author's circle.
+    avatar: f32,
+    col_gap: f32,
+
+    const regular: Metrics = .{ .row_h = 44, .head_h = 28, .bar_h = 48, .pad = 16, .lane_w = 16, .lane_x0 = 12, .graph_min = 44, .stroke = 2, .node = 5, .avatar = 22, .col_gap = 12 };
+    const compact: Metrics = .{ .row_h = 26, .head_h = 22, .bar_h = 40, .pad = 10, .lane_w = 11, .lane_x0 = 8, .graph_min = 28, .stroke = 1.5, .node = 3.5, .avatar = 18, .col_gap = 10 };
+
+    fn current() Metrics {
+        return if (theme.compact) compact else regular;
+    }
+};
 /// Lanes beyond this are not drawn: the message keeps its room.
 const max_drawn_lanes: usize = 12;
-const stroke: f32 = 2;
 
 pub const State = struct {
     commits: []const log_mod.Commit,
@@ -48,7 +74,12 @@ pub const State = struct {
     generation: u64,
 };
 
-pub const Intent = union(enum) { select: usize, more };
+pub const Intent = union(enum) {
+    select: usize,
+    more,
+    /// A secondary click on a commit: what can be copied of it, as a menu here.
+    menu: struct { index: usize, x: f32, y: f32 },
+};
 
 pub const View = struct {
     gpa: std.mem.Allocator,
@@ -130,6 +161,11 @@ pub const View = struct {
 
     pub fn draw(self: *View, ui: *Ui, focus: *field.Focus, rect: Rect, state: State) void {
         const dl = ui.dl;
+        const m = Metrics.current();
+        const row_h = m.row_h;
+        const head_h = m.head_h;
+        const bar_h = m.bar_h;
+        const pad = m.pad;
         self.syncFilter(focus);
         self.rematch(state);
         dl.pushClip(rect);
@@ -153,7 +189,9 @@ pub const View = struct {
         }
 
         // The columns: how many fit depends on the room.
-        const graph_w: f32 = if (self.filtering()) 0 else @max(44, lane_x0 * 2 + lane_w * @as(f32, @floatFromInt(@min(max_drawn_lanes, @max(1, state.width)) - 1)));
+        // Wide enough for its lanes, and never narrower than its own heading.
+        const lanes_w = m.lane_x0 * 2 + m.lane_w * @as(f32, @floatFromInt(@min(max_drawn_lanes, @max(1, state.width)) - 1));
+        const graph_w: f32 = if (self.filtering()) 0 else @max(@max(m.graph_min, lanes_w), ui.text.measure(kit.font_label, "GRAPH"));
         // The author's name gives way to their initials alone, then the
         // hash goes, as the list narrows.
         const show_author = rect.w >= 520;
@@ -161,8 +199,8 @@ pub const View = struct {
         const show_hash = rect.w >= 440;
         const date_w: f32 = 92;
         const hash_w: f32 = if (show_hash) 76 else 0;
-        const author_w: f32 = if (!show_author) 0 else if (author_named) 150 else 22;
-        const col_gap: f32 = 12;
+        const author_w: f32 = if (!show_author) 0 else if (author_named) 150 else m.avatar;
+        const col_gap = m.col_gap;
         const date_right = rect.right() - pad;
         const hash_x = date_right - date_w - (if (show_hash) hash_w + col_gap else 0);
         const author_x = hash_x - (if (show_author) author_w + col_gap else 0);
@@ -213,17 +251,18 @@ pub const View = struct {
             if (selected) dl.rect(row, theme.accent.alpha(0.11)) else if (st.hover) dl.rect(row, theme.hover);
             dl.rect(.{ .x = row.x, .y = row.bottom() - 1, .w = row.w, .h = 1 }, theme.line.alpha(0.6));
             if (st.clicked) self.intent = .{ .select = i };
+            if (ui.rightClicked(row)) self.intent = .{ .menu = .{ .index = i, .x = ui.mx, .y = ui.my } };
             const cy = row.centerY();
 
-            if (graph_w > 0 and i < state.rows.len) drawGraph(ui, rect.x + pad, row, state.rows[i], if (selected) Color.mix(theme.bg, theme.accent, 0.11) else theme.bg);
+            if (graph_w > 0 and i < state.rows.len) drawGraph(ui, m, rect.x + pad, row, state.rows[i], if (selected) Color.mix(theme.bg, theme.accent, 0.11) else theme.bg);
 
             // The date, the hash and the author, from the right.
             var ago_buf: [32]u8 = undefined;
             _ = dl.textRight(kit.font_small, date_right, cy, reltime.ago(&ago_buf, state.now, c.time), theme.text_3);
             if (show_hash) _ = dl.textCentered(kit.font_mono, hash_x, cy, c.short(), theme.text_3);
             if (show_author) {
-                kit.avatar(ui, author_x + 11, cy, 22, c.author);
-                if (author_named) _ = dl.textEllipsis(kit.font_small, author_x + 30, cy, c.author, author_w - 30, theme.text_2);
+                kit.avatar(ui, author_x + m.avatar / 2, cy, m.avatar, c.author);
+                if (author_named) _ = dl.textEllipsis(kit.font_small, author_x + m.avatar + 8, cy, c.author, author_w - m.avatar - 8, theme.text_2);
             }
 
             // The subject, then the names pointing at the commit as far as they fit.
@@ -259,22 +298,23 @@ fn refColor(r: log_mod.Ref) Color {
     };
 }
 
-fn laneX(x0: f32, col: usize) f32 {
-    return x0 + lane_x0 + lane_w * @as(f32, @floatFromInt(@min(col, max_drawn_lanes - 1)));
+fn laneX(m: Metrics, x0: f32, col: usize) f32 {
+    return x0 + m.lane_x0 + m.lane_w * @as(f32, @floatFromInt(@min(col, max_drawn_lanes - 1)));
 }
 
 /// One row of the graph: the lanes passing by, the strokes bending into
 /// and out of the commit, and the commit's own dot (filled with `ground`,
 /// the row's background, so the strokes stop at its rim).
-fn drawGraph(ui: *Ui, x0: f32, row: Rect, r: lanes_mod.Row, ground: Color) void {
+fn drawGraph(ui: *Ui, m: Metrics, x0: f32, row: Rect, r: lanes_mod.Row, ground: Color) void {
     const dl = ui.dl;
+    const stroke = m.stroke;
     const top = row.y;
     const mid = row.centerY();
     const bot = row.bottom();
-    const xc = laneX(x0, r.col);
+    const xc = laneX(m, x0, r.col);
     var col: usize = 0;
     while (col < r.width and col < lanes_mod.max_lanes) : (col += 1) {
-        const x = laneX(x0, col);
+        const x = laneX(m, x0, col);
         const color = kit.hue(col);
         if (lanes_mod.Row.has(r.through, col)) dl.line(x, top, x, bot, stroke, color);
         if (lanes_mod.Row.has(r.join, col)) {
@@ -295,5 +335,5 @@ fn drawGraph(ui: *Ui, x0: f32, row: Rect, r: lanes_mod.Row, ground: Color) void 
     const own = kit.hue(r.col);
     if (r.from_top) dl.line(xc, top, xc, mid, stroke, own);
     if (r.to_bottom) dl.line(xc, mid, xc, bot, stroke, own);
-    dl.shape(.{ .x = xc - 5, .y = mid - 5, .w = 10, .h = 10 }, 5, ground, 2, own);
+    dl.shape(.{ .x = xc - m.node, .y = mid - m.node, .w = m.node * 2, .h = m.node * 2 }, m.node, ground, stroke, own);
 }

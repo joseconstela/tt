@@ -223,7 +223,7 @@ pub fn avatar(ui: *Ui, cx: f32, cy: f32, diameter: f32, name: []const u8) void {
     ui.dl.circle(cx, cy, diameter / 2, theme.chip_active);
     var buf: [8]u8 = undefined;
     const s = initials(name, &buf);
-    const font = Font.semibold(if (diameter >= 24) 10.5 else 9.5);
+    const font = Font.semibold(if (diameter >= 24) 10.5 else if (diameter >= 20) 9.5 else 8.5);
     const w = ui.text.measure(font, s);
     _ = ui.dl.textCentered(font, cx - w / 2, cy, s, hueOf(name));
 }

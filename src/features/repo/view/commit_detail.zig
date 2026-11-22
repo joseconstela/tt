@@ -5,6 +5,11 @@
 //! buttons at the bottom check the commit out, revert it, or cherry-pick
 //! it onto the branch checked out. Nothing is run here: what was asked
 //! for comes out of `takeIntent`.
+//!
+//! Everything written in the pane can be selected and copied
+//! (`select.zig`): drag across it, double-click a word, triple-click a
+//! line, then ⌘C or a secondary click → Copy. The files are buttons, so
+//! theirs is a menu instead: a secondary click on one offers its path.
 const std = @import("std");
 const ui_mod = @import("../../../ui/ui.zig");
 const theme = @import("../../../ui/theme.zig");
@@ -13,6 +18,7 @@ const wrap = @import("../../../ui/wrap.zig");
 const log_mod = @import("../model/log.zig");
 const status = @import("../model/status.zig");
 const kit = @import("kit.zig");
+const select = @import("select.zig");
 
 const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
@@ -40,12 +46,24 @@ pub const Intent = union(enum) {
     checkout,
     revert,
     cherry_pick,
+    /// A secondary click on a file: what can be copied of it, as a menu here.
+    file_menu: struct { index: usize, x: f32, y: f32 },
 };
 
 pub const View = struct {
     intent: ?Intent = null,
     scroll: f32 = 0,
     content_h: f32 = 0,
+    /// The pane's text, selectable.
+    sel: select.Selectable,
+
+    pub fn init(gpa: std.mem.Allocator) View {
+        return .{ .sel = select.Selectable.init(gpa, Ui.id("repo.detail.select", 0)) };
+    }
+
+    pub fn deinit(self: *View) void {
+        self.sel.deinit();
+    }
 
     pub fn takeIntent(self: *View) ?Intent {
         defer self.intent = null;
@@ -57,9 +75,14 @@ pub const View = struct {
         dl.rect(rect, theme.bg_side);
         dl.rect(.{ .x = rect.x, .y = rect.y, .w = 1, .h = rect.h }, theme.line);
         const c = state.commit orelse {
+            self.sel.begin(0);
             _ = dl.textEllipsis(kit.font_text, rect.x + pad, rect.y + 28, "Select a commit to see what it changed.", rect.w - 2 * pad, theme.text_3);
             return;
         };
+        // A selection is of this commit as it is shown now: the rest of its
+        // message arriving moves every line after it.
+        const sel = &self.sel;
+        sel.begin(std.hash.Wyhash.hash(@intFromBool(state.ready), c.hash));
         const x = rect.x + pad;
         const w = rect.w - 2 * pad;
 
@@ -88,21 +111,21 @@ pub const View = struct {
             const hw = ui.text.measure(kit.font_mono_small, c.short()) + 14;
             const pill: Rect = .{ .x = x + lw + 8, .y = y, .w = hw, .h = 20 };
             dl.shape(pill, 6, theme.chip_active, 1, theme.line);
-            _ = dl.textCentered(kit.font_mono_small, pill.x + 7, pill.centerY(), c.short(), theme.text_2);
+            _ = sel.text(ui, kit.font_mono_small, pill.x + 7, pill.centerY(), c.short(), hw - 7, theme.text_2);
             y += 20 + 12;
         }
-        y = wrap.drawWrapped(ui, kit.font_title, c.subject, x, y, w, 20, theme.text) + 8;
+        y = sel.wrapped(ui, kit.font_title, c.subject, x, y, w, 20, theme.text, false) + 8;
         if (state.ready and state.body.len > 0) {
-            y = wrap.drawWrappedParagraphs(ui, kit.font_small, state.body, x, y, w, 19, theme.text_3) + 12;
+            y = sel.wrapped(ui, kit.font_small, state.body, x, y, w, 19, theme.text_3, true) + 12;
         } else y += 4;
 
         // Who, when, from what.
         {
-            _ = dl.textCentered(kit.font_small, x, y + 11, "Author", theme.text_3);
-            _ = dl.textEllipsis(kit.font_small, x + key_w, y + 11, c.author, w - key_w, theme.text);
+            _ = sel.text(ui, kit.font_small, x, y + 11, "Author", key_w, theme.text_3);
+            _ = sel.text(ui, kit.font_small, x + key_w, y + 11, c.author, w - key_w, theme.text);
             y += 22;
-            _ = dl.textCentered(kit.font_small, x, y + 11, "Date", theme.text_3);
-            _ = dl.textEllipsis(kit.font_small, x + key_w, y + 11, if (state.ready) state.date else "", w - key_w, theme.text);
+            _ = sel.text(ui, kit.font_small, x, y + 11, "Date", key_w, theme.text_3);
+            _ = sel.text(ui, kit.font_small, x + key_w, y + 11, if (state.ready) state.date else "", w - key_w, theme.text);
             y += 22;
             var buf: [200]u8 = undefined;
             var n: usize = 0;
@@ -110,8 +133,8 @@ pub const View = struct {
                 const part = std.fmt.bufPrint(buf[n..], "{s}{s}", .{ if (i > 0) " · " else "", p[0..@min(7, p.len)] }) catch break;
                 n += part.len;
             }
-            _ = dl.textCentered(kit.font_small, x, y + 11, "Parents", theme.text_3);
-            _ = dl.textEllipsis(kit.font_mono, x + key_w, y + 11, if (n > 0) buf[0..n] else "none", w - key_w, if (n > 0) theme.text else theme.text_3);
+            _ = sel.text(ui, kit.font_small, x, y + 11, "Parents", key_w, theme.text_3);
+            _ = sel.text(ui, kit.font_mono, x + key_w, y + 11, if (n > 0) buf[0..n] else "none", w - key_w, if (n > 0) theme.text else theme.text_3);
             y += 22;
             if (c.refs.len > 0) {
                 n = 0;
@@ -119,8 +142,8 @@ pub const View = struct {
                     const part = std.fmt.bufPrint(buf[n..], "{s}{s}", .{ if (i > 0) ", " else "", r.name }) catch break;
                     n += part.len;
                 }
-                _ = dl.textCentered(kit.font_small, x, y + 11, "Refs", theme.text_3);
-                _ = dl.textEllipsis(kit.font_mono, x + key_w, y + 11, buf[0..n], w - key_w, theme.text);
+                _ = sel.text(ui, kit.font_small, x, y + 11, "Refs", key_w, theme.text_3);
+                _ = sel.text(ui, kit.font_mono, x + key_w, y + 11, buf[0..n], w - key_w, theme.text);
                 y += 22;
             }
             y += 12;
@@ -138,6 +161,7 @@ pub const View = struct {
                     const row: Rect = .{ .x = rect.x + 8, .y = y, .w = rect.w - 16, .h = file_h };
                     y += file_h;
                     if (row.bottom() < area.y or row.y > area.bottom()) continue;
+                    if (ui.rightClicked(row)) self.intent = .{ .file_menu = .{ .index = i, .x = ui.mx, .y = ui.my } };
                     const st = ui.button(Ui.id("repo.detail.file", i), row);
                     ui.feedback(row, 6, st);
                     kit.badge(ui, x, row.centerY(), f.letter, 18);
@@ -161,5 +185,7 @@ pub const View = struct {
 
         self.content_h = (y - top) + 28;
         if (max_scroll > 0) sidebar.drawScrollbar(ui, area, self.scroll, self.content_h);
+        // Last, so the files' buttons took their presses first.
+        sel.end(ui, area);
     }
 };

@@ -59,7 +59,7 @@ const Ui = ui_mod.Ui;
 const Rect = ui_mod.Rect;
 
 /// What a confirmation box is about; the tag it comes back with.
-const Question = enum(u32) { checkout, revert, cherry_pick, discard, drop_stash, merge, merge_method, commit_options };
+const Question = enum(u32) { checkout, revert, cherry_pick, discard, drop_stash, merge, merge_method, commit_options, commit_menu, file_menu };
 
 pub const RepoTab = struct {
     pub const kind_label = "Repository";
@@ -77,7 +77,7 @@ pub const RepoTab = struct {
     section: nav_view.Section = .history,
     nav: nav_view.View,
     list: history_view.View,
-    commit: detail_view.View = .{},
+    commit: detail_view.View,
     changes: changes_view.View,
     stashes: stashes_view.View = .{},
 
@@ -94,6 +94,9 @@ pub const RepoTab = struct {
     /// What the box on show would act on: a hash, a path, a stash's name.
     pending: std.ArrayList(u8) = .empty,
     pending_flag: bool = false,
+    /// The commit whose whole message is to be copied once it has been
+    /// read (its hash): the menu was picked before the detail came in.
+    copy_message: std.ArrayList(u8) = .empty,
 
     // ── pull requests ───────────────────────────────────────────────────
     pulls: pulls_view.View,
@@ -136,6 +139,7 @@ pub const RepoTab = struct {
             .section = kept.section,
             .nav = nav_view.View.init(gpa),
             .list = history_view.View.init(gpa),
+            .commit = detail_view.View.init(gpa),
             .changes = changes_view.View.init(gpa),
             .pulls = pulls_view.View.init(gpa),
             .pull = pull_view.View.init(gpa),
@@ -154,6 +158,7 @@ pub const RepoTab = struct {
         self.focus.deinit();
         self.nav.deinit();
         self.list.deinit();
+        self.commit.deinit();
         self.changes.deinit();
         if (self.session) |s| s.destroy();
         if (self.lookup) |l| l.destroy();
@@ -165,6 +170,7 @@ pub const RepoTab = struct {
         self.remote_name.deinit(gpa);
         self.rows.deinit(gpa);
         self.selected.deinit(gpa);
+        self.copy_message.deinit(gpa);
         self.file.deinit(gpa);
         self.pending.deinit(gpa);
         gpa.free(self.dir);
@@ -234,6 +240,7 @@ pub const RepoTab = struct {
         if (self.history.tick()) dirty = true;
         self.keepSelection();
         if (self.detail.tick()) dirty = true;
+        if (self.copy_message.items.len > 0) self.copyMessage();
         if (self.working.tick()) dirty = true;
         if (self.focus.tick(now)) dirty = true;
         if (self.tickHosting()) dirty = true;
@@ -399,6 +406,22 @@ pub const RepoTab = struct {
         return if (i < commits.len) commits[i] else null;
     }
 
+    /// Puts the whole message of the commit asked for (`copy_message`) on
+    /// the clipboard: its subject, and after a blank line the rest, which
+    /// is read with the commit's detail. Waits when that is not in yet.
+    fn copyMessage(self: *RepoTab) void {
+        const c = self.selectedCommit() orelse return self.copy_message.clearRetainingCapacity();
+        // The selection moved on before the message came: nothing to copy.
+        if (!std.mem.eql(u8, c.hash, self.copy_message.items)) return self.copy_message.clearRetainingCapacity();
+        if (!self.detail.ready()) return;
+        self.copy_message.clearRetainingCapacity();
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(self.gpa);
+        text.appendSlice(self.gpa, c.subject) catch return;
+        if (self.detail.body.len > 0) text.print(self.gpa, "\n\n{s}", .{self.detail.body}) catch return;
+        self.env.setClipboard(text.items);
+    }
+
     /// The file on show in Changes follows the status: when its side has
     /// nothing to show any more (it was staged, committed, discarded) the
     /// other side takes over, else the first change there is.
@@ -492,7 +515,12 @@ pub const RepoTab = struct {
 
     pub fn copy(self: *RepoTab, out: *std.ArrayList(u8), cut: bool) bool {
         if (self.focus.active()) return self.focus.copy(out, cut);
-        // With no field focused, ⌘C copies the selected commit's hash.
+        // What is selected in the commit's details; with nothing selected
+        // there, ⌘C copies the selected commit's hash.
+        if (self.section == .history and self.commit.sel.hasSelection()) {
+            out.appendSlice(self.gpa, self.commit.sel.selected()) catch return false;
+            return true;
+        }
         if (self.section == .history) if (self.selectedCommit()) |c| {
             out.appendSlice(self.gpa, c.hash) catch return false;
             return true;
@@ -639,6 +667,12 @@ pub const RepoTab = struct {
         if (self.list.takeIntent()) |intent| switch (intent) {
             .select => |i| self.select(i),
             .more => self.history.more(),
+            // The commit under the pointer becomes the one on show, as a
+            // secondary click does in a list; its menu is about it.
+            .menu => |m| {
+                self.select(m.index);
+                self.env.askMenu(self, @backingInt(Question.commit_menu), &.{ "Copy Commit Message", "Copy SHA" }, null, m.x, m.y);
+            },
         };
         if (self.commit.takeIntent()) |intent| self.runCommit(intent);
         if (self.changes.takeIntent()) |intent| switch (intent) {
@@ -696,6 +730,13 @@ pub const RepoTab = struct {
                 buf.print(self.gpa, "{s}/{s}", .{ self.root(), f.path }) catch return;
                 self.env.openDiff(buf.items, .{ .orig = f.orig, .revs = .{ .left = if (c.parents.len > 0) c.parents[0] else null, .right = c.hash } });
             },
+            .file_menu => |m| {
+                const changes = self.detail.changes orelse return;
+                if (m.index >= changes.files.len) return;
+                self.pending.clearRetainingCapacity();
+                self.pending.appendSlice(self.gpa, changes.files[m.index].path) catch return;
+                self.env.askMenu(self, @backingInt(Question.file_menu), &.{ "Copy Path", "Copy Absolute Path" }, null, m.x, m.y);
+            },
             .checkout => self.ask(.checkout, c.hash, false, std.fmt.bufPrint(&heading, "Check out {s}?", .{c.short()}) catch "Check out this commit?", "HEAD is detached at this commit: new commits belong to no branch until you make one.", "Checkout"),
             .revert => self.ask(.revert, c.hash, merge, std.fmt.bufPrint(&heading, "Revert {s}?", .{c.short()}) catch "Revert this commit?", std.fmt.bufPrint(&reason, "A new commit undoing it is added to {s}.", .{branch}) catch "", "Revert"),
             .cherry_pick => self.ask(.cherry_pick, c.hash, merge, std.fmt.bufPrint(&heading, "Cherry-pick {s}?", .{c.short()}) catch "Cherry-pick this commit?", std.fmt.bufPrint(&reason, "Its change is applied to {s} as a new commit.", .{branch}) catch "", "Cherry-pick"),
@@ -752,6 +793,22 @@ pub const RepoTab = struct {
     pub fn answered(self: *RepoTab, tag: u32, choice: usize) void {
         const what = std.enums.fromInt(Question, tag) orelse return;
         if (what == .commit_options) return self.changes.toggleOption(choice);
+        if (what == .commit_menu) {
+            const c = self.selectedCommit() orelse return;
+            if (choice == 1) return self.env.setClipboard(c.hash);
+            self.copy_message.clearRetainingCapacity();
+            self.copy_message.appendSlice(self.gpa, c.hash) catch return;
+            return self.copyMessage();
+        }
+        if (what == .file_menu) {
+            const rel = self.pending.items;
+            if (rel.len == 0) return;
+            if (choice == 0) return self.env.setClipboard(rel);
+            var path: std.ArrayList(u8) = .empty;
+            defer path.deinit(self.gpa);
+            path.print(self.gpa, "{s}/{s}", .{ self.root(), rel }) catch return;
+            return self.env.setClipboard(path.items);
+        }
         if (what == .merge_method) {
             const session = self.session orelse return;
             const methods = session.caps().merge_methods;
@@ -761,7 +818,7 @@ pub const RepoTab = struct {
         const subject = self.pending.items;
         if (subject.len == 0) return;
         switch (what) {
-            .merge_method, .commit_options => {},
+            .merge_method, .commit_options, .commit_menu, .file_menu => {},
             .merge => if (self.session) |session| {
                 // The pull request the box was about, if it is still the one on show.
                 const number = std.fmt.parseInt(u64, subject, 10) catch 0;

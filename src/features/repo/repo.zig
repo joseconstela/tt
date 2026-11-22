@@ -69,6 +69,7 @@ test {
     _ = @import("client/forge.zig");
     _ = @import("client/pull_files.zig");
     _ = @import("view/kit.zig");
+    _ = @import("view/select.zig");
     _ = @import("entry/tab.zig");
     _ = @import("entry/settings.zig");
 }
